@@ -156,7 +156,21 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
 
     $entryYear = (int) date('Y', (int) strtotime((string) $year['starts_on']));
 
-    return db_transaction(static function () use ($data, $yearId, $classroomId, $entryYear, $year): array {
+    try {
+        return db_transaction(static function () use ($data, $yearId, $classroomId, $entryYear, $year): array {
+        // Le contrôle ci-dessus donne un message immédiat dans le cas
+        // courant ; celui-ci, verrou posé, est le seul qui fasse foi
+        // lorsque deux inscriptions arrivent en même temps.
+        if ($classroomId !== null) {
+            students_service_lock_classroom($classroomId);
+
+            $recheck = students_service_check_capacity($classroomId);
+
+            if (!$recheck['ok']) {
+                throw new RuntimeException($recheck['message']);
+            }
+        }
+
         $matricule = students_service_next_matricule($entryYear);
 
         $studentId = tenant_insert('students', [
@@ -210,7 +224,10 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
         );
 
         return ['ok' => true, 'id' => $studentId, 'matricule' => $matricule, 'message' => ''];
-    });
+        });
+    } catch (RuntimeException $e) {
+        return ['ok' => false, 'id' => null, 'matricule' => null, 'message' => $e->getMessage()];
+    }
 }
 
 // =====================================================================
@@ -275,7 +292,18 @@ function students_service_re_enroll(int $studentId, int $yearId, ?int $classroom
         }
     }
 
-    return db_transaction(static function () use ($studentId, $yearId, $classroomId, $repeated, $year, $student): array {
+    try {
+        return db_transaction(static function () use ($studentId, $yearId, $classroomId, $repeated, $year, $student): array {
+        if ($classroomId !== null) {
+            students_service_lock_classroom($classroomId);
+
+            $recheck = students_service_check_capacity($classroomId);
+
+            if (!$recheck['ok']) {
+                throw new RuntimeException($recheck['message']);
+            }
+        }
+
         $enrollmentId = tenant_insert('enrollments', [
             'student_id'        => $studentId,
             'academic_year_id'  => $yearId,
@@ -309,7 +337,10 @@ function students_service_re_enroll(int $studentId, int $yearId, ?int $classroom
         );
 
         return ['ok' => true, 'id' => $enrollmentId, 'message' => ''];
-    });
+        });
+    } catch (RuntimeException $e) {
+        return ['ok' => false, 'id' => null, 'message' => $e->getMessage()];
+    }
 }
 
 // =====================================================================
@@ -354,13 +385,37 @@ function students_service_check_capacity(int $classroomId): array
     return ['ok' => true, 'message' => '', 'current' => $current, 'capacity' => $capacity];
 }
 
-/** Affecte ou change la classe d'une inscription. */
-function students_service_assign_classroom(int $enrollmentId, int $classroomId): array
+/**
+ * Affecte ou change la classe d'une inscription.
+ *
+ * $studentId est obligatoire et vérifié : le contrôleur reçoit l'élève
+ * dans l'URL et l'inscription dans le corps du formulaire. Sans ce
+ * recoupement, remplacer enrollment_id dans le POST déplaçait l'élève
+ * d'un CAMARADE de classe, en journalisant l'opération sous l'élève
+ * affiché — une modification invisible à la relecture.
+ */
+function students_service_assign_classroom(int $studentId, int $enrollmentId, int $classroomId): array
 {
     $enrollment = tenant_find('enrollments', $enrollmentId);
 
-    if ($enrollment === null) {
-        return ['ok' => false, 'message' => 'Inscription introuvable.'];
+    if ($enrollment === null || (int) $enrollment['student_id'] !== $studentId) {
+        return ['ok' => false, 'message' => 'Inscription introuvable pour cet élève.'];
+    }
+
+    if ($enrollment['status'] === 'cancelled') {
+        return [
+            'ok'      => false,
+            'message' => 'Cette inscription est annulée : elle ne peut pas recevoir de classe.',
+        ];
+    }
+
+    $year = tenant_find('academic_years', (int) $enrollment['academic_year_id']);
+
+    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
+        return [
+            'ok'      => false,
+            'message' => 'Cette année scolaire est clôturée : elle ne peut plus être modifiée.',
+        ];
     }
 
     $classroom = tenant_one(
@@ -373,30 +428,60 @@ function students_service_assign_classroom(int $enrollmentId, int $classroomId):
         return ['ok' => false, 'message' => 'La classe n\'appartient pas à l\'année scolaire de cette inscription.'];
     }
 
-    if ((int) $enrollment['classroom_id'] !== $classroomId) {
-        $check = students_service_check_capacity($classroomId);
+    $unchanged = (int) $enrollment['classroom_id'] === $classroomId;
 
-        if (!$check['ok']) {
-            return ['ok' => false, 'message' => $check['message']];
-        }
+    try {
+        db_transaction(static function () use ($enrollment, $enrollmentId, $classroomId, $classroom, $unchanged): void {
+            if (!$unchanged) {
+                students_service_lock_classroom($classroomId);
+
+                $check = students_service_check_capacity($classroomId);
+
+                if (!$check['ok']) {
+                    throw new RuntimeException($check['message']);
+                }
+            }
+
+            tenant_update('enrollments', [
+                'classroom_id' => $classroomId,
+                'status'       => 'enrolled',
+                'enrolled_on'  => $enrollment['enrolled_on'] ?? date('Y-m-d'),
+            ], 'id = :id', ['id' => $enrollmentId]);
+
+            audit_log(
+                'update',
+                'enrollment',
+                $enrollmentId,
+                ['classroom_id' => $enrollment['classroom_id']],
+                ['classroom_id' => $classroomId],
+                'Affectation à la classe ' . $classroom['name']
+            );
+        });
+    } catch (RuntimeException $e) {
+        return ['ok' => false, 'message' => $e->getMessage()];
     }
 
-    tenant_update('enrollments', [
-        'classroom_id' => $classroomId,
-        'status'       => $enrollment['status'] === 'enrolled' ? 'enrolled' : 'enrolled',
-        'enrolled_on'  => $enrollment['enrolled_on'] ?? date('Y-m-d'),
-    ], 'id = :id', ['id' => $enrollmentId]);
-
-    audit_log(
-        'update',
-        'enrollment',
-        $enrollmentId,
-        ['classroom_id' => $enrollment['classroom_id']],
-        ['classroom_id' => $classroomId],
-        'Affectation à la classe ' . $classroom['name']
-    );
-
     return ['ok' => true, 'message' => ''];
+}
+
+/**
+ * Verrouille la ligne d'une classe jusqu'à la fin de la transaction.
+ *
+ * Le contrôle de capacité est un COUNT suivi d'un INSERT. Sans verrou,
+ * deux secrétaires validant une inscription à la même seconde lisent le
+ * même effectif, passent tous les deux le contrôle et dépassent la
+ * capacité — exactement le scénario que le matricule évite déjà par le
+ * même moyen. Aucune contrainte SQL ne rattrape un effectif dépassé.
+ *
+ * À appeler dans une transaction ouverte, avant students_service_check_capacity().
+ */
+function students_service_lock_classroom(int $classroomId): void
+{
+    db_query(
+        'SELECT id FROM classrooms
+          WHERE school_id = :school_id AND id = :id FOR UPDATE',
+        ['school_id' => tenant_require(), 'id' => $classroomId]
+    );
 }
 
 // =====================================================================
@@ -419,10 +504,21 @@ function students_service_attach_guardian(int $studentId, array $data): array
         return ['ok' => false, 'guardian_id' => null, 'created' => false, 'message' => 'Élève introuvable.'];
     }
 
-    $phone    = sanitize_phone((string) ($data['phone'] ?? ''));
-    $existing = $phone !== null ? guardians_repo_find_by_phone($phone) : null;
+    $phone = sanitize_phone((string) ($data['phone'] ?? ''));
 
-    return db_transaction(static function () use ($existing, $data, $phone, $studentId, $student): array {
+    return db_transaction(static function () use ($data, $phone, $studentId, $student): array {
+        // La recherche est faite DANS la transaction : hors transaction,
+        // deux rattachements simultanés du même parent à deux enfants
+        // d'une fratrie créaient deux fiches, ce que la déduplication
+        // est justement censée empêcher.
+        //
+        // Le critère est le téléphone ET le nom : voir
+        // guardians_repo_find_same_person(). Le père et la mère donnent
+        // souvent le même numéro.
+        $existing = $phone !== null
+            ? guardians_repo_find_same_person($phone, (string) $data['last_name'], (string) $data['first_name'])
+            : null;
+
         $created = false;
 
         if ($existing !== null) {
@@ -516,6 +612,13 @@ function students_service_orient(
 
     if ($year === null) {
         return ['ok' => false, 'message' => 'Année scolaire introuvable.'];
+    }
+
+    // Une décision d'orientation datée d'aujourd'hui n'a rien à faire
+    // dans une année déjà clôturée : la clôture doit valoir pour toutes
+    // les écritures, pas seulement pour les inscriptions.
+    if (in_array($year['status'], ['closed', 'archived'], true)) {
+        return ['ok' => false, 'message' => 'Cette année scolaire est clôturée : aucune orientation ne peut y être prononcée.'];
     }
 
     $enrollment = students_repo_enrollment($studentId, $yearId);
@@ -648,6 +751,21 @@ function students_service_change_status(int $studentId, string $status, string $
 
     if ($student === null) {
         return ['ok' => false, 'message' => 'Élève introuvable.'];
+    }
+
+    // Sortir un élève de la vie scolaire n'est pas une modification de
+    // dossier : la réinscription le refuse ensuite, et le dossier
+    // disparaît des effectifs. Le catalogue prévoit une permission
+    // distincte pour cela, « student.delete », qui n'était appliquée
+    // nulle part — le secrétariat pouvait donc archiver tout le fichier
+    // avec le seul droit de modification.
+    $sensitive = ['graduated', 'transferred', 'dropped', 'archived'];
+
+    if (in_array($status, $sensitive, true) && !perm_has('student.delete')) {
+        return [
+            'ok'      => false,
+            'message' => 'Vous n\'avez pas le droit de clôturer ou d\'archiver un dossier élève.',
+        ];
     }
 
     $labels = [

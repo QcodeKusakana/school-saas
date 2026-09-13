@@ -90,7 +90,10 @@ function ctrl_students_show(string $id): void
     $studentId = (int) $id;
     $student   = students_repo_find($studentId);
 
-    if ($student === null) {
+    // Restreindre la liste ne protège rien si la fiche reste accessible
+    // par son identifiant. Un 404, et non un 403 : confirmer l'existence
+    // d'un dossier qu'on n'a pas le droit de lire est déjà une fuite.
+    if ($student === null || !students_can_view($studentId)) {
         abort(404, 'Élève introuvable.');
     }
 
@@ -223,18 +226,40 @@ function ctrl_students_update(string $id): void
         redirect('/eleves/' . $studentId);
     }
 
-    $after = [
-        'last_name'   => sanitize_string((string) input('last_name'), 80),
-        'post_name'   => sanitize_string(input('post_name'), 80),
-        'first_name'  => sanitize_string((string) input('first_name'), 80),
-        'gender'      => (string) input('gender'),
-        'birth_date'  => input('birth_date'),
-        'birth_place' => sanitize_string(input('birth_place'), 120),
-        'nationality' => sanitize_string(input('nationality'), 60),
-        'address'     => sanitize_string(input('address'), 255),
-        'phone'       => sanitize_phone(input('phone')),
-        'email'       => input('email'),
+    // Seuls les champs RÉELLEMENT transmis sont écrits.
+    //
+    // Écrire systématiquement les dix colonnes effaçait l'état civil dès
+    // qu'une requête n'en portait qu'une partie : les règles « nullable »
+    // laissent passer un champ absent, input() renvoie null, et la date
+    // de naissance, le lieu, l'adresse et le téléphone partaient à NULL
+    // sans la moindre erreur SQL.
+    $source = input_all();
+
+    $writable = [
+        'last_name'   => static fn ($v) => sanitize_string((string) $v, 80),
+        'post_name'   => static fn ($v) => sanitize_string($v, 80),
+        'first_name'  => static fn ($v) => sanitize_string((string) $v, 80),
+        'gender'      => static fn ($v) => (string) $v,
+        'birth_date'  => static fn ($v) => $v !== '' ? $v : null,
+        'birth_place' => static fn ($v) => sanitize_string($v, 120),
+        'nationality' => static fn ($v) => sanitize_string($v, 60),
+        'address'     => static fn ($v) => sanitize_string($v, 255),
+        'phone'       => static fn ($v) => sanitize_phone($v),
+        'email'       => static fn ($v) => $v !== '' ? $v : null,
     ];
+
+    $after = [];
+
+    foreach ($writable as $field => $transform) {
+        if (array_key_exists($field, $source)) {
+            $after[$field] = $transform($source[$field]);
+        }
+    }
+
+    if ($after === []) {
+        flash_error('Aucune donnée à enregistrer.');
+        redirect('/eleves/' . $studentId);
+    }
 
     tenant_update('students', $after, 'id = :id', ['id' => $studentId]);
     audit_update('student', $studentId, $student, $after, 'Modification du dossier élève');
@@ -286,7 +311,7 @@ function ctrl_students_assign(string $id): void
         redirect('/eleves/' . $studentId);
     }
 
-    $outcome = students_service_assign_classroom($enrollmentId, $classroomId);
+    $outcome = students_service_assign_classroom($studentId, $enrollmentId, $classroomId);
 
     $outcome['ok']
         ? flash_success('Élève affecté à la classe.')

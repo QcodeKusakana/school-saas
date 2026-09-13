@@ -62,6 +62,15 @@ const TENANT_TABLES = [
     'enrollments',
     'orientations',
     'student_history',
+
+    // Journal d'audit : school_id vaut NULL pour les actions de la
+    // plateforme, et l'identifiant de l'école pour toutes les autres.
+    // Il est soumis au garde-fou : une future page « historique des
+    // actions » qui oublierait le filtre exposerait l'activité complète
+    // d'un autre établissement — c'est précisément ce qu'une trace ne
+    // doit jamais laisser faire.
+    'audit_logs',
+
     // Phases suivantes — déclarées d'avance pour ne pas être oubliées
     'teachers',
     'teacher_subjects',
@@ -92,19 +101,42 @@ const GLOBAL_TABLES = [
     'schools',
     'plans',
     'permissions',
-    'roles',              // school_id nullable : rôles système partagés
-    'role_permissions',
-    'user_roles',
     'education_cycles',
     'education_levels',
     'learning_domains',      // modèle national, phase 2
     'reference_sections',
     'reference_options',
     'reference_subjects',
-    'audit_logs',         // school_id nullable : trace aussi la plateforme
     'login_attempts',
     'password_resets',
+
+    // ----------------------------------------------------------------
+    //  Deux tables portent une colonne school_id et restent pourtant
+    //  déclarées globales. Ce n'est pas un oubli, et la raison doit
+    //  rester écrite ici, sinon quelqu'un « corrigera » un jour la
+    //  classification et cassera l'authentification.
+    // ----------------------------------------------------------------
+
+    // roles : les rôles système ont school_id NULL et sont partagés par
+    // toutes les écoles. perm_all() et perm_roles() résolvent les rôles
+    // par user_id — un utilisateur n'appartenant qu'à une seule école,
+    // le cloisonnement vient de là. Toute page listant les rôles devra
+    // en revanche filtrer explicitement
+    // (school_id IS NULL OR school_id = :school_id), faute de quoi les
+    // rôles personnalisés d'une autre école deviendraient visibles.
+    'roles',
+    'role_permissions',
+    'user_roles',
+
+    // user_sessions : la session est créée à l'authentification, avant
+    // qu'un établissement ne soit placé dans le contexte. Elle est lue
+    // et révoquée par user_id. La colonne school_id n'y est qu'une
+    // dénormalisation de confort.
     'user_sessions',
+
+    // Registre de l'applicateur de migrations : infrastructure, jamais
+    // rattachée à un établissement.
+    'schema_migrations',
 ];
 
 // ---------------------------------------------------------------------

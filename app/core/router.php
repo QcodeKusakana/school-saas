@@ -50,6 +50,23 @@ function router_table(string $action, ?array $route = null): array
 }
 
 /**
+ * Une route est-elle déclarée ?
+ *
+ * Sert aux middlewares qui redirigent : rediriger vers une route qui
+ * n'existe pas encore transforme un refus d'accès en page introuvable.
+ */
+function router_has_route(string $method, string $pattern): bool
+{
+    foreach (router_table('get') as $route) {
+        if ($route['method'] === strtoupper($method) && $route['path'] === '/' . trim($pattern, '/')) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Résout la requête courante et exécute le gestionnaire correspondant.
  */
 function router_dispatch(): void
@@ -114,9 +131,15 @@ function router_match(string $pattern, string $path): ?array
     foreach ($segments as $segment) {
         if ($segment[0] === '{') {
             $name = trim($segment, '{}');
-            // {id}, {student_id} n'acceptent que des chiffres ;
+            // {id}, {student_id}, {subjectId} n'acceptent que des chiffres ;
             // {slug}, {code} acceptent lettres, chiffres, tiret et souligné.
-            $regex .= str_ends_with($name, 'id') ? '(\d+)' : '([a-zA-Z0-9_\-]+)';
+            //
+            // La comparaison est insensible à la casse : écrite
+            // sensible, elle laissait passer {linkId} et {subjectId}
+            // dans la branche alphanumérique, et la garantie « un
+            // identifiant n'est que des chiffres » devenait fausse sans
+            // que rien ne le signale.
+            $regex .= str_ends_with(strtolower($name), 'id') ? '(\d+)' : '([a-zA-Z0-9_\-]+)';
         } else {
             $regex .= preg_quote($segment, '#');
         }
@@ -173,9 +196,22 @@ function router_run_middleware(array $middleware): void
 
             case 'school':
                 // La page exige un établissement dans le contexte courant.
+                //
+                // Sans ce contrôle, un super administrateur (school_id
+                // NULL, toutes les permissions) atteignait les pages de
+                // l'école et provoquait une erreur 500 sur le premier
+                // tenant_require() rencontré.
                 if (tenant_id() === null) {
-                    flash_warning('Veuillez sélectionner un établissement.');
-                    redirect('/plateforme/ecoles');
+                    // La page de sélection d'établissement appartient à
+                    // la phase plateforme. Tant qu'elle n'est pas
+                    // publiée, rediriger enverrait vers une 404 : mieux
+                    // vaut un refus explicite.
+                    if (router_has_route('GET', '/plateforme/ecoles')) {
+                        flash_warning('Veuillez sélectionner un établissement.');
+                        redirect('/plateforme/ecoles');
+                    }
+
+                    abort(403, 'Cette page appartient à un établissement. Connectez-vous avec un compte rattaché à une école.');
                 }
                 break;
 

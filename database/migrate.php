@@ -5,15 +5,19 @@
  *   php database/migrate.php            Applique les migrations en attente
  *   php database/migrate.php --status   Liste sans rien exécuter
  *   php database/migrate.php --seed     Applique aussi les seeds non joués
+ *   php database/migrate.php --baseline Marque les fichiers comme appliqués
+ *                                       SANS les exécuter
  *
- * Chaque fichier de database/migrations/ n'est exécuté qu'une seule
- * fois : la table schema_migrations garde la trace de ce qui a été
- * appliqué, avec la date et une empreinte du contenu.
+ * Chaque fichier n'est exécuté qu'une seule fois : la table
+ * schema_migrations garde la trace de ce qui a été appliqué, avec la
+ * date et une empreinte du contenu.
  *
  * L'empreinte sert d'alerte : si un fichier déjà appliqué est modifié
  * après coup, le script le signale. En équipe, modifier une migration
  * déjà jouée chez un collègue produit deux bases divergentes — mieux
  * vaut écrire une nouvelle migration.
+ *
+ * La logique d'exécution vit dans runner.php, partagée avec install.php.
  */
 
 declare(strict_types=1);
@@ -28,6 +32,7 @@ define('APP_PATH', BASE_PATH . '/app');
 
 require APP_PATH . '/core/helpers.php';
 require APP_PATH . '/core/logger.php';
+require __DIR__ . '/runner.php';
 
 $options    = getopt('', ['status', 'seed', 'baseline', 'help']);
 $statusOnly = isset($options['status']);
@@ -74,61 +79,45 @@ try {
     exit(1);
 }
 
-// ---------------------------------------------------------------------
-// Registre des migrations
-// ---------------------------------------------------------------------
-$pdo->exec(
-    'CREATE TABLE IF NOT EXISTS schema_migrations (
-        id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
-        filename    VARCHAR(190) NOT NULL,
-        checksum    CHAR(64)     NOT NULL,
-        kind        ENUM(\'migration\', \'seed\') NOT NULL DEFAULT \'migration\',
-        statements  SMALLINT UNSIGNED NOT NULL DEFAULT 0,
-        applied_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        UNIQUE KEY uq_migration_file (filename)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
-);
-
-$applied = [];
-
-foreach ($pdo->query('SELECT filename, checksum, applied_at FROM schema_migrations') as $row) {
-    $applied[$row['filename']] = $row;
-}
-
-// ---------------------------------------------------------------------
-// Fichiers candidats
-// ---------------------------------------------------------------------
-$files = [];
-
-foreach (glob(__DIR__ . '/migrations/*.sql') ?: [] as $path) {
-    $files[] = ['path' => $path, 'name' => basename($path), 'kind' => 'migration'];
-}
-
-if ($withSeeds) {
-    foreach (glob(__DIR__ . '/seeds/*.sql') ?: [] as $path) {
-        $files[] = ['path' => $path, 'name' => 'seeds/' . basename($path), 'kind' => 'seed'];
-    }
-}
-
-usort($files, static fn (array $a, array $b): int => strcmp($a['name'], $b['name']));
-
 echo "\n  Migrations — base « " . config('database.name') . " »\n";
 echo "  ──────────────────────────────────────────────────────\n";
 
-if ($files === []) {
-    echo "  Aucun fichier trouvé.\n\n";
-    exit(0);
+// ---------------------------------------------------------------------
+// Registre et reprise des bases antérieures
+// ---------------------------------------------------------------------
+runner_ledger_ensure($pdo);
+
+$catalog = runner_catalog();
+$adopted = runner_autobaseline($pdo, $catalog, runner_applied($pdo));
+
+foreach ($adopted as $name) {
+    printf("  ≡ %-52s déjà en place, enregistré\n", $name);
 }
 
+if ($adopted !== []) {
+    echo "\n";
+}
+
+$applied = runner_applied($pdo);
+
+// ---------------------------------------------------------------------
+// État des fichiers
+// ---------------------------------------------------------------------
 $pending  = [];
 $modified = [];
 
-foreach ($files as $file) {
-    $checksum = hash_file('sha256', $file['path']);
-    $isKnown  = isset($applied[$file['name']]);
+foreach ($catalog as $file) {
+    if ($file['kind'] === 'seed' && !$withSeeds) {
+        continue;
+    }
 
-    if (!$isKnown) {
+    if (!is_file($file['path'])) {
+        continue;
+    }
+
+    $checksum = hash_file('sha256', $file['path']);
+
+    if (!isset($applied[$file['name']])) {
         $pending[] = $file + ['checksum' => $checksum];
         printf("  ○ %-52s en attente\n", $file['name']);
         continue;
@@ -155,7 +144,7 @@ if ($modified !== []) {
 }
 
 if ($statusOnly) {
-    echo "\n  " . count($pending) . " migration(s) en attente.\n\n";
+    echo "\n  " . count($pending) . " fichier(s) en attente.\n\n";
     exit(0);
 }
 
@@ -177,17 +166,8 @@ if ($baseline) {
         exit(1);
     }
 
-    $statement = $pdo->prepare(
-        'INSERT INTO schema_migrations (filename, checksum, kind, statements)
-         VALUES (:filename, :checksum, :kind, 0)'
-    );
-
     foreach ($pending as $file) {
-        $statement->execute([
-            'filename' => $file['name'],
-            'checksum' => $file['checksum'],
-            'kind'     => $file['kind'],
-        ]);
+        runner_record($pdo, $file['name'], $file['checksum'], $file['kind'], 0);
         printf("  ✓ %-52s marqué appliqué\n", $file['name']);
     }
 
@@ -201,110 +181,16 @@ if ($baseline) {
 echo "\n  Application de " . count($pending) . " fichier(s)…\n\n";
 
 foreach ($pending as $file) {
-    $statements = sql_split((string) file_get_contents($file['path']));
-    $executed   = 0;
-
-    // Chaque fichier est appliqué dans sa propre transaction lorsque
-    // c'est possible. MySQL valide implicitement les CREATE TABLE et
-    // ALTER TABLE : la transaction ne protège donc pas un fichier de
-    // schéma, d'où l'arrêt immédiat à la première erreur, pour ne pas
-    // enchaîner sur une base à moitié migrée.
     try {
-        foreach ($statements as $statement) {
-            $pdo->exec($statement);
-            $executed++;
-        }
-    } catch (PDOException $e) {
-        fwrite(STDERR, "  ✗ {$file['name']} — instruction " . ($executed + 1) . "\n");
-        fwrite(STDERR, "    {$e->getMessage()}\n");
-        fwrite(STDERR, "    " . substr(preg_replace('/\s+/', ' ', $statement) ?? '', 0, 160) . "…\n\n");
+        $executed = runner_apply($pdo, $file);
+    } catch (RuntimeException $e) {
+        fwrite(STDERR, "  ✗ {$e->getMessage()}\n\n");
         fwrite(STDERR, "  Migration interrompue. Corrigez le fichier puis relancez.\n\n");
         exit(1);
     }
-
-    $pdo->prepare(
-        'INSERT INTO schema_migrations (filename, checksum, kind, statements)
-         VALUES (:filename, :checksum, :kind, :statements)'
-    )->execute([
-        'filename'   => $file['name'],
-        'checksum'   => $file['checksum'],
-        'kind'       => $file['kind'],
-        'statements' => $executed,
-    ]);
 
     printf("  ✓ %-52s %3d instructions\n", $file['name'], $executed);
 }
 
 echo "\n  Terminé.\n\n";
 exit(0);
-
-// =====================================================================
-
-/**
- * Découpe un fichier SQL en instructions, en respectant les chaînes
- * littérales et les commentaires.
- *
- * @return string[]
- */
-function sql_split(string $sql): array
-{
-    $statements = [];
-    $current    = '';
-    $inString   = false;
-    $quoteChar  = '';
-    $length     = strlen($sql);
-
-    for ($i = 0; $i < $length; $i++) {
-        $char = $sql[$i];
-        $next = $sql[$i + 1] ?? '';
-
-        if (!$inString && (($char === '-' && $next === '-') || $char === '#')) {
-            while ($i < $length && $sql[$i] !== "\n") {
-                $i++;
-            }
-            $current .= "\n";
-            continue;
-        }
-
-        if (!$inString && $char === '/' && $next === '*') {
-            $end = strpos($sql, '*/', $i);
-            $i   = $end === false ? $length : $end + 1;
-            continue;
-        }
-
-        if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
-            if (!$inString) {
-                $inString  = true;
-                $quoteChar = $char;
-            } elseif ($char === $quoteChar) {
-                if ($next === $quoteChar) {
-                    $current .= $char . $next;
-                    $i++;
-                    continue;
-                }
-                $inString = false;
-            }
-        }
-
-        if ($char === ';' && !$inString) {
-            $statement = trim($current);
-
-            if ($statement !== '') {
-                $statements[] = $statement;
-            }
-
-            $current = '';
-            continue;
-        }
-
-        $current .= $char;
-    }
-
-    $statement = trim($current);
-
-    if ($statement !== '') {
-        $statements[] = $statement;
-    }
-
-    return $statements;
-}

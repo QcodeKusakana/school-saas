@@ -9,6 +9,109 @@
 
 declare(strict_types=1);
 
+// =====================================================================
+//  PÉRIMÈTRE DE LECTURE
+//
+//  Une permission dit ce qu'un utilisateur a le droit de FAIRE ; elle ne
+//  dit jamais SUR QUI. Les deux doivent être posés séparément, sans
+//  quoi « consulter un élève » devient « consulter tous les élèves ».
+//
+//  Cette couche manquait : ENSEIGNANT et PARENT détenaient student.view
+//  et lisaient donc l'intégralité du fichier de l'établissement.
+// =====================================================================
+
+/**
+ * Condition SQL restreignant la lecture au périmètre de l'utilisateur.
+ *
+ * Renvoie une condition portant sur l'alias `s` de la table students,
+ * et les paramètres associés.
+ *
+ * Trois cas, dans cet ordre :
+ *   1. student.view.all  → aucune restriction ;
+ *   2. compte rattaché à une fiche tuteur → ses enfants uniquement ;
+ *   3. tout le reste → aucun élève.
+ *
+ * Le cas 2 s'appuie sur guardians.user_id, c'est-à-dire sur un lien de
+ * données réel, et non sur le code du rôle : renommer ou dupliquer le
+ * rôle « PARENT » ne peut donc pas ouvrir le fichier par inadvertance.
+ *
+ * Le cas 3 refuse par défaut. L'enseignant en fait partie tant que la
+ * table teachers n'existe pas (phase 4) : mieux vaut une page vide,
+ * corrigible, qu'une divulgation, irréversible.
+ *
+ * @return array{0: string, 1: array<string, mixed>}
+ */
+function students_scope_clause(): array
+{
+    if (perm_has('student.view.all')) {
+        return ['1 = 1', []];
+    }
+
+    $userId = auth_id();
+
+    if ($userId !== null) {
+        $isGuardian = db_exists(
+            'SELECT 1 FROM guardians
+              WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
+              LIMIT 1',
+            ['school_id' => tenant_require(), 'user_id' => $userId]
+        );
+
+        if ($isGuardian) {
+            return [
+                's.id IN (SELECT sg.student_id
+                            FROM student_guardians sg
+                            JOIN guardians g ON g.id = sg.guardian_id
+                                            AND g.school_id = sg.school_id
+                           WHERE sg.school_id = :scope_school
+                             AND g.user_id = :scope_user
+                             AND g.deleted_at IS NULL)',
+                ['scope_school' => tenant_require(), 'scope_user' => $userId],
+            ];
+        }
+    }
+
+    return ['1 = 0', []];
+}
+
+/**
+ * L'utilisateur courant a-t-il le droit de consulter CET élève ?
+ *
+ * Utilisé par les contrôleurs avant d'afficher une fiche : la
+ * restriction de la liste ne protège rien si l'accès direct par
+ * identifiant reste ouvert.
+ */
+function students_can_view(int $studentId): bool
+{
+    [$clause, $params] = students_scope_clause();
+
+    if ($clause === '1 = 1') {
+        return true;
+    }
+
+    if ($clause === '1 = 0') {
+        return false;
+    }
+
+    return db_exists(
+        'SELECT 1 FROM students s
+          WHERE s.school_id = :school_id AND s.id = :id AND ' . $clause . ' LIMIT 1',
+        $params + ['school_id' => tenant_require(), 'id' => $studentId]
+    );
+}
+
+/**
+ * Échappe les jokers d'un terme destiné à un LIKE.
+ *
+ * Sans cela, un simple « % » saisi dans la barre de recherche
+ * transforme la recherche par préfixe — pensée pour l'index
+ * idx_student_names — en balayage complet de la table.
+ */
+function students_escape_like(string $term): string
+{
+    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
+}
+
 /**
  * Liste paginée des élèves, avec leur inscription de l'année demandée.
  *
@@ -20,11 +123,18 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
     $where  = ['s.school_id = :school_id', 's.deleted_at IS NULL'];
     $params = ['school_id' => tenant_require(), 'year_id' => $academicYearId];
 
+    // Périmètre d'abord : aucune autre condition ne doit pouvoir
+    // l'élargir. Un parent ne voit ses enfants quels que soient les
+    // filtres saisis dans l'interface.
+    [$scopeClause, $scopeParams] = students_scope_clause();
+    $where[] = $scopeClause;
+    $params += $scopeParams;
+
     // Recherche plein texte simple : nom, postnom, prénom, matricule.
     // LIKE 'terme%' sur les noms utilise l'index idx_student_names ;
     // un '%terme%' en tête l'empêcherait et forcerait un balayage complet.
     if (!empty($filters['q'])) {
-        $term = trim((string) $filters['q']);
+        $term = students_escape_like(trim((string) $filters['q']));
         $where[] = '(s.matricule LIKE :q_exact
                      OR s.last_name LIKE :q_start
                      OR s.post_name LIKE :q_start2
@@ -85,10 +195,16 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
     return ['rows' => $rows, 'total' => $total, 'pages' => $pages, 'page' => $page];
 }
 
-/** Fiche complète d'un élève. */
+/**
+ * Fiche complète d'un élève.
+ *
+ * Le filtre deleted_at est posé ici et pas seulement dans la recherche :
+ * sans lui, un dossier supprimé resterait consultable, modifiable et
+ * réinscriptible par accès direct à son identifiant.
+ */
 function students_repo_find(int $id): ?array
 {
-    return tenant_find('students', $id);
+    return tenant_one('students', 'id = :id AND deleted_at IS NULL', ['id' => $id]);
 }
 
 /** Élève retrouvé par son matricule (recherche du secrétariat). */
@@ -234,6 +350,28 @@ function guardians_repo_find(int $id): ?array
 function guardians_repo_find_by_phone(string $phone): ?array
 {
     return tenant_one('guardians', 'phone = :p AND deleted_at IS NULL', ['p' => $phone]);
+}
+
+/**
+ * Tuteur retrouvé par téléphone ET identité.
+ *
+ * Le téléphone seul ne suffit pas à identifier une personne : dans
+ * beaucoup de familles, le père et la mère donnent le même numéro, celui
+ * du foyer ou de l'unique téléphone de la maison. Dédupliquer sur ce seul
+ * critère revenait à rattacher la mère à l'élève alors que le secrétariat
+ * saisissait le père — silencieusement, sans le moindre avertissement.
+ *
+ * La comparaison porte donc sur le numéro et sur le nom. Elle reste
+ * insensible à la casse et aux accents (collation utf8mb4_unicode_ci),
+ * ce qui suffit pour retrouver le même parent d'un enfant à l'autre.
+ */
+function guardians_repo_find_same_person(string $phone, string $lastName, string $firstName): ?array
+{
+    return tenant_one(
+        'guardians',
+        'phone = :p AND last_name = :ln AND first_name = :fn AND deleted_at IS NULL',
+        ['p' => $phone, 'ln' => trim($lastName), 'fn' => trim($firstName)]
+    );
 }
 
 /** Liste paginée des tuteurs, avec le nombre d'enfants. */

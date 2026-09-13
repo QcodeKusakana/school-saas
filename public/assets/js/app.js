@@ -98,6 +98,41 @@
     }
 
     /* =================================================================
+       Soumission automatique d'un filtre
+       Usage : <select name="annee" data-auto-submit>
+
+       Ces sélecteurs portaient un onchange="this.form.submit()" écrit
+       directement dans le HTML. La politique de sécurité du contenu
+       (script-src 'self' 'nonce-…', sans unsafe-inline) interdit les
+       gestionnaires en attribut : le code n'était JAMAIS exécuté, et
+       comme ces formulaires n'ont pas de bouton d'envoi, changer
+       d'année scolaire était tout simplement impossible.
+
+       Le comportement vit donc ici, dans un fichier servi par le site
+       et chargé avec le nonce. Un bouton de secours est ajouté pour les
+       navigateurs sans JavaScript.
+       ================================================================= */
+
+    function initAutoSubmit() {
+        document.querySelectorAll('[data-auto-submit]').forEach((element) => {
+            const form = element.form;
+
+            if (!form) {
+                return;
+            }
+
+            element.addEventListener('change', () => form.submit());
+
+            // Sans JavaScript, le bouton reste visible et fonctionnel.
+            const fallback = form.querySelector('[data-auto-submit-fallback]');
+
+            if (fallback) {
+                fallback.hidden = true;
+            }
+        });
+    }
+
+    /* =================================================================
        Confirmation avant action destructive
        Usage : <button data-confirm="Supprimer cet élève ?">
        ================================================================= */
@@ -240,6 +275,7 @@
     document.addEventListener('DOMContentLoaded', function () {
         initSidebar();
         initPasswordToggles();
+        initAutoSubmit();
         initConfirmations();
         initSubmitGuard();
         initNetworkStatus();

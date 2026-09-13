@@ -20,6 +20,63 @@ function check(string $label, bool $ok, string $detail = ''): void
     printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
 }
 
+/**
+ * Ouvre une session de test au nom d'un utilisateur portant un rôle système.
+ *
+ * Les tests s'exécutaient jusqu'ici sans aucun utilisateur connecté :
+ * perm_all() renvoyait un tableau vide et la couche de permissions
+ * n'était donc jamais réellement traversée. Tout contrôle ajouté dans
+ * les services passait inaperçu.
+ *
+ * @return int Identifiant de l'utilisateur créé.
+ */
+function act_as(int $schoolId, string $roleCode): int
+{
+    static $counter = 0;
+    $counter++;
+
+    $userId = db_insert('users', [
+        'uuid'          => str_uuid(),
+        'school_id'     => $schoolId,
+        'username'      => 'test.' . strtolower($roleCode) . '.' . $counter,
+        'email'         => 'test' . $counter . '@example.test',
+        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
+        'last_name'     => 'TEST',
+        'first_name'    => ucfirst(strtolower($roleCode)),
+        'status'        => 'active',
+    ], true);
+
+    db_query(
+        'INSERT INTO user_roles (user_id, role_id)
+         SELECT :user_id, id FROM roles WHERE code = :code AND school_id IS NULL',
+        ['user_id' => $userId, 'code' => $roleCode],
+        true
+    );
+
+    $_SESSION['user_id']  = $userId;
+    $_SESSION['school_id'] = $schoolId;
+
+    // Les caches statiques sont remplis une fois par requête : sans
+    // rafraîchissement, le test conserverait les droits du rôle précédent.
+    // auth_user() met son résultat en cache statique : sans
+    // rafraîchissement, auth_id() renverrait l'utilisateur précédent et
+    // le périmètre serait calculé pour la mauvaise personne.
+    auth_user(true);
+    perm_all(true);
+    perm_roles(true);
+
+    return $userId;
+}
+
+/** Referme la session de test. */
+function act_as_nobody(): void
+{
+    unset($_SESSION['user_id'], $_SESSION['school_id']);
+    auth_user(true);
+    perm_all(true);
+    perm_roles(true);
+}
+
 /** Prépare une école complète : cycles, année, référentiel, programme, classe. */
 function build_school(string $code, string $name): array
 {
@@ -141,6 +198,7 @@ check('École A voit bien son élève', students_repo_find($studentA) !== null);
 // en premier et le test validerait pour la mauvaise raison.
 $enrollmentA = students_repo_enrollment($studentA, $a['year_id']);
 $crossClassroom = students_service_assign_classroom(
+    $studentA,
     (int) $enrollmentA['id'],
     $b['classroom_id']
 );
@@ -272,8 +330,22 @@ check(
     implode(', ', array_unique($types))
 );
 
+// Séparation des devoirs : clôturer un dossier n'est pas le modifier.
+act_as($a['school_id'], 'SECRETARIAT');
+tenant_set($a['school_id']);
+
+$refused = students_service_change_status($studentA, 'archived', 'Tentative');
+check(
+    'Le secrétariat ne peut pas archiver un dossier',
+    !$refused['ok'] && str_contains($refused['message'], 'droit'),
+    $refused['message']
+);
+
+act_as($a['school_id'], 'DIRECTION');
+tenant_set($a['school_id']);
+
 $graduated = students_service_change_status($studentA, 'graduated', 'Fin du cycle secondaire');
-check('Changement de statut : fin des études', $graduated['ok']);
+check('La direction clôture le dossier : fin des études', $graduated['ok'], $graduated['message']);
 
 $student = students_repo_find($studentA);
 check('Le dossier est conservé, pas supprimé', $student !== null && $student['status'] === 'graduated');

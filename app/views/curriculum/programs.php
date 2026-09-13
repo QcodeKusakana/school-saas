@@ -38,13 +38,14 @@ foreach ($options as $option) {
 
     <?php if (count($years) > 1): ?>
         <form method="get" action="<?= e(url('/referentiel/programmes')) ?>">
-            <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
+            <select name="annee" class="form-select form-select-sm" data-auto-submit>
                 <?php foreach ($years as $option): ?>
                     <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
                         <?= e($option['code']) ?>
                     </option>
                 <?php endforeach; ?>
             </select>
+            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
         </form>
     <?php endif; ?>
 </div>

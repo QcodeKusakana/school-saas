@@ -27,6 +27,7 @@ define('APP_PATH', BASE_PATH . '/app');
 
 require APP_PATH . '/core/helpers.php';
 require APP_PATH . '/core/logger.php';
+require __DIR__ . '/runner.php';
 
 $options = getopt('', ['fresh', 'demo', 'help']);
 
@@ -106,34 +107,45 @@ echo "  ✓ Base « {$dbName} » prête\n\n";
 // ---------------------------------------------------------------------
 // Exécution des fichiers SQL
 // ---------------------------------------------------------------------
-$files = [
-    'Schéma des tables'            => __DIR__ . '/schema.sql',
-    'Référentiel RDC et offres'    => __DIR__ . '/seeds/001_reference_data.sql',
-    'Permissions et rôles système' => __DIR__ . '/seeds/002_roles_permissions.sql',
-];
+// L'installateur n'a pas sa propre liste de fichiers : il applique le
+// catalogue commun (schéma, migrations, puis seeds), et l'enregistre au
+// fur et à mesure. C'est ce qui garantit qu'une base fraîchement
+// installée et une base migrée soient identiques, et que migrate.php
+// n'essaie jamais de rejouer ce que l'installateur a déjà appliqué.
+runner_ledger_ensure($pdo);
 
-foreach ($files as $label => $file) {
-    if (!is_file($file)) {
-        fwrite(STDERR, "  ✗ Fichier manquant : {$file}\n");
+$catalog = runner_catalog();
+
+foreach (runner_autobaseline($pdo, $catalog, runner_applied($pdo)) as $name) {
+    printf("  ≡ %-38s déjà en place, enregistré\n", $name);
+}
+
+$applied = runner_applied($pdo);
+$total   = 0;
+
+foreach ($catalog as $file) {
+    if (isset($applied[$file['name']])) {
+        continue;
+    }
+
+    if (!is_file($file['path'])) {
+        fwrite(STDERR, "  ✗ Fichier manquant : {$file['path']}\n");
         exit(1);
     }
 
-    $statements = sql_split((string) file_get_contents($file));
-    $count      = 0;
-
-    foreach ($statements as $statement) {
-        try {
-            $pdo->exec($statement);
-            $count++;
-        } catch (PDOException $e) {
-            fwrite(STDERR, "\n  ✗ Erreur dans {$label} :\n");
-            fwrite(STDERR, "    {$e->getMessage()}\n");
-            fwrite(STDERR, "    Instruction : " . substr(preg_replace('/\s+/', ' ', $statement) ?? '', 0, 160) . "…\n\n");
-            exit(1);
-        }
+    try {
+        $count = runner_apply($pdo, $file);
+    } catch (RuntimeException $e) {
+        fwrite(STDERR, "\n  ✗ {$e->getMessage()}\n\n");
+        exit(1);
     }
 
-    printf("  ✓ %-30s %3d instructions\n", $label, $count);
+    printf("  ✓ %-38s %3d instructions\n", $file['name'], $count);
+    $total++;
+}
+
+if ($total === 0) {
+    echo "  → Base déjà à jour, aucun fichier à appliquer.\n";
 }
 
 // ---------------------------------------------------------------------
@@ -316,80 +328,6 @@ exit(0);
 //  Fonctions utilitaires de l'installateur
 // =====================================================================
 
-/**
- * Découpe un fichier SQL en instructions.
- *
- * Tient compte des chaînes entre quotes et des commentaires, afin qu'un
- * point-virgule contenu dans un libellé ne coupe pas l'instruction.
- *
- * @return string[]
- */
-function sql_split(string $sql): array
-{
-    $statements = [];
-    $current    = '';
-    $inString   = false;
-    $quoteChar  = '';
-    $length     = strlen($sql);
-
-    for ($i = 0; $i < $length; $i++) {
-        $char = $sql[$i];
-        $next = $sql[$i + 1] ?? '';
-
-        // Commentaire sur une ligne
-        if (!$inString && (($char === '-' && $next === '-') || $char === '#')) {
-            while ($i < $length && $sql[$i] !== "\n") {
-                $i++;
-            }
-            $current .= "\n";
-            continue;
-        }
-
-        // Commentaire multi-lignes
-        if (!$inString && $char === '/' && $next === '*') {
-            $end = strpos($sql, '*/', $i);
-            $i   = $end === false ? $length : $end + 1;
-            continue;
-        }
-
-        // Entrée / sortie de chaîne
-        if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
-            if (!$inString) {
-                $inString  = true;
-                $quoteChar = $char;
-            } elseif ($char === $quoteChar) {
-                // '' à l'intérieur d'une chaîne = apostrophe échappée
-                if ($next === $quoteChar) {
-                    $current .= $char . $next;
-                    $i++;
-                    continue;
-                }
-                $inString = false;
-            }
-        }
-
-        if ($char === ';' && !$inString) {
-            $statement = trim($current);
-
-            if ($statement !== '') {
-                $statements[] = $statement;
-            }
-
-            $current = '';
-            continue;
-        }
-
-        $current .= $char;
-    }
-
-    $statement = trim($current);
-
-    if ($statement !== '') {
-        $statements[] = $statement;
-    }
-
-    return $statements;
-}
 
 /** Demande une valeur à l'utilisateur, avec valeur par défaut. */
 function prompt(string $label, string $default = ''): string

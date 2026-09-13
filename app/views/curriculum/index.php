@@ -34,7 +34,7 @@ $isEmpty        = $sections === [] && $subjects === [];
 
     <?php if (count($years) > 1): ?>
         <form method="get" action="<?= e(url('/referentiel')) ?>" class="d-flex gap-2">
-            <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
+            <select name="annee" class="form-select form-select-sm" data-auto-submit>
                 <?php foreach ($years as $option): ?>
                     <option value="<?= (int) $option['id'] ?>"
                         <?= $year !== null && (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
@@ -42,6 +42,7 @@ $isEmpty        = $sections === [] && $subjects === [];
                     </option>
                 <?php endforeach; ?>
             </select>
+            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
         </form>
     <?php endif; ?>
 </div>
