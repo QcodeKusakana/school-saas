@@ -1,0 +1,12 @@
+# Aucun fichier PHP ne doit être exécutable depuis les dossiers de
+# contenu statique : c'est la parade au téléversement d'un script
+# déguisé en image.
+#
+# Placé ici plutôt que dans public/.htaccess : la directive <If> ne peut
+# pas être imbriquée dans <FilesMatch>, et un fichier .htaccess dédié au
+# dossier concerné est de toute façon plus lisible.
+<FilesMatch "\.(php|phtml|php3|php4|php5|php7|php8|phar|cgi|pl)$">
+    Require all denied
+</FilesMatch>
+
+Options -Indexes -ExecCGI

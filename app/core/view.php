@@ -117,6 +117,16 @@ function script_tag(string $src = '', string $inline = ''): string
 /**
  * URL d'un fichier statique, avec un paramètre de version basé sur la
  * date de modification : le navigateur recharge le fichier dès qu'il change.
+ *
+ * Volontairement RELATIVE À LA RACINE (« /assets/css/app.css ») et non
+ * absolue. Le navigateur reprend alors de lui-même le schéma, l'hôte et
+ * le port de la page en cours d'affichage.
+ *
+ * C'est une protection concrète : une URL absolue construite à partir
+ * d'app.url casse silencieusement tout le rendu dès que la valeur
+ * configurée diffère de l'adresse réellement utilisée — mauvais port,
+ * localhost au lieu du nom d'hôte, HTTPS activé après coup. La page
+ * s'affiche alors sans aucun style, sans la moindre erreur visible.
  */
 function asset(string $path): string
 {
@@ -124,5 +134,5 @@ function asset(string $path): string
     $fullPath = BASE_PATH . '/public/' . $path;
     $version  = is_file($fullPath) ? (string) filemtime($fullPath) : (string) config('app.version');
 
-    return app_url($path) . '?v=' . $version;
+    return base_uri() . '/' . $path . '?v=' . $version;
 }

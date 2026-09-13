@@ -64,12 +64,21 @@ function redirect(string $path, int $status = 302): never
 {
     $host = parse_url($path, PHP_URL_HOST);
 
-    if ($host !== null && $host !== parse_url((string) config('app.url'), PHP_URL_HOST)) {
-        log_warning('Tentative de redirection externe bloquée', ['path' => $path]);
-        $path = '/';
+    // Une URL absolue vers un autre hôte que celui de la requête est
+    // refusée : c'est le vecteur classique de la redirection ouverte.
+    if ($host !== null) {
+        $currentHost = parse_url(app_origin(), PHP_URL_HOST);
+
+        if ($host !== $currentHost) {
+            log_warning('Tentative de redirection externe bloquée', ['path' => $path]);
+            $path = '/';
+            $host = null;
+        }
     }
 
-    $url = str_starts_with($path, 'http') ? $path : app_url($path);
+    // Redirection relative à la racine, pour la même raison qu'asset() et
+    // url() : elle reste valide quels que soient l'hôte et le port utilisés.
+    $url = $host !== null ? $path : base_uri() . '/' . ltrim($path, '/');
 
     if (!headers_sent()) {
         header('Location: ' . $url, true, $status);
@@ -115,6 +124,96 @@ function json_error(string $message, int $status = 400, array $errors = []): nev
         'message' => $message,
         'errors'  => $errors ?: null,
     ], static fn ($v) => $v !== null), $status);
+}
+
+/**
+ * Sert un fichier statique depuis PHP — filet de sécurité.
+ *
+ * ------------------------------------------------------------------
+ *  POURQUOI CETTE FONCTION EXISTE
+ * ------------------------------------------------------------------
+ * Normalement, Apache sert lui-même public/assets/… sans jamais faire
+ * appel à PHP. Mais si la racine web est mal positionnée, si
+ * mod_rewrite se comporte autrement que prévu, ou si un .htaccess est
+ * ignoré, ces requêtes retombent sur index.php et renvoient un 404 : la
+ * page s'affiche alors sans aucun style, sans erreur explicite.
+ *
+ * Cette fonction supprime cette classe entière de pannes. Le coût est
+ * nul dans le cas nominal, puisqu'elle n'est jamais atteinte.
+ *
+ * Sécurité : chemin résolu puis vérifié comme étant strictement sous
+ * public/assets, extensions en liste blanche, aucun fichier exécutable.
+ */
+function serve_static_file(string $path): void
+{
+    $mimeTypes = [
+        'css'   => 'text/css; charset=UTF-8',
+        'js'    => 'application/javascript; charset=UTF-8',
+        'map'   => 'application/json; charset=UTF-8',
+        'png'   => 'image/png',
+        'jpg'   => 'image/jpeg',
+        'jpeg'  => 'image/jpeg',
+        'gif'   => 'image/gif',
+        'webp'  => 'image/webp',
+        'svg'   => 'image/svg+xml',
+        'ico'   => 'image/x-icon',
+        'woff'  => 'font/woff',
+        'woff2' => 'font/woff2',
+        'ttf'   => 'font/ttf',
+        'eot'   => 'application/vnd.ms-fontobject',
+    ];
+
+    $relative  = ltrim($path, '/');
+    $extension = strtolower((string) pathinfo($relative, PATHINFO_EXTENSION));
+
+    if (!isset($mimeTypes[$extension])) {
+        return; // type non servi : on laisse le routeur répondre 404
+    }
+
+    $assetsRoot = realpath(BASE_PATH . '/public/assets');
+    $fullPath   = realpath(BASE_PATH . '/public/' . $relative);
+
+    // realpath résout « .. » : un chemin qui sortirait de public/assets
+    // est donc détecté ici, avant toute lecture.
+    if ($assetsRoot === false || $fullPath === false) {
+        return;
+    }
+
+    $assetsRoot = str_replace('\\', '/', $assetsRoot);
+    $fullPath   = str_replace('\\', '/', $fullPath);
+
+    if (!str_starts_with($fullPath, $assetsRoot . '/') || !is_file($fullPath)) {
+        return;
+    }
+
+    $lastModified = (int) filemtime($fullPath);
+    $etag         = '"' . md5($fullPath . $lastModified) . '"';
+
+    header('Content-Type: ' . $mimeTypes[$extension]);
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: public, max-age=31536000');
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $lastModified) . ' GMT');
+    header('ETag: ' . $etag);
+
+    // Réponse 304 si le navigateur possède déjà la version courante.
+    $ifNoneMatch     = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
+    $ifModifiedSince = $_SERVER['HTTP_IF_MODIFIED_SINCE'] ?? '';
+
+    if ($ifNoneMatch === $etag
+        || ($ifModifiedSince !== '' && strtotime($ifModifiedSince) >= $lastModified)
+    ) {
+        http_response_code(304);
+        exit;
+    }
+
+    header('Content-Length: ' . filesize($fullPath));
+
+    // Journalisé en avertissement : dans une installation correctement
+    // configurée, Apache devrait servir ce fichier sans passer par PHP.
+    log_warning('Fichier statique servi par PHP — vérifier la racine web', ['path' => $path]);
+
+    readfile($fullPath);
+    exit;
 }
 
 /**

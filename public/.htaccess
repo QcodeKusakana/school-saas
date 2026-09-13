@@ -6,14 +6,12 @@
 
 <IfModule mod_rewrite.c>
     RewriteEngine On
+    RewriteBase /
 
-    # Supprime le slash final (hors répertoires réels) pour éviter que
-    # /eleves et /eleves/ soient traités comme deux URL distinctes.
-    RewriteCond %{REQUEST_FILENAME} !-d
-    RewriteCond %{REQUEST_URI} (.+)/$
-    RewriteRule ^ %1 [L,R=301]
-
-    # Front controller
+    # Front controller.
+    # Un fichier ou un dossier existant (CSS, JS, images, polices) est
+    # servi directement par Apache : les deux conditions ci-dessous le
+    # garantissent et doivent rester en tête.
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteCond %{REQUEST_FILENAME} !-d
     RewriteRule ^ index.php [L]
@@ -22,15 +20,12 @@
 # Pas de listage de répertoire
 Options -Indexes
 
-# Aucun fichier PHP exécutable dans les dossiers d'upload publics
-<FilesMatch "\.(php|phtml|php3|php4|php5|php7|php8|phar)$">
-    <If "%{REQUEST_URI} =~ m#^/(assets|uploads)/#">
-        Require all denied
-    </If>
+# Fichiers sensibles jamais servis
+<FilesMatch "^(\.env|\.htaccess|\.git.*|composer\.(json|lock))$">
+    Require all denied
 </FilesMatch>
 
-# Fichiers sensibles jamais servis
-<FilesMatch "^(\.env|\.git.*|composer\.(json|lock)|.*\.sql|.*\.md|.*\.log)$">
+<FilesMatch "\.(sql|log|md|ini|yml|yaml|bak|tmp)$">
     Require all denied
 </FilesMatch>
 
@@ -44,8 +39,6 @@ Options -Indexes
     ExpiresByType image/svg+xml            "access plus 1 year"
     ExpiresByType image/webp               "access plus 1 year"
     ExpiresByType font/woff2               "access plus 1 year"
-    # Le service worker ne doit jamais être mis en cache par le navigateur.
-    ExpiresByType text/javascript          "access plus 0 seconds"
 </IfModule>
 
 <IfModule mod_deflate.c>
@@ -53,10 +46,9 @@ Options -Indexes
     AddOutputFilterByType DEFLATE application/javascript application/json
 </IfModule>
 
-# En-têtes de sécurité de secours (l'application les envoie déjà en PHP,
-# ceci couvre les fichiers statiques servis directement par Apache).
+# En-têtes de sécurité de secours pour les fichiers statiques
+# (l'application les envoie déjà elle-même pour les pages PHP).
 <IfModule mod_headers.c>
     Header always set X-Content-Type-Options "nosniff"
-    Header always set X-Frame-Options "SAMEORIGIN"
     Header always unset X-Powered-By
 </IfModule>

@@ -45,10 +45,63 @@ route('POST', '/mot-de-passe/changer',  'auth', 'ctrl_auth_change',          ['a
 route('GET',  '/tableau-de-bord',       'dashboard', 'ctrl_dashboard_index', ['auth']);
 
 // ---------------------------------------------------------------------
+// Phase 2 — Référentiel scolaire
+// ---------------------------------------------------------------------
+route('GET',  '/referentiel',                    'curriculum', 'ctrl_curriculum_index',            ['auth', 'perm:curriculum.view']);
+route('POST', '/referentiel/importer',           'curriculum', 'ctrl_curriculum_import',           ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/periodes',           'curriculum', 'ctrl_curriculum_create_periods',   ['auth', 'perm:curriculum.manage']);
+
+// Branches
+route('GET',  '/referentiel/branches',           'curriculum', 'ctrl_curriculum_subjects',         ['auth', 'perm:curriculum.view']);
+route('POST', '/referentiel/branches',           'curriculum', 'ctrl_curriculum_store_subject',    ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/branches/{id}',      'curriculum', 'ctrl_curriculum_update_subject',   ['auth', 'perm:curriculum.manage']);
+
+// Sections et options
+route('GET',  '/referentiel/sections',           'curriculum', 'ctrl_curriculum_sections',         ['auth', 'perm:curriculum.view']);
+route('POST', '/referentiel/sections/{id}/etat', 'curriculum', 'ctrl_curriculum_toggle_section',   ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/options/{id}/etat',  'curriculum', 'ctrl_curriculum_toggle_option',    ['auth', 'perm:curriculum.manage']);
+route('GET',  '/referentiel/sections/{id}/options', 'curriculum', 'ctrl_curriculum_section_options', ['auth', 'perm:curriculum.view']);
+
+// Programmes
+route('GET',  '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_programs',           ['auth', 'perm:curriculum.view']);
+route('POST', '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_store_program',      ['auth', 'perm:curriculum.manage']);
+route('GET',  '/referentiel/programmes/{id}',         'curriculum', 'ctrl_curriculum_show_program',       ['auth', 'perm:curriculum.view']);
+route('POST', '/referentiel/programmes/{id}/remplir', 'curriculum', 'ctrl_curriculum_fill_program',       ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/programmes/{id}/branches','curriculum', 'ctrl_curriculum_add_subject',        ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/programmes/{id}/maxima',  'curriculum', 'ctrl_curriculum_update_subjects',    ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/programmes/{id}/activer', 'curriculum', 'ctrl_curriculum_activate_program',   ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/programmes/{id}/dupliquer','curriculum','ctrl_curriculum_duplicate_program',  ['auth', 'perm:curriculum.manage']);
+route('POST', '/referentiel/programmes/{id}/branches/{subjectId}/retirer', 'curriculum', 'ctrl_curriculum_remove_subject', ['auth', 'perm:curriculum.manage']);
+
+// ---------------------------------------------------------------------
+// Phase 3 — Classes
+// ---------------------------------------------------------------------
+route('GET',  '/classes',            'classrooms', 'ctrl_classrooms_index',      ['auth', 'perm:classroom.view']);
+route('POST', '/classes',            'classrooms', 'ctrl_classrooms_store',      ['auth', 'perm:classroom.manage']);
+route('GET',  '/classes/{id}',       'classrooms', 'ctrl_classrooms_show',       ['auth', 'perm:classroom.view']);
+route('POST', '/classes/{id}',       'classrooms', 'ctrl_classrooms_update',     ['auth', 'perm:classroom.manage']);
+route('POST', '/classes/salles',     'classrooms', 'ctrl_classrooms_store_room', ['auth', 'perm:classroom.manage']);
+
+// ---------------------------------------------------------------------
+// Phase 3 — Élèves
+// ---------------------------------------------------------------------
+route('GET',  '/eleves',             'students', 'ctrl_students_index',        ['auth', 'perm:student.view']);
+route('GET',  '/eleves/nouveau',     'students', 'ctrl_students_create_form',  ['auth', 'perm:student.create']);
+route('POST', '/eleves',             'students', 'ctrl_students_store',        ['auth', 'perm:student.create']);
+route('GET',  '/eleves/recherche',   'students', 'ctrl_students_quick_search', ['auth', 'perm:student.view']);
+route('GET',  '/eleves/{id}',        'students', 'ctrl_students_show',         ['auth', 'perm:student.view']);
+route('POST', '/eleves/{id}',        'students', 'ctrl_students_update',       ['auth', 'perm:student.edit']);
+
+route('POST', '/eleves/{id}/reinscription', 'students', 'ctrl_students_re_enroll',    ['auth', 'perm:enrollment.manage']);
+route('POST', '/eleves/{id}/affectation',   'students', 'ctrl_students_assign',       ['auth', 'perm:classroom.assign']);
+route('POST', '/eleves/{id}/tuteurs',       'students', 'ctrl_students_add_guardian', ['auth', 'perm:student.edit']);
+route('POST', '/eleves/{id}/tuteurs/{linkId}/retirer', 'students', 'ctrl_students_detach_guardian', ['auth', 'perm:student.edit']);
+route('POST', '/eleves/{id}/orientation',   'students', 'ctrl_students_orient',        ['auth', 'perm:orientation.manage']);
+route('POST', '/eleves/{id}/statut',        'students', 'ctrl_students_change_status', ['auth', 'perm:student.edit']);
+
+// ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :
 //
-//   Phase 2 — référentiel   /referentiel/...
-//   Phase 3 — élèves        /eleves/...
 //   Phase 4 — pédagogie     /notes/..., /presences/...
 //   Phase 5 — finances      /finances/...
 //   Phase 6 — portails      /parent/..., /eleve/...

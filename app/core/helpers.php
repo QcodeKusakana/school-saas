@@ -53,7 +53,80 @@ function storage_path(string $path = ''): string
 /** URL absolue de l'application. */
 function app_url(string $path = ''): string
 {
-    return rtrim((string) config('app.url'), '/') . '/' . ltrim($path, '/');
+    return app_origin() . base_uri() . '/' . ltrim($path, '/');
+}
+
+/**
+ * Préfixe d'URL sous lequel l'application est servie.
+ *
+ * Retourne '' quand la racine web pointe sur public/ (cas normal), ou
+ * '/school-saas/public' quand l'application vit dans un sous-dossier.
+ *
+ * Déduit de SCRIPT_NAME, c'est-à-dire de la réalité du serveur — et non
+ * d'une valeur de configuration qui peut être fausse ou oubliée. C'est
+ * ce qui rend les liens CSS, JS et les redirections corrects quelle que
+ * soit la configuration d'Apache.
+ */
+function base_uri(): string
+{
+    static $base = null;
+
+    if ($base !== null) {
+        return $base;
+    }
+
+    $scriptName = $_SERVER['SCRIPT_NAME'] ?? '';
+
+    // SCRIPT_NAME doit désigner le script réellement exécuté
+    // (/index.php, ou /school-saas/public/index.php). Certains serveurs
+    // — dont le serveur intégré de PHP en mode routeur — y placent
+    // l'URI demandée : on ne s'y fie donc que s'il s'agit bien d'un
+    // fichier PHP, sinon on considère le préfixe comme vide.
+    if (!str_ends_with(strtolower($scriptName), '.php')) {
+        return $base = '';
+    }
+
+    $directory = str_replace('\\', '/', dirname($scriptName));
+
+    return $base = ($directory === '/' || $directory === '.') ? '' : rtrim($directory, '/');
+}
+
+/**
+ * Origine réelle de la requête : schéma + hôte + port.
+ *
+ * Reconstruite depuis les en-têtes de la requête plutôt que lue dans
+ * app.url. Conséquence directe : que l'on ouvre le site par
+ * school-saas.test:8000, localhost:8000 ou 127.0.0.1, les liens
+ * générés restent valides, sans aucune modification de configuration.
+ *
+ * app.url ne sert plus que hors contexte HTTP (ligne de commande,
+ * tâches planifiées, liens envoyés par email).
+ */
+function app_origin(): string
+{
+    static $origin = null;
+
+    if ($origin !== null) {
+        return $origin;
+    }
+
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+
+    if ($host === '') {
+        // Contexte CLI : on retombe sur la configuration.
+        return $origin = rtrim((string) config('app.url'), '/');
+    }
+
+    $isHttps = (($_SERVER['HTTPS'] ?? '') !== '' && ($_SERVER['HTTPS'] ?? '') !== 'off')
+        || (int) ($_SERVER['SERVER_PORT'] ?? 80) === 443;
+
+    // L'en-tête Host est fourni par le client : on le valide avant usage
+    // pour éviter qu'une valeur forgée ne se retrouve dans un lien.
+    if (!preg_match('/^[a-zA-Z0-9\.\-]+(:\d{1,5})?$/', $host)) {
+        return $origin = rtrim((string) config('app.url'), '/');
+    }
+
+    return $origin = ($isHttps ? 'https://' : 'http://') . $host;
 }
 
 /**

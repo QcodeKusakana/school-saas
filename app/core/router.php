@@ -237,10 +237,19 @@ function router_call(array $route, array $params): void
     $route['handler'](...$params);
 }
 
-/** Génère une URL interne. Centralise les chemins pour faciliter les refontes. */
+/**
+ * Génère une URL interne, relative à la racine du site.
+ *
+ * Comme asset(), volontairement relative : le navigateur complète avec
+ * l'origine de la page courante. Les liens restent donc valides quel que
+ * soit l'hôte ou le port par lequel on accède à l'application.
+ *
+ * Pour un lien absolu destiné à sortir de l'application (email de
+ * réinitialisation, QR code d'un bulletin), utiliser app_url().
+ */
 function url(string $path = '/', array $query = []): string
 {
-    $url = app_url($path);
+    $url = base_uri() . '/' . ltrim($path, '/');
 
     if ($query !== []) {
         $url .= (str_contains($url, '?') ? '&' : '?') . http_build_query($query);

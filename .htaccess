@@ -4,9 +4,10 @@
 #  Cas normal : la racine web pointe sur /public et ce fichier n'est
 #  jamais lu.
 #
-#  Cas cPanel mutualisé où la racine web ne peut pas être déplacée :
-#  ce fichier redirige tout le trafic vers public/ tout en interdisant
-#  l'accès direct à app/, storage/ et database/.
+#  Cas où la racine web ne peut pas être déplacée (mutualisé, ou hôte
+#  virtuel généré avant l'existence du dossier public) : ce fichier
+#  redirige le trafic vers public/ et interdit l'accès aux dossiers
+#  internes.
 # =====================================================================
 
 Options -Indexes
@@ -14,16 +15,21 @@ Options -Indexes
 <IfModule mod_rewrite.c>
     RewriteEngine On
 
-    # Bloque tout accès direct aux dossiers internes.
-    RewriteRule ^(app|storage|database|docs)/ - [F,L]
+    # Aucun accès direct aux dossiers internes.
+    RewriteRule ^(app|storage|database|docs|tests)/ - [F,L]
 
-    # Redirige le reste vers public/
-    RewriteCond %{REQUEST_URI} !^/public/
-    RewriteRule ^(.*)$ public/$1 [L]
+    # Redirection vers public/.
+    #
+    # Le (?!public/) est indispensable : après une réécriture interne,
+    # %{REQUEST_URI} conserve l'URI D'ORIGINE et ne reflète pas le
+    # nouveau chemin. Une condition portant sur REQUEST_URI resterait
+    # donc vraie à chaque passe et produirait public/public/public/…
+    # jusqu'à épuisement de LimitInternalRecursion.
+    # Le motif, lui, s'applique bien au chemin réécrit : la boucle
+    # s'arrête d'elle-même.
+    RewriteRule ^(?!public/)(.*)$ public/$1 [L]
 </IfModule>
 
-# Ceinture et bretelles : même si mod_rewrite est absent, ces fichiers
-# ne doivent jamais être servis.
 <FilesMatch "\.(sql|log|md|json|lock|ini|yml|yaml)$">
     Require all denied
 </FilesMatch>

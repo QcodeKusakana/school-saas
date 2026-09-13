@@ -57,6 +57,7 @@ require APP_PATH . '/core/db.php';
 require APP_PATH . '/core/tenant.php';
 require APP_PATH . '/core/session.php';
 require APP_PATH . '/core/csrf.php';
+require APP_PATH . '/core/settings.php';
 require APP_PATH . '/core/security.php';
 require APP_PATH . '/core/validator.php';
 require APP_PATH . '/core/request.php';

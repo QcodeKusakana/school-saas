@@ -25,11 +25,17 @@ function request_method(): string
     return $method;
 }
 
-/** Chemin demandé, sans query string ni sous-dossier d'installation. */
+/**
+ * Chemin demandé, sans query string ni sous-dossier d'installation.
+ *
+ * Le préfixe est retiré via base_uri(), la même fonction que celle
+ * utilisée pour construire les liens : les deux ne peuvent donc pas
+ * diverger. Une URL produite par url() est toujours reconnue ici.
+ */
 function request_path(): string
 {
     $uri  = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
-    $base = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? ''), '/\\');
+    $base = base_uri();
 
     if ($base !== '' && str_starts_with($uri, $base)) {
         $uri = substr($uri, strlen($base));

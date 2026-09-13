@@ -17,6 +17,22 @@ declare(strict_types=1);
 require dirname(__DIR__) . '/app/bootstrap.php';
 
 // ---------------------------------------------------------------------
+// Filet de sécurité pour les fichiers statiques.
+//
+// Si une requête vers /assets/… parvient jusqu'ici, c'est qu'Apache ne
+// l'a pas servie lui-même — racine web mal positionnée, .htaccess
+// ignoré, mod_rewrite absent. On sert le fichier plutôt que de renvoyer
+// un 404 qui afficherait la page sans aucun style.
+//
+// Placé AVANT les en-têtes de sécurité : un fichier statique n'a pas
+// besoin de la politique de sécurité du contenu, qui ne vise que les
+// documents HTML.
+// ---------------------------------------------------------------------
+if (str_starts_with(request_path(), '/assets/')) {
+    serve_static_file(request_path());
+}
+
+// ---------------------------------------------------------------------
 // En-têtes de sécurité, sur chaque réponse.
 // ---------------------------------------------------------------------
 response_security_headers();
