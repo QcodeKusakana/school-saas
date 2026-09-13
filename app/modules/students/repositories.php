@@ -9,6 +9,13 @@
 
 declare(strict_types=1);
 
+// Le périmètre de l'enseignant est défini par le module enseignants, qui
+// en est la source unique. On le charge explicitement plutôt que de
+// réécrire la requête ici : deux définitions du même périmètre finissent
+// toujours par diverger, et c'est le genre de divergence qui ouvre un
+// accès sans que personne ne s'en aperçoive.
+require_once __DIR__ . '/../teachers/repositories.php';
+
 // =====================================================================
 //  PÉRIMÈTRE DE LECTURE
 //
@@ -26,18 +33,25 @@ declare(strict_types=1);
  * Renvoie une condition portant sur l'alias `s` de la table students,
  * et les paramètres associés.
  *
- * Trois cas, dans cet ordre :
+ * Quatre cas, dans cet ordre :
  *   1. student.view.all  → aucune restriction ;
  *   2. compte rattaché à une fiche tuteur → ses enfants uniquement ;
- *   3. tout le reste → aucun élève.
+ *   3. compte rattaché à une fiche enseignant → les élèves de ses
+ *      classes, qu'il en soit titulaire ou qu'il y assure une branche ;
+ *   4. tout le reste → aucun élève.
  *
- * Le cas 2 s'appuie sur guardians.user_id, c'est-à-dire sur un lien de
- * données réel, et non sur le code du rôle : renommer ou dupliquer le
- * rôle « PARENT » ne peut donc pas ouvrir le fichier par inadvertance.
+ * Les cas 2 et 3 s'appuient sur un lien de données réel — guardians.user_id,
+ * teachers.user_id — et non sur le code du rôle : renommer ou dupliquer
+ * le rôle « PARENT » ou « ENSEIGNANT » ne peut donc pas ouvrir le
+ * fichier par inadvertance.
  *
- * Le cas 3 refuse par défaut. L'enseignant en fait partie tant que la
- * table teachers n'existe pas (phase 4) : mieux vaut une page vide,
- * corrigible, qu'une divulgation, irréversible.
+ * Le tuteur passe avant l'enseignant. Un enseignant dont l'enfant est
+ * scolarisé dans l'établissement est les deux à la fois ; le périmètre
+ * le plus large des deux lui revient, et c'est celui de l'enseignant —
+ * il est donc calculé en réunissant les deux ensembles.
+ *
+ * Le cas 4 refuse par défaut : mieux vaut une page vide, corrigible,
+ * qu'une divulgation, irréversible.
  *
  * @return array{0: string, 1: array<string, mixed>}
  */
@@ -49,29 +63,61 @@ function students_scope_clause(): array
 
     $userId = auth_id();
 
-    if ($userId !== null) {
-        $isGuardian = db_exists(
-            'SELECT 1 FROM guardians
-              WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
-              LIMIT 1',
-            ['school_id' => tenant_require(), 'user_id' => $userId]
-        );
-
-        if ($isGuardian) {
-            return [
-                's.id IN (SELECT sg.student_id
-                            FROM student_guardians sg
-                            JOIN guardians g ON g.id = sg.guardian_id
-                                            AND g.school_id = sg.school_id
-                           WHERE sg.school_id = :scope_school
-                             AND g.user_id = :scope_user
-                             AND g.deleted_at IS NULL)',
-                ['scope_school' => tenant_require(), 'scope_user' => $userId],
-            ];
-        }
+    if ($userId === null) {
+        return ['1 = 0', []];
     }
 
-    return ['1 = 0', []];
+    $schoolId   = tenant_require();
+    $conditions = [];
+    $params     = [];
+
+    // --- Tuteur : ses enfants -----------------------------------------
+    $isGuardian = db_exists(
+        'SELECT 1 FROM guardians
+          WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
+          LIMIT 1',
+        ['school_id' => $schoolId, 'user_id' => $userId]
+    );
+
+    if ($isGuardian) {
+        $conditions[] = 's.id IN (SELECT sg.student_id
+                                    FROM student_guardians sg
+                                    JOIN guardians g ON g.id = sg.guardian_id
+                                                    AND g.school_id = sg.school_id
+                                   WHERE sg.school_id = :scope_school
+                                     AND g.user_id = :scope_user
+                                     AND g.deleted_at IS NULL)';
+        $params['scope_school'] = $schoolId;
+        $params['scope_user']   = $userId;
+    }
+
+    // --- Enseignant : les élèves de ses classes ------------------------
+    //
+    // Le périmètre est calculé à partir de teacher_subjects et de
+    // classrooms.main_teacher_id, via le module enseignants qui en est
+    // la source unique. Refaire la requête ici créerait deux définitions
+    // du périmètre, qui finiraient par diverger.
+    $classroomIds = teachers_scope_classroom_ids();
+
+    if ($classroomIds !== []) {
+        // Les identifiants viennent de la base, jamais de l'utilisateur,
+        // et sont malgré tout castés : une liste interpolée doit être
+        // sûre par construction, pas par confiance.
+        $inList = implode(',', array_map('intval', $classroomIds));
+
+        $conditions[] = 's.id IN (SELECT e2.student_id
+                                    FROM enrollments e2
+                                   WHERE e2.school_id = :scope_school_t
+                                     AND e2.classroom_id IN (' . $inList . ')
+                                     AND e2.status <> \'cancelled\')';
+        $params['scope_school_t'] = $schoolId;
+    }
+
+    if ($conditions === []) {
+        return ['1 = 0', []];
+    }
+
+    return ['(' . implode(' OR ', $conditions) . ')', $params];
 }
 
 /**

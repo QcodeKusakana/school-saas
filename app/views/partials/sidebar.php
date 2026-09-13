@@ -69,26 +69,26 @@ $isPlatform = $user['school_id'] === null;
                 </a>
             <?php endif; ?>
 
-            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view'])): ?>
+            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view', 'teacher.view'])): ?>
                 <p class="nav-heading">Pédagogie</p>
-                <?php if (can('grade.view')): ?>
+                <?php if (can('grade.view') && route_exists('/notes')): ?>
                     <a class="nav-item <?= nav_active('/notes') ?>" href="<?= e(url('/notes')) ?>">
                         <i class="bi bi-journal-check"></i><span>Notes et bulletins</span>
                     </a>
                 <?php endif; ?>
-                <?php if (can('attendance.view')): ?>
+                <?php if (can('attendance.view') && route_exists('/presences')): ?>
                     <a class="nav-item <?= nav_active('/presences') ?>" href="<?= e(url('/presences')) ?>">
                         <i class="bi bi-calendar-check"></i><span>Présences</span>
                     </a>
                 <?php endif; ?>
-                <?php if (can('teacher.view')): ?>
+                <?php if (can('teacher.view') && route_exists('/enseignants')): ?>
                     <a class="nav-item <?= nav_active('/enseignants') ?>" href="<?= e(url('/enseignants')) ?>">
                         <i class="bi bi-person-video3"></i><span>Enseignants</span>
                     </a>
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (can('finance.view')): ?>
+            <?php if (can('finance.view') && route_exists('/finances')): ?>
                 <p class="nav-heading">Finances</p>
                 <a class="nav-item <?= nav_active('/finances') ?>" href="<?= e(url('/finances')) ?>">
                     <i class="bi bi-cash-coin"></i><span>Frais et paiements</span>
@@ -98,25 +98,25 @@ $isPlatform = $user['school_id'] === null;
             <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
-                <?php if (can('academic_year.view')): ?>
+                <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
                     <a class="nav-item <?= nav_active('/annees-scolaires') ?>" href="<?= e(url('/annees-scolaires')) ?>">
                         <i class="bi bi-calendar3"></i><span>Années scolaires</span>
                     </a>
                 <?php endif; ?>
 
-                <?php if (can('curriculum.view')): ?>
+                <?php if (can('curriculum.view') && route_exists('/referentiel')): ?>
                     <a class="nav-item <?= nav_active('/referentiel') ?>" href="<?= e(url('/referentiel')) ?>">
                         <i class="bi bi-diagram-3"></i><span>Référentiel scolaire</span>
                     </a>
                 <?php endif; ?>
 
-                <?php if (can('user.view')): ?>
+                <?php if (can('user.view') && route_exists('/utilisateurs')): ?>
                     <a class="nav-item <?= nav_active('/utilisateurs') ?>" href="<?= e(url('/utilisateurs')) ?>">
                         <i class="bi bi-person-badge"></i><span>Utilisateurs</span>
                     </a>
                 <?php endif; ?>
 
-                <?php if (can('school.edit')): ?>
+                <?php if (can('school.edit') && route_exists('/ecole/parametres')): ?>
                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
                         <i class="bi bi-gear"></i><span>Mon établissement</span>
                     </a>

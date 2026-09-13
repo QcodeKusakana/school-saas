@@ -67,6 +67,20 @@ function router_has_route(string $method, string $pattern): bool
 }
 
 /**
+ * La page existe-t-elle ? (raccourci GET, pour les menus)
+ *
+ * La barre latérale annonce les modules des phases à venir. Sans ce
+ * contrôle, elle propose des liens qui renvoient une page introuvable :
+ * l'utilisateur croit à une panne alors que la fonctionnalité n'est pas
+ * encore livrée. Les entrées apparaissent d'elles-mêmes dès que la route
+ * correspondante est déclarée.
+ */
+function route_exists(string $path): bool
+{
+    return router_has_route('GET', $path);
+}
+
+/**
  * Résout la requête courante et exécute le gestionnaire correspondant.
  */
 function router_dispatch(): void

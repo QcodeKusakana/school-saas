@@ -100,6 +100,26 @@ route('POST', '/eleves/{id}/orientation',   'students', 'ctrl_students_orient', 
 route('POST', '/eleves/{id}/statut',        'students', 'ctrl_students_change_status', ['auth', 'school', 'perm:student.edit']);
 
 // ---------------------------------------------------------------------
+// Phase 4A — Enseignants et répartition des branches
+//
+// La répartition est rattachée à la CLASSE et non à l'enseignant : le
+// préfet des études raisonne classe par classe, branche par branche.
+// Elle exige teacher.assign, distincte de teacher.manage : confier une
+// branche n'est pas modifier un dossier de personnel.
+// ---------------------------------------------------------------------
+route('GET',  '/enseignants',          'teachers', 'ctrl_teachers_index',         ['auth', 'school', 'perm:teacher.view']);
+route('GET',  '/enseignants/nouveau',  'teachers', 'ctrl_teachers_create_form',   ['auth', 'school', 'perm:teacher.manage']);
+route('POST', '/enseignants',          'teachers', 'ctrl_teachers_store',         ['auth', 'school', 'perm:teacher.manage']);
+route('GET',  '/enseignants/{id}',     'teachers', 'ctrl_teachers_show',          ['auth', 'school', 'perm:teacher.view']);
+route('POST', '/enseignants/{id}',     'teachers', 'ctrl_teachers_update',        ['auth', 'school', 'perm:teacher.manage']);
+route('POST', '/enseignants/{id}/statut', 'teachers', 'ctrl_teachers_change_status', ['auth', 'school', 'perm:teacher.manage']);
+
+route('GET',  '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_classroom_grid', ['auth', 'school', 'perm:teacher.view']);
+route('POST', '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_assign',         ['auth', 'school', 'perm:teacher.assign']);
+route('POST', '/classes/{id}/repartition/{assignment_id}/retirer', 'teachers', 'ctrl_teachers_unassign', ['auth', 'school', 'perm:teacher.assign']);
+route('POST', '/classes/{id}/titulaire',                    'teachers', 'ctrl_teachers_set_main',       ['auth', 'school', 'perm:teacher.assign']);
+
+// ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :
 //
 //   Phase 4 — pédagogie     /notes/..., /presences/...
