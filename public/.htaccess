@@ -1,0 +1,62 @@
+# =====================================================================
+#  Racine web de l'application.
+#  Toutes les requêtes qui ne correspondent pas à un fichier réel
+#  sont dirigées vers index.php.
+# =====================================================================
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Supprime le slash final (hors répertoires réels) pour éviter que
+    # /eleves et /eleves/ soient traités comme deux URL distinctes.
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} (.+)/$
+    RewriteRule ^ %1 [L,R=301]
+
+    # Front controller
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# Pas de listage de répertoire
+Options -Indexes
+
+# Aucun fichier PHP exécutable dans les dossiers d'upload publics
+<FilesMatch "\.(php|phtml|php3|php4|php5|php7|php8|phar)$">
+    <If "%{REQUEST_URI} =~ m#^/(assets|uploads)/#">
+        Require all denied
+    </If>
+</FilesMatch>
+
+# Fichiers sensibles jamais servis
+<FilesMatch "^(\.env|\.git.*|composer\.(json|lock)|.*\.sql|.*\.md|.*\.log)$">
+    Require all denied
+</FilesMatch>
+
+# Mise en cache des ressources statiques
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType text/css                 "access plus 1 year"
+    ExpiresByType application/javascript   "access plus 1 year"
+    ExpiresByType image/png                "access plus 1 year"
+    ExpiresByType image/jpeg               "access plus 1 year"
+    ExpiresByType image/svg+xml            "access plus 1 year"
+    ExpiresByType image/webp               "access plus 1 year"
+    ExpiresByType font/woff2               "access plus 1 year"
+    # Le service worker ne doit jamais être mis en cache par le navigateur.
+    ExpiresByType text/javascript          "access plus 0 seconds"
+</IfModule>
+
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/css text/plain text/xml
+    AddOutputFilterByType DEFLATE application/javascript application/json
+</IfModule>
+
+# En-têtes de sécurité de secours (l'application les envoie déjà en PHP,
+# ceci couvre les fichiers statiques servis directement par Apache).
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always unset X-Powered-By
+</IfModule>

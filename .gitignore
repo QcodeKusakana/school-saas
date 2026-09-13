@@ -1,0 +1,26 @@
+# Secrets et configuration locale
+/app/config/config.local.php
+
+# Données générées à l'exécution
+/storage/logs/*
+/storage/sessions/*
+/storage/cache/*
+/storage/uploads/*
+/storage/backups/*
+!/storage/**/.gitkeep
+
+# Dépendances
+/vendor/
+/node_modules/
+
+# Outils
+.idea/
+.vscode/
+*.sublime-*
+.DS_Store
+Thumbs.db
+
+# Sauvegardes et fichiers temporaires
+*.bak
+*.tmp
+*~
