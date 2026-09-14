@@ -1,0 +1,592 @@
+From 2084866400de9aa4dd3689ef94c87399509dacf2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 13 Sep 2026 21:01:37 +0000
+Subject: [PATCH 4/5] =?UTF-8?q?Audit=20phase=204A=20:=20le=20p=C3=A9rim?=
+ =?UTF-8?q?=C3=A8tre=20ne=20valait=20que=20pour=20la=20porte=20principale?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GRAVE — /classes/{id} exposait la liste nominative de toute classe
+students_repo_classroom_students() n'appliquait aucun périmètre. Le rôle
+ENSEIGNANT détient « classroom.view » : ouvrir la classe voisine suffisait
+à lire matricules, noms, sexes et dates de naissance de ses élèves.
+/eleves et /eleves/{id} étaient protégés, pas cette porte-là. Une
+restriction d'accès ne vaut que si toutes les portes la portent.
+Ajout de la clause de périmètre au dépôt, et de
+students_can_view_classroom() en garde du contrôleur — masquer la liste
+ne suffit pas, l'effectif et le titulaire sont aussi des informations de
+gestion.
+
+ÉLEVÉ — le périmètre enseignant ignorait l'année
+teachers_scope_classroom_ids() acceptait une année ; elle n'était jamais
+passée. Les classes s'accumulaient donc d'une année sur l'autre : un
+professeur gardait à vie l'accès au dossier COURANT — adresse, tuteurs,
+téléphones — de tout élève qu'il avait eu une seule fois. Sur une
+carrière, son périmètre couvrait l'établissement entier.
+students_scope_clause() et students_can_view() acceptent désormais
+l'année consultée.
+
+MOYEN
+- teachers_service_set_main_teacher() ne vérifiait pas la clôture de
+  l'année. La vue masquait le formulaire ; un envoi direct réécrivait le
+  titulaire d'une année archivée, donc le nom porté par des bulletins
+  déjà produits.
+- Le motif de changement de statut était écrit dans `notes`, champ libre
+  de la fiche : suspendre un enseignant effaçait son contenu sans retour
+  possible. Colonne dédiée status_reason (migration 006).
+- ctrl_teachers_unassign() ignorait la classe de l'URL : un envoi sur
+  /classes/12/repartition/999/retirer retirait l'affectation 999 même si
+  elle relevait de la classe 40. Même IDOR qu'en phase 3 sur les élèves.
+- Violation d'unicité en cas d'attribution concurrente : page 500 au lieu
+  d'un message. Traduction du SQLSTATE 23000.
+
+FAIBLE
+- teachers_repo_available_users() interrogée même sans teacher.manage.
+- Fonction morte teachers_current_is_teacher() retirée.
+
+Tests : 153 au vert (17 + 25 + 35 + 25 + 51), dont 9 nouveaux couvrant
+exactement les failles ci-dessus.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+---
+ app/modules/classrooms/controllers.php        |  13 +-
+ app/modules/students/repositories.php         |  55 ++++++-
+ app/modules/teachers/controllers.php          |   8 +-
+ app/modules/teachers/repositories.php         |  13 --
+ app/modules/teachers/services.php             |  77 +++++++--
+ .../2026_09_13_006_teachers_statut.sql        |  25 +++
+ tests/teachers_isolation.php                  | 148 +++++++++++++++++-
+ 7 files changed, 299 insertions(+), 40 deletions(-)
+ create mode 100644 database/migrations/2026_09_13_006_teachers_statut.sql
+
+diff --git a/app/modules/classrooms/controllers.php b/app/modules/classrooms/controllers.php
+index 7ff209f..4c66ff5 100644
+--- a/app/modules/classrooms/controllers.php
++++ b/app/modules/classrooms/controllers.php
+@@ -230,12 +230,19 @@ function ctrl_classrooms_show(string $id): void
+     $classroomId = (int) $id;
+     $classroom   = tenant_find('classrooms', $classroomId);
+ 
+-    if ($classroom === null) {
++    require_once APP_PATH . '/modules/students/repositories.php';
++
++    // Le périmètre vaut pour la classe entière, pas seulement pour la
++    // liste nominative : l'effectif, le taux de remplissage et le nom du
++    // titulaire sont eux aussi des informations de gestion.
++    //
++    // 404 et non 403 : confirmer l'existence d'une classe qu'on n'a pas
++    // le droit de consulter renseigne déjà sur l'organisation de
++    // l'établissement.
++    if ($classroom === null || !students_can_view_classroom($classroomId)) {
+         abort(404, 'Classe introuvable.');
+     }
+ 
+-    require_once APP_PATH . '/modules/students/repositories.php';
+-
+     $details = db_one(
+         'SELECT c.*, cu.name AS curriculum_name, l.name AS level_name,
+                 sec.name AS section_name, opt.name AS option_name,
+diff --git a/app/modules/students/repositories.php b/app/modules/students/repositories.php
+index 06b6e5d..69edf76 100644
+--- a/app/modules/students/repositories.php
++++ b/app/modules/students/repositories.php
+@@ -55,7 +55,7 @@ require_once __DIR__ . '/../teachers/repositories.php';
+  *
+  * @return array{0: string, 1: array<string, mixed>}
+  */
+-function students_scope_clause(): array
++function students_scope_clause(?int $yearId = null): array
+ {
+     if (perm_has('student.view.all')) {
+         return ['1 = 1', []];
+@@ -97,7 +97,18 @@ function students_scope_clause(): array
+     // classrooms.main_teacher_id, via le module enseignants qui en est
+     // la source unique. Refaire la requête ici créerait deux définitions
+     // du périmètre, qui finiraient par diverger.
+-    $classroomIds = teachers_scope_classroom_ids();
++    //
++    // Le périmètre est BORNÉ À L'ANNÉE consultée. Sans cette borne, les
++    // classes s'accumulent d'année en année : un professeur conservait
++    // l'accès au dossier COURANT — adresse, tuteurs, téléphones — de
++    // tout élève qu'il avait eu une seule fois. Sur une carrière, son
++    // périmètre finissait par couvrir l'établissement entier.
++    //
++    // Consulter l'historique d'un ancien élève reste possible en
++    // changeant d'année : il a bien enseigné à cet élève cette
++    // année-là. Ce qui n'est plus possible, c'est d'y accéder depuis
++    // l'année en cours.
++    $classroomIds = teachers_scope_classroom_ids($yearId);
+ 
+     if ($classroomIds !== []) {
+         // Les identifiants viennent de la base, jamais de l'utilisateur,
+@@ -127,9 +138,9 @@ function students_scope_clause(): array
+  * restriction de la liste ne protège rien si l'accès direct par
+  * identifiant reste ouvert.
+  */
+-function students_can_view(int $studentId): bool
++function students_can_view(int $studentId, ?int $yearId = null): bool
+ {
+-    [$clause, $params] = students_scope_clause();
++    [$clause, $params] = students_scope_clause($yearId);
+ 
+     if ($clause === '1 = 1') {
+         return true;
+@@ -172,7 +183,7 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
+     // Périmètre d'abord : aucune autre condition ne doit pouvoir
+     // l'élargir. Un parent ne voit ses enfants quels que soient les
+     // filtres saisis dans l'interface.
+-    [$scopeClause, $scopeParams] = students_scope_clause();
++    [$scopeClause, $scopeParams] = students_scope_clause($academicYearId);
+     $where[] = $scopeClause;
+     $params += $scopeParams;
+ 
+@@ -372,17 +383,49 @@ function students_repo_year_stats(int $academicYearId): array
+ /** Élèves d'une classe. */
+ function students_repo_classroom_students(int $classroomId): array
+ {
++    // Le périmètre s'applique ICI AUSSI.
++    //
++    // Protéger /eleves et /eleves/{id} ne sert à rien si la liste
++    // nominative d'une classe reste ouverte par ailleurs : le rôle
++    // ENSEIGNANT détient « classroom.view », et cette fonction alimente
++    // l'écran d'une classe. Sans cette clause, il suffisait d'ouvrir
++    // /classes/{id} d'une classe voisine pour lire matricules, noms,
++    // sexes et dates de naissance de ses élèves.
++    //
++    // Une restriction d'accès ne vaut que si TOUTES les portes la
++    // portent. C'est la deuxième fois que ce défaut apparaît dans ce
++    // projet, sous une forme différente.
++    [$scope, $scopeParams] = students_scope_clause();
++
+     return db_all(
+         'SELECT s.*, e.id AS enrollment_id, e.status AS enrollment_status, e.decision
+            FROM enrollments e
+            JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
+           WHERE e.school_id = :school_id AND e.classroom_id = :classroom_id
+             AND e.status <> \'cancelled\' AND s.deleted_at IS NULL
++            AND ' . $scope . '
+           ORDER BY s.last_name, s.post_name, s.first_name',
+-        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
++        $scopeParams + ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
+     );
+ }
+ 
++/**
++ * L'utilisateur courant peut-il consulter CETTE classe ?
++ *
++ * Le périmètre de l'enseignant porte sur des classes : il est donc
++ * calculable directement, sans passer par les élèves. Masquer la liste
++ * nominative ne suffirait pas — l'effectif, le taux de remplissage et le
++ * nom du titulaire restent des informations de gestion.
++ */
++function students_can_view_classroom(int $classroomId): bool
++{
++    if (perm_has('student.view.all') || perm_has('classroom.manage')) {
++        return true;
++    }
++
++    return in_array($classroomId, teachers_scope_classroom_ids(), true);
++}
++
+ // =====================================================================
+ //  TUTEURS
+ // =====================================================================
+diff --git a/app/modules/teachers/controllers.php b/app/modules/teachers/controllers.php
+index 263fab5..1f6d43e 100644
+--- a/app/modules/teachers/controllers.php
++++ b/app/modules/teachers/controllers.php
+@@ -80,7 +80,11 @@ function ctrl_teachers_show(string $id): void
+         'weeklyLoad'     => $yearId > 0 ? teachers_repo_weekly_load($teacherId, $yearId) : 0.0,
+         'statuses'       => TEACHER_STATUSES,
+         'employmentTypes' => TEACHER_EMPLOYMENT_TYPES,
+-        'availableUsers' => teachers_repo_available_users($teacherId),
++        // La liste des comptes n'est rendue que sous teacher.manage :
++        // inutile de l'interroger pour un consultant en lecture seule.
++        'availableUsers' => can('teacher.manage')
++            ? teachers_repo_available_users($teacherId)
++            : [],
+     ]);
+ }
+ 
+@@ -228,7 +232,7 @@ function ctrl_teachers_unassign(string $id, string $assignmentId): void
+ {
+     $classroomId = (int) $id;
+ 
+-    $outcome = teachers_service_unassign((int) $assignmentId);
++    $outcome = teachers_service_unassign($classroomId, (int) $assignmentId);
+ 
+     $outcome['ok']
+         ? flash_success('Affectation retirée.')
+diff --git a/app/modules/teachers/repositories.php b/app/modules/teachers/repositories.php
+index 2eb1ca4..fb1a517 100644
+--- a/app/modules/teachers/repositories.php
++++ b/app/modules/teachers/repositories.php
+@@ -337,16 +337,3 @@ function teachers_can_teach(int $classroomId, int $curriculumSubjectId): bool
+     );
+ }
+ 
+-/** L'utilisateur courant est-il un enseignant en activité ? */
+-function teachers_current_is_teacher(): bool
+-{
+-    $userId = auth_id();
+-
+-    if ($userId === null) {
+-        return false;
+-    }
+-
+-    $teacher = teachers_repo_find_by_user($userId);
+-
+-    return $teacher !== null && $teacher['status'] === 'active';
+-}
+diff --git a/app/modules/teachers/services.php b/app/modules/teachers/services.php
+index 38e900c..2ee6a61 100644
+--- a/app/modules/teachers/services.php
++++ b/app/modules/teachers/services.php
+@@ -47,7 +47,8 @@ function teachers_service_create(array $data): array
+         return ['ok' => false, 'id' => null, 'message' => $matriculeCheck['message']];
+     }
+ 
+-    $teacherId = db_transaction(static function () use ($data): int {
++    try {
++        $teacherId = db_transaction(static function () use ($data): int {
+         $id = tenant_insert('teachers', [
+             'uuid'            => str_uuid(),
+             'user_id'         => $data['user_id'] ?? null,
+@@ -80,7 +81,20 @@ function teachers_service_create(array $data): array
+         );
+ 
+         return $id;
+-    });
++        });
++    } catch (PDOException $e) {
++        // Matricule ou compte attribué entre la vérification et
++        // l'écriture : la contrainte d'unicité tranche, le message reste
++        // compréhensible.
++        if ($e->getCode() === '23000') {
++            return [
++                'ok' => false, 'id' => null,
++                'message' => 'Ce matricule ou ce compte vient d\'être attribué à un autre enseignant.',
++            ];
++        }
++
++        throw $e;
++    }
+ 
+     return ['ok' => true, 'id' => $teacherId, 'message' => ''];
+ }
+@@ -214,23 +228,23 @@ function teachers_service_change_status(int $teacherId, string $status, string $
+         return ['ok' => false, 'message' => 'Enseignant introuvable.'];
+     }
+ 
++    // Le motif va dans status_reason, jamais dans notes : notes est le
++    // champ libre de la fiche, saisi par le secrétariat. L'y écrire
++    // effaçait son contenu sans retour possible.
+     $changes = [
+-        'status'  => $status,
+-        'left_on' => $status === 'left' ? date('Y-m-d') : null,
++        'status'        => $status,
++        'left_on'       => $status === 'left' ? date('Y-m-d') : null,
++        'status_reason' => $reason !== '' ? mb_substr($reason, 0, 255) : null,
+     ];
+ 
+-    if ($reason !== '') {
+-        $changes['notes'] = mb_substr($reason, 0, 255);
+-    }
+-
+     tenant_update('teachers', $changes, 'id = :id', ['id' => $teacherId]);
+ 
+     audit_log(
+         'update',
+         'teacher',
+         $teacherId,
+-        ['status' => $teacher['status']],
+-        ['status' => $status],
++        ['status' => $teacher['status'], 'status_reason' => $teacher['status_reason'] ?? null],
++        ['status' => $status, 'status_reason' => $changes['status_reason']],
+         TEACHER_STATUSES[$status] . ($reason !== '' ? ' — ' . $reason : '')
+     );
+ 
+@@ -325,7 +339,13 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
+         ];
+     }
+ 
+-    $assignmentId = db_transaction(static function () use ($teacherId, $classroom, $classroomId, $curriculumSubjectId, $weeklyHours, $teacher): int {
++    // Les contrôles ci-dessus donnent un message clair dans le cas
++    // courant. Ils ne suffisent pas : entre la lecture et l'écriture,
++    // un autre préfet peut avoir attribué la même branche. C'est alors
++    // la contrainte uq_assignment_slot qui tranche — il faut traduire sa
++    // violation en message, et non laisser remonter une page d'erreur.
++    try {
++        $assignmentId = db_transaction(static function () use ($teacherId, $classroom, $classroomId, $curriculumSubjectId, $weeklyHours, $teacher): int {
+         $id = tenant_insert('teacher_subjects', [
+             'teacher_id'            => $teacherId,
+             'academic_year_id'      => (int) $classroom['academic_year_id'],
+@@ -347,7 +367,17 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
+         );
+ 
+         return $id;
+-    });
++        });
++    } catch (PDOException $e) {
++        if ($e->getCode() === '23000') {
++            return [
++                'ok' => false, 'id' => null,
++                'message' => 'Cette branche vient d\'être attribuée par un autre utilisateur. Rechargez la page.',
++            ];
++        }
++
++        throw $e;
++    }
+ 
+     return ['ok' => true, 'id' => $assignmentId, 'message' => ''];
+ }
+@@ -359,12 +389,17 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
+  * déjà été saisies pour cette branche : l'auteur d'une note doit rester
+  * identifiable. Le point est signalé ici pour ne pas être oublié.
+  */
+-function teachers_service_unassign(int $assignmentId): array
++function teachers_service_unassign(int $classroomId, int $assignmentId): array
+ {
+     $assignment = tenant_find('teacher_subjects', $assignmentId);
+ 
+-    if ($assignment === null) {
+-        return ['ok' => false, 'message' => 'Affectation introuvable.'];
++    // L'affectation doit appartenir à la classe de l'URL. Sans ce
++    // recoupement, un envoi sur /classes/12/repartition/999/retirer
++    // retirait l'affectation 999 même si elle relevait de la classe 40,
++    // et le journal d'audit désignait la mauvaise classe. Même motif
++    // d'IDOR que celui corrigé sur l'affectation des élèves en phase 3.
++    if ($assignment === null || (int) $assignment['classroom_id'] !== $classroomId) {
++        return ['ok' => false, 'message' => 'Affectation introuvable pour cette classe.'];
+     }
+ 
+     $year = tenant_find('academic_years', (int) $assignment['academic_year_id']);
+@@ -402,6 +437,18 @@ function teachers_service_set_main_teacher(int $classroomId, ?int $teacherId): a
+         return ['ok' => false, 'message' => 'Classe introuvable.'];
+     }
+ 
++    // Masquer le formulaire dans la vue ne protège rien : un envoi direct
++    // sur /classes/{id}/titulaire réécrirait le titulaire d'une année
++    // archivée, donc le nom porté par des bulletins déjà produits.
++    $year = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++
++    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
++        return [
++            'ok'      => false,
++            'message' => 'Cette année scolaire est clôturée : le titulaire ne peut plus être modifié.',
++        ];
++    }
++
+     if ($teacherId !== null) {
+         $teacher = teachers_repo_find($teacherId);
+ 
+diff --git a/database/migrations/2026_09_13_006_teachers_statut.sql b/database/migrations/2026_09_13_006_teachers_statut.sql
+new file mode 100644
+index 0000000..19119db
+--- /dev/null
++++ b/database/migrations/2026_09_13_006_teachers_statut.sql
+@@ -0,0 +1,25 @@
++-- =====================================================================
++--  MIGRATION 006 — Motif de changement de statut d'un enseignant
++--
++--  Défaut corrigé
++--  --------------
++--  teachers_service_change_status() écrivait le motif du changement
++--  (« Fin de contrat », « Suspension disciplinaire ») dans la colonne
++--  `notes`, qui est aussi un champ libre de la fiche, saisi par le
++--  secrétariat. Suspendre un enseignant effaçait donc définitivement les
++--  notes de sa fiche, sans possibilité de les retrouver : le journal
++--  d'audit ne consignait que l'ancien et le nouveau statut.
++--
++--  Correction
++--  ----------
++--  Une colonne dédiée. Un champ qui porte deux significations finit
++--  toujours par en perdre une.
++--
++--  À appliquer avec : php database/migrate.php
++-- =====================================================================
++
++SET NAMES utf8mb4;
++
++ALTER TABLE teachers
++    ADD COLUMN status_reason VARCHAR(255) NULL
++        COMMENT 'Motif du dernier changement de statut' AFTER left_on;
+diff --git a/tests/teachers_isolation.php b/tests/teachers_isolation.php
+index f336d4c..fb46193 100644
+--- a/tests/teachers_isolation.php
++++ b/tests/teachers_isolation.php
+@@ -378,6 +378,112 @@ try {
+         !teachers_can_teach($a['classroom_b'], $a['subjects'][0])
+     );
+ 
++    // =================================================================
++    //  LA CLASSE EST UNE PORTE, ELLE AUSSI
++    //
++    //  Ces contrôles existent parce qu'une faille réelle leur avait
++    //  échappé : /eleves et /eleves/{id} étaient protégés, mais
++    //  /classes/{id} affichait la liste nominative de N'IMPORTE QUELLE
++    //  classe — matricule, nom, sexe, date de naissance — au moindre
++    //  compte détenant « classroom.view », que le rôle ENSEIGNANT
++    //  possède.
++    //
++    //  Une restriction d'accès ne vaut que si TOUTES les portes la
++    //  portent.
++    // =================================================================
++    // Il avait été fait titulaire de 5B au test précédent : on lui
++    // retire ce titre pour que 5B redevienne une classe étrangère.
++    act_as($a['school_id'], 'DIRECTION');
++    tenant_set($a['school_id']);
++    teachers_service_set_main_teacher($a['classroom_b'], null);
++
++    $_SESSION['user_id'] = $teacherUserId;
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++    tenant_set($a['school_id']);
++
++    check(
++        'La classe qui lui est confiée est consultable',
++        students_can_view_classroom($a['classroom_a'])
++    );
++
++    check(
++        'La liste nominative d\'une AUTRE classe est vide',
++        students_repo_classroom_students($a['classroom_b']) === [],
++        count(students_repo_classroom_students($a['classroom_b'])) . ' élève(s)'
++    );
++
++    check(
++        'L\'écran d\'une autre classe lui est refusé',
++        !students_can_view_classroom($a['classroom_b'])
++    );
++
++    // Le personnel administratif, lui, voit tout.
++    act_as($a['school_id'], 'SECRETARIAT');
++    tenant_set($a['school_id']);
++
++    check(
++        'Le secrétariat voit la liste nominative de chaque classe',
++        students_repo_classroom_students($a['classroom_b']) !== []
++    );
++
++    // =================================================================
++    //  LE PÉRIMÈTRE EST BORNÉ À L'ANNÉE
++    //
++    //  Sans cette borne, les classes s'accumulent d'année en année et un
++    //  professeur conserve à vie l'accès au dossier COURANT de tout
++    //  élève qu'il a eu une seule fois.
++    // =================================================================
++    act_as($a['school_id'], 'DIRECTION');
++    tenant_set($a['school_id']);
++
++    $nextYear = tenant_insert('academic_years', [
++        'code' => '2071-2072', 'name' => 'Année suivante', 'starts_on' => '2071-09-01',
++        'ends_on' => '2072-07-31', 'status' => 'active',
++    ]);
++
++    $nextProgram = curriculum_service_create_program(
++        $nextYear,
++        (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_6'", [], true),
++        null,
++        null
++    );
++    curriculum_service_fill_program((int) $nextProgram['id']);
++    curriculum_service_activate((int) $nextProgram['id']);
++
++    $nextClassroom = tenant_insert('classrooms', [
++        'academic_year_id' => $nextYear, 'curriculum_id' => (int) $nextProgram['id'],
++        'code' => '6A', 'name' => '6ème primaire A', 'capacity' => 40,
++    ]);
++
++    // Le MÊME élève est réinscrit l'année suivante, dans une classe que
++    // l'enseignant n'assure pas.
++    $reEnroll = students_service_re_enroll((int) $eleveA['id'], $nextYear, $nextClassroom);
++    check('L\'élève est réinscrit l\'année suivante', $reEnroll['ok'], $reEnroll['message']);
++
++    $_SESSION['user_id'] = $teacherUserId;
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++    tenant_set($a['school_id']);
++
++    check(
++        'Son périmètre de l\'année passée reste intact',
++        students_repo_search([], $a['year_id'])['total'] > 0
++    );
++
++    check(
++        'Il ne voit AUCUN élève dans l\'année où il n\'enseigne pas',
++        students_repo_search([], $nextYear)['total'] === 0,
++        students_repo_search([], $nextYear)['total'] . ' trouvé(s)'
++    );
++
++    check(
++        'Son ancien élève ne lui est plus accessible sur l\'année en cours',
++        !students_can_view((int) $eleveA['id'], $nextYear)
++    );
++
+     // =================================================================
+     //  ANNÉE CLÔTURÉE
+     // =================================================================
+@@ -393,15 +499,55 @@ try {
+         $closed['message']
+     );
+ 
+-    $closedRemove = teachers_service_unassign((int) $assign['id']);
++    $closedRemove = teachers_service_unassign($a['classroom_a'], (int) $assign['id']);
+     check(
+         'Année clôturée : plus aucun retrait',
+         !$closedRemove['ok'] && str_contains($closedRemove['message'], 'clôturée'),
+         $closedRemove['message']
+     );
+ 
++    // Masquer le formulaire ne protège rien : l'envoi direct doit être
++    // refusé par le service.
++    $closedMain = teachers_service_set_main_teacher($a['classroom_a'], $teacherA);
++    check(
++        'Année clôturée : le titulaire ne peut plus être changé',
++        !$closedMain['ok'] && str_contains($closedMain['message'], 'clôturée'),
++        $closedMain['message']
++    );
++
+     tenant_update('academic_years', ['status' => 'active'], 'id = :id', ['id' => $a['year_id']]);
+ 
++    // =================================================================
++    //  RETRAIT D'AFFECTATION : LA CLASSE DE L'URL DOIT CORRESPONDRE
++    // =================================================================
++    $wrongClassroom = teachers_service_unassign($a['classroom_b'], (int) $assign['id']);
++    check(
++        'Retrait depuis une AUTRE classe que la sienne : refusé',
++        !$wrongClassroom['ok'] && str_contains($wrongClassroom['message'], 'pour cette classe'),
++        $wrongClassroom['message']
++    );
++
++    // =================================================================
++    //  LE MOTIF DE STATUT N'ÉCRASE PAS LES NOTES DE LA FICHE
++    // =================================================================
++    teachers_service_update($teacherA, ['notes' => 'Responsable du club de mathématiques']);
++    teachers_service_change_status($teacherA, 'suspended', 'Procédure disciplinaire');
++
++    $afterStatus = teachers_repo_find($teacherA);
++    check(
++        'Le motif de suspension n\'écrase pas les notes de la fiche',
++        $afterStatus['notes'] === 'Responsable du club de mathématiques',
++        (string) $afterStatus['notes']
++    );
++
++    check(
++        'Le motif est conservé dans sa propre colonne',
++        $afterStatus['status_reason'] === 'Procédure disciplinaire',
++        (string) $afterStatus['status_reason']
++    );
++
++    teachers_service_change_status($teacherA, 'active');
++
+     // =================================================================
+     //  COMPTE DE CONNEXION
+     // =================================================================
+-- 
+2.43.0
+

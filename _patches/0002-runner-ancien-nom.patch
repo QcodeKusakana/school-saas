@@ -1,0 +1,48 @@
+From bc8e82372ea14a8eea1311f8edd57f67fdbada9a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 13 Sep 2026 20:09:15 +0000
+Subject: [PATCH 2/5] =?UTF-8?q?Runner=20:=20tol=C3=A9rer=20l'ancien=20nom?=
+ =?UTF-8?q?=20du=20r=C3=A9f=C3=A9rentiel=20national?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Le fichier seeds/003_referentiel_national.sql reste présent dans les
+dossiers de travail existants. Lui donner le même témoin que son nouveau
+nom le fait enregistrer sans exécution, au lieu d'interrompre la
+migration sur une erreur de doublon.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+---
+ database/runner.php | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/database/runner.php b/database/runner.php
+index 7e1964b..9706d69 100644
+--- a/database/runner.php
++++ b/database/runner.php
+@@ -112,10 +112,17 @@ function runner_witness(string $basename): ?string
+         '001_reference_data.sql'    => 'SELECT COUNT(*) FROM education_cycles',
+         '002_roles_permissions.sql' => 'SELECT COUNT(*) FROM permissions',
+ 
+-        // Ce fichier s'appelait seeds/003_referentiel_national.sql. Sans
+-        // ce témoin, les bases déjà installées le rejoueraient sous son
+-        // nouveau nom et échoueraient sur « Duplicate entry ».
++        // Ce fichier s'appelait seeds/003_referentiel_national.sql et a
++        // été déplacé dans migrations/ : il remplit des tables créées en
++        // phase 2, il ne pouvait donc pas rester un seed.
++        //
++        // Les deux noms portent le même témoin. Sans celui du nouveau
++        // nom, les bases déjà installées rejoueraient le fichier et
++        // échoueraient sur « Duplicate entry » ; sans celui de l'ancien,
++        // un dossier de travail où le fichier d'origine traîne encore
++        // ferait échouer la migration au lieu de l'ignorer.
+         '2026_09_13_001b_referentiel_national.sql' => 'SELECT COUNT(*) FROM learning_domains',
++        '003_referentiel_national.sql'             => 'SELECT COUNT(*) FROM learning_domains',
+ 
+         default => null,
+     };
+-- 
+2.43.0
+

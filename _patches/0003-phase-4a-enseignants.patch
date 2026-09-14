@@ -1,0 +1,2999 @@
+From 63cd941e1fa34c4d366a7fff414d0ad700aa371a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 13 Sep 2026 20:34:58 +0000
+Subject: [PATCH 3/5] =?UTF-8?q?Phase=204A=20:=20enseignants,=20affectation?=
+ =?UTF-8?q?s=20et=20p=C3=A9rim=C3=A8tre=20p=C3=A9dagogique?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Cette phase précède volontairement les notes : « grade.enter » ne pourra
+jamais suffire à autoriser une saisie, il faudra prouver que l'enseignant
+assure cette branche dans cette classe. teacher_subjects est cette preuve.
+
+Base de données (migration 005)
+- teachers : fiche du personnel enseignant, rattachable à un compte.
+  UNIQUE (school_id, user_id) — un compte ne peut représenter deux
+  enseignants, sinon les périmètres se cumulent.
+- teacher_subjects : un enseignant, une branche, une classe, une année.
+  UNIQUE (school_id, academic_year_id, classroom_id, curriculum_subject_id)
+  — une branche n'a qu'un enseignant, ce qui rend la saisie non ambiguë.
+  La branche est désignée par curriculum_subjects, jamais par subjects :
+  c'est le programme qui porte le maximum de points.
+- classrooms.main_teacher_id : titulaire, annoncé en phase 3, SET NULL.
+
+Périmètre — dette de l'audit refermée
+L'enseignant ne voyait aucun élève, faute de périmètre calculable. Il voit
+désormais les élèves des classes dont il est titulaire ou dans lesquelles
+il assure une branche. students_scope_clause() interroge le module
+enseignants plutôt que de refaire la requête : deux définitions du même
+périmètre finissent toujours par diverger.
+
+Être titulaire ouvre la consultation, jamais la notation : le titulaire
+encadre la classe, il ne note pas les branches qu'il n'enseigne pas.
+teachers_can_teach() porte cette distinction.
+
+Seuil de réussite
+50 % par défaut, mais lu depuis school_settings et borné entre 1 et 99 :
+une école conventionnée peut retenir un autre seuil, et un changement
+réglementaire ne doit pas imposer une nouvelle version du logiciel.
+
+Corrections annexes
+- Paramètre nommé réutilisé dans un UNION : MySQL en requêtes préparées
+  natives répond « Invalid parameter number ». Chaque branche a désormais
+  ses propres paramètres.
+- Requête de liste sélectionnant u.username sans joindre users. Défaut
+  trouvé par l'écran, pas par les tests : quatre tests de liste ajoutés.
+  Un dépôt non exécuté est un dépôt non testé.
+- La barre latérale proposait /notes, /presences, /finances,
+  /annees-scolaires et /utilisateurs, qui renvoient 404. route_exists()
+  masque les entrées dont la route n'est pas encore déclarée ; elles
+  réapparaîtront d'elles-mêmes à la livraison de chaque phase.
+
+Tests : 141 au vert (17 + 25 + 35 + 25 + 39).
+Vérifié en conditions réelles : un compte enseignant connecté voit les
+3 élèves de sa classe et non le 4e ; accès direct à sa fiche → 404 ;
+recherche rapide → tableau vide ; /enseignants → 403.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+---
+ app/config/routes.php                         |  20 +
+ app/core/router.php                           |  14 +
+ app/modules/students/repositories.php         | 104 +++-
+ app/modules/teachers/controllers.php          | 331 ++++++++++++
+ app/modules/teachers/repositories.php         | 352 ++++++++++++
+ app/modules/teachers/services.php             | 458 ++++++++++++++++
+ app/views/partials/sidebar.php                |  18 +-
+ app/views/teachers/form.php                   | 156 ++++++
+ app/views/teachers/index.php                  | 167 ++++++
+ app/views/teachers/repartition.php            | 207 ++++++++
+ app/views/teachers/show.php                   | 244 +++++++++
+ .../2026_09_13_005_phase4_enseignants.sql     | 187 +++++++
+ tests/teachers_isolation.php                  | 499 ++++++++++++++++++
+ 13 files changed, 2719 insertions(+), 38 deletions(-)
+ create mode 100644 app/modules/teachers/controllers.php
+ create mode 100644 app/modules/teachers/repositories.php
+ create mode 100644 app/modules/teachers/services.php
+ create mode 100644 app/views/teachers/form.php
+ create mode 100644 app/views/teachers/index.php
+ create mode 100644 app/views/teachers/repartition.php
+ create mode 100644 app/views/teachers/show.php
+ create mode 100644 database/migrations/2026_09_13_005_phase4_enseignants.sql
+ create mode 100644 tests/teachers_isolation.php
+
+diff --git a/app/config/routes.php b/app/config/routes.php
+index d03a8ab..400261a 100644
+--- a/app/config/routes.php
++++ b/app/config/routes.php
+@@ -99,6 +99,26 @@ route('POST', '/eleves/{id}/tuteurs/{link_id}/retirer', 'students', 'ctrl_studen
+ route('POST', '/eleves/{id}/orientation',   'students', 'ctrl_students_orient',        ['auth', 'school', 'perm:orientation.manage']);
+ route('POST', '/eleves/{id}/statut',        'students', 'ctrl_students_change_status', ['auth', 'school', 'perm:student.edit']);
+ 
++// ---------------------------------------------------------------------
++// Phase 4A — Enseignants et répartition des branches
++//
++// La répartition est rattachée à la CLASSE et non à l'enseignant : le
++// préfet des études raisonne classe par classe, branche par branche.
++// Elle exige teacher.assign, distincte de teacher.manage : confier une
++// branche n'est pas modifier un dossier de personnel.
++// ---------------------------------------------------------------------
++route('GET',  '/enseignants',          'teachers', 'ctrl_teachers_index',         ['auth', 'school', 'perm:teacher.view']);
++route('GET',  '/enseignants/nouveau',  'teachers', 'ctrl_teachers_create_form',   ['auth', 'school', 'perm:teacher.manage']);
++route('POST', '/enseignants',          'teachers', 'ctrl_teachers_store',         ['auth', 'school', 'perm:teacher.manage']);
++route('GET',  '/enseignants/{id}',     'teachers', 'ctrl_teachers_show',          ['auth', 'school', 'perm:teacher.view']);
++route('POST', '/enseignants/{id}',     'teachers', 'ctrl_teachers_update',        ['auth', 'school', 'perm:teacher.manage']);
++route('POST', '/enseignants/{id}/statut', 'teachers', 'ctrl_teachers_change_status', ['auth', 'school', 'perm:teacher.manage']);
++
++route('GET',  '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_classroom_grid', ['auth', 'school', 'perm:teacher.view']);
++route('POST', '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_assign',         ['auth', 'school', 'perm:teacher.assign']);
++route('POST', '/classes/{id}/repartition/{assignment_id}/retirer', 'teachers', 'ctrl_teachers_unassign', ['auth', 'school', 'perm:teacher.assign']);
++route('POST', '/classes/{id}/titulaire',                    'teachers', 'ctrl_teachers_set_main',       ['auth', 'school', 'perm:teacher.assign']);
++
+ // ---------------------------------------------------------------------
+ // Les modules des phases suivantes viendront s'ajouter ici :
+ //
+diff --git a/app/core/router.php b/app/core/router.php
+index 3f4d751..78c6766 100644
+--- a/app/core/router.php
++++ b/app/core/router.php
+@@ -66,6 +66,20 @@ function router_has_route(string $method, string $pattern): bool
+     return false;
+ }
+ 
++/**
++ * La page existe-t-elle ? (raccourci GET, pour les menus)
++ *
++ * La barre latérale annonce les modules des phases à venir. Sans ce
++ * contrôle, elle propose des liens qui renvoient une page introuvable :
++ * l'utilisateur croit à une panne alors que la fonctionnalité n'est pas
++ * encore livrée. Les entrées apparaissent d'elles-mêmes dès que la route
++ * correspondante est déclarée.
++ */
++function route_exists(string $path): bool
++{
++    return router_has_route('GET', $path);
++}
++
+ /**
+  * Résout la requête courante et exécute le gestionnaire correspondant.
+  */
+diff --git a/app/modules/students/repositories.php b/app/modules/students/repositories.php
+index 05fafb8..06b6e5d 100644
+--- a/app/modules/students/repositories.php
++++ b/app/modules/students/repositories.php
+@@ -9,6 +9,13 @@
+ 
+ declare(strict_types=1);
+ 
++// Le périmètre de l'enseignant est défini par le module enseignants, qui
++// en est la source unique. On le charge explicitement plutôt que de
++// réécrire la requête ici : deux définitions du même périmètre finissent
++// toujours par diverger, et c'est le genre de divergence qui ouvre un
++// accès sans que personne ne s'en aperçoive.
++require_once __DIR__ . '/../teachers/repositories.php';
++
+ // =====================================================================
+ //  PÉRIMÈTRE DE LECTURE
+ //
+@@ -26,18 +33,25 @@ declare(strict_types=1);
+  * Renvoie une condition portant sur l'alias `s` de la table students,
+  * et les paramètres associés.
+  *
+- * Trois cas, dans cet ordre :
++ * Quatre cas, dans cet ordre :
+  *   1. student.view.all  → aucune restriction ;
+  *   2. compte rattaché à une fiche tuteur → ses enfants uniquement ;
+- *   3. tout le reste → aucun élève.
++ *   3. compte rattaché à une fiche enseignant → les élèves de ses
++ *      classes, qu'il en soit titulaire ou qu'il y assure une branche ;
++ *   4. tout le reste → aucun élève.
++ *
++ * Les cas 2 et 3 s'appuient sur un lien de données réel — guardians.user_id,
++ * teachers.user_id — et non sur le code du rôle : renommer ou dupliquer
++ * le rôle « PARENT » ou « ENSEIGNANT » ne peut donc pas ouvrir le
++ * fichier par inadvertance.
+  *
+- * Le cas 2 s'appuie sur guardians.user_id, c'est-à-dire sur un lien de
+- * données réel, et non sur le code du rôle : renommer ou dupliquer le
+- * rôle « PARENT » ne peut donc pas ouvrir le fichier par inadvertance.
++ * Le tuteur passe avant l'enseignant. Un enseignant dont l'enfant est
++ * scolarisé dans l'établissement est les deux à la fois ; le périmètre
++ * le plus large des deux lui revient, et c'est celui de l'enseignant —
++ * il est donc calculé en réunissant les deux ensembles.
+  *
+- * Le cas 3 refuse par défaut. L'enseignant en fait partie tant que la
+- * table teachers n'existe pas (phase 4) : mieux vaut une page vide,
+- * corrigible, qu'une divulgation, irréversible.
++ * Le cas 4 refuse par défaut : mieux vaut une page vide, corrigible,
++ * qu'une divulgation, irréversible.
+  *
+  * @return array{0: string, 1: array<string, mixed>}
+  */
+@@ -49,29 +63,61 @@ function students_scope_clause(): array
+ 
+     $userId = auth_id();
+ 
+-    if ($userId !== null) {
+-        $isGuardian = db_exists(
+-            'SELECT 1 FROM guardians
+-              WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
+-              LIMIT 1',
+-            ['school_id' => tenant_require(), 'user_id' => $userId]
+-        );
+-
+-        if ($isGuardian) {
+-            return [
+-                's.id IN (SELECT sg.student_id
+-                            FROM student_guardians sg
+-                            JOIN guardians g ON g.id = sg.guardian_id
+-                                            AND g.school_id = sg.school_id
+-                           WHERE sg.school_id = :scope_school
+-                             AND g.user_id = :scope_user
+-                             AND g.deleted_at IS NULL)',
+-                ['scope_school' => tenant_require(), 'scope_user' => $userId],
+-            ];
+-        }
++    if ($userId === null) {
++        return ['1 = 0', []];
++    }
++
++    $schoolId   = tenant_require();
++    $conditions = [];
++    $params     = [];
++
++    // --- Tuteur : ses enfants -----------------------------------------
++    $isGuardian = db_exists(
++        'SELECT 1 FROM guardians
++          WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
++          LIMIT 1',
++        ['school_id' => $schoolId, 'user_id' => $userId]
++    );
++
++    if ($isGuardian) {
++        $conditions[] = 's.id IN (SELECT sg.student_id
++                                    FROM student_guardians sg
++                                    JOIN guardians g ON g.id = sg.guardian_id
++                                                    AND g.school_id = sg.school_id
++                                   WHERE sg.school_id = :scope_school
++                                     AND g.user_id = :scope_user
++                                     AND g.deleted_at IS NULL)';
++        $params['scope_school'] = $schoolId;
++        $params['scope_user']   = $userId;
++    }
++
++    // --- Enseignant : les élèves de ses classes ------------------------
++    //
++    // Le périmètre est calculé à partir de teacher_subjects et de
++    // classrooms.main_teacher_id, via le module enseignants qui en est
++    // la source unique. Refaire la requête ici créerait deux définitions
++    // du périmètre, qui finiraient par diverger.
++    $classroomIds = teachers_scope_classroom_ids();
++
++    if ($classroomIds !== []) {
++        // Les identifiants viennent de la base, jamais de l'utilisateur,
++        // et sont malgré tout castés : une liste interpolée doit être
++        // sûre par construction, pas par confiance.
++        $inList = implode(',', array_map('intval', $classroomIds));
++
++        $conditions[] = 's.id IN (SELECT e2.student_id
++                                    FROM enrollments e2
++                                   WHERE e2.school_id = :scope_school_t
++                                     AND e2.classroom_id IN (' . $inList . ')
++                                     AND e2.status <> \'cancelled\')';
++        $params['scope_school_t'] = $schoolId;
++    }
++
++    if ($conditions === []) {
++        return ['1 = 0', []];
+     }
+ 
+-    return ['1 = 0', []];
++    return ['(' . implode(' OR ', $conditions) . ')', $params];
+ }
+ 
+ /**
+diff --git a/app/modules/teachers/controllers.php b/app/modules/teachers/controllers.php
+new file mode 100644
+index 0000000..263fab5
+--- /dev/null
++++ b/app/modules/teachers/controllers.php
+@@ -0,0 +1,331 @@
++<?php
++/**
++ * Module TEACHERS — contrôleurs.
++ */
++
++declare(strict_types=1);
++
++require_once __DIR__ . '/services.php';
++require_once __DIR__ . '/repositories.php';
++
++/** Année de travail : paramètre d'URL validé, sinon année courante. */
++function teachers_current_year(): ?array
++{
++    $requested = input_int('annee');
++
++    if ($requested !== null) {
++        $year = tenant_find('academic_years', $requested);
++
++        if ($year !== null) {
++            return $year;
++        }
++    }
++
++    return tenant_one('academic_years', 'is_current = 1')
++        ?? tenant_one('academic_years', '1 = 1 ORDER BY starts_on DESC');
++}
++
++// ---------------------------------------------------------------------
++//  LISTE
++// ---------------------------------------------------------------------
++
++function ctrl_teachers_index(): void
++{
++    $year = teachers_current_year();
++
++    $filters = [
++        'q'         => trim((string) input('q', '')),
++        'status'    => (string) input('statut', ''),
++        'specialty' => (string) input('specialite', ''),
++    ];
++
++    $result = teachers_repo_search($filters, max(1, (int) input_int('page', 1)));
++
++    view('teachers/index', [
++        'title'       => 'Enseignants',
++        'teachers'    => $result['rows'],
++        'total'       => $result['total'],
++        'pages'       => $result['pages'],
++        'page'        => $result['page'],
++        'filters'     => $filters,
++        'statuses'    => TEACHER_STATUSES,
++        'year'        => $year,
++        'years'       => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
++    ]);
++}
++
++// ---------------------------------------------------------------------
++//  FICHE
++// ---------------------------------------------------------------------
++
++function ctrl_teachers_show(string $id): void
++{
++    $teacherId = (int) $id;
++    $teacher   = teachers_repo_find($teacherId);
++
++    if ($teacher === null) {
++        abort(404, 'Enseignant introuvable.');
++    }
++
++    $year = teachers_current_year();
++    $yearId = $year !== null ? (int) $year['id'] : 0;
++
++    view('teachers/show', [
++        'title'          => full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name']),
++        'teacher'        => $teacher,
++        'year'           => $year,
++        'years'          => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
++        'assignments'    => $yearId > 0 ? teachers_repo_assignments($teacherId, $yearId) : [],
++        'mainClassrooms' => $yearId > 0 ? teachers_repo_main_classrooms($teacherId, $yearId) : [],
++        'weeklyLoad'     => $yearId > 0 ? teachers_repo_weekly_load($teacherId, $yearId) : 0.0,
++        'statuses'       => TEACHER_STATUSES,
++        'employmentTypes' => TEACHER_EMPLOYMENT_TYPES,
++        'availableUsers' => teachers_repo_available_users($teacherId),
++    ]);
++}
++
++// ---------------------------------------------------------------------
++//  CRÉATION
++// ---------------------------------------------------------------------
++
++function ctrl_teachers_create_form(): void
++{
++    view('teachers/form', [
++        'title'           => 'Nouvel enseignant',
++        'teacher'         => null,
++        'statuses'        => TEACHER_STATUSES,
++        'employmentTypes' => TEACHER_EMPLOYMENT_TYPES,
++        'availableUsers'  => teachers_repo_available_users(),
++    ]);
++}
++
++function ctrl_teachers_store(): void
++{
++    $result = validate(input_all(), teachers_validation_rules());
++
++    if (!validator_passes($result)) {
++        flash_errors(validator_errors($result));
++        flash_old(input_all());
++        redirect('/enseignants/nouveau');
++    }
++
++    $outcome = teachers_service_create(teachers_payload_from_input(input_all()));
++
++    if (!$outcome['ok']) {
++        flash_error($outcome['message']);
++        flash_old(input_all());
++        redirect('/enseignants/nouveau');
++    }
++
++    flash_success('Fiche enseignant créée.');
++    redirect('/enseignants/' . (int) $outcome['id']);
++}
++
++// ---------------------------------------------------------------------
++//  MODIFICATION
++// ---------------------------------------------------------------------
++
++function ctrl_teachers_update(string $id): void
++{
++    $teacherId = (int) $id;
++
++    if (teachers_repo_find($teacherId) === null) {
++        abort(404, 'Enseignant introuvable.');
++    }
++
++    $result = validate(input_all(), teachers_validation_rules());
++
++    if (!validator_passes($result)) {
++        flash_errors(validator_errors($result));
++        redirect('/enseignants/' . $teacherId);
++    }
++
++    // Seules les clés réellement transmises sont écrites : un envoi
++    // partiel ne doit pas vider les colonnes qu'il ne mentionne pas.
++    $outcome = teachers_service_update($teacherId, teachers_payload_from_input(input_all(), true));
++
++    $outcome['ok']
++        ? flash_success('Fiche mise à jour.')
++        : flash_error($outcome['message']);
++
++    redirect('/enseignants/' . $teacherId);
++}
++
++function ctrl_teachers_change_status(string $id): void
++{
++    $teacherId = (int) $id;
++    $status    = (string) input('status', '');
++    $reason    = sanitize_string(input('reason'), 255) ?? '';
++
++    $outcome = teachers_service_change_status($teacherId, $status, $reason);
++
++    $outcome['ok']
++        ? flash_success('Statut mis à jour.')
++        : flash_error($outcome['message']);
++
++    redirect('/enseignants/' . $teacherId);
++}
++
++// ---------------------------------------------------------------------
++//  RÉPARTITION DES BRANCHES
++// ---------------------------------------------------------------------
++
++/** Écran de répartition d'une classe : chaque branche et son enseignant. */
++function ctrl_teachers_classroom_grid(string $id): void
++{
++    $classroomId = (int) $id;
++    $classroom   = tenant_find('classrooms', $classroomId);
++
++    if ($classroom === null) {
++        abort(404, 'Classe introuvable.');
++    }
++
++    $year = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++
++    view('teachers/repartition', [
++        'title'     => 'Répartition — ' . $classroom['name'],
++        'classroom' => $classroom,
++        'year'      => $year,
++        'rows'      => teachers_repo_classroom_grid($classroomId),
++        'teachers'  => tenant_all(
++            'teachers',
++            'status = :s AND deleted_at IS NULL ORDER BY last_name, post_name, first_name',
++            ['s' => 'active']
++        ),
++        'mainTeacher' => $classroom['main_teacher_id'] !== null
++            ? teachers_repo_find((int) $classroom['main_teacher_id'])
++            : null,
++    ]);
++}
++
++function ctrl_teachers_assign(string $id): void
++{
++    $classroomId = (int) $id;
++    $teacherId   = input_int('teacher_id');
++    $subjectId   = input_int('curriculum_subject_id');
++    $hours       = input('weekly_hours');
++
++    if ($teacherId === null || $subjectId === null) {
++        flash_error('Enseignant ou branche manquant.');
++        redirect('/classes/' . $classroomId . '/repartition');
++    }
++
++    $outcome = teachers_service_assign(
++        $teacherId,
++        $classroomId,
++        $subjectId,
++        ($hours !== null && $hours !== '') ? (float) $hours : null
++    );
++
++    $outcome['ok']
++        ? flash_success('Branche attribuée.')
++        : flash_error($outcome['message']);
++
++    redirect('/classes/' . $classroomId . '/repartition');
++}
++
++function ctrl_teachers_unassign(string $id, string $assignmentId): void
++{
++    $classroomId = (int) $id;
++
++    $outcome = teachers_service_unassign((int) $assignmentId);
++
++    $outcome['ok']
++        ? flash_success('Affectation retirée.')
++        : flash_error($outcome['message']);
++
++    redirect('/classes/' . $classroomId . '/repartition');
++}
++
++function ctrl_teachers_set_main(string $id): void
++{
++    $classroomId = (int) $id;
++    $teacherId   = input_int('main_teacher_id');
++
++    $outcome = teachers_service_set_main_teacher($classroomId, $teacherId);
++
++    $outcome['ok']
++        ? flash_success('Titulaire enregistré.')
++        : flash_error($outcome['message']);
++
++    redirect('/classes/' . $classroomId . '/repartition');
++}
++
++// ---------------------------------------------------------------------
++//  OUTILS INTERNES
++// ---------------------------------------------------------------------
++
++/** Règles de validation communes à la création et à la modification. */
++function teachers_validation_rules(): array
++{
++    return [
++        'last_name'       => 'required|string|max:80',
++        'post_name'       => 'nullable|string|max:80',
++        'first_name'      => 'required|string|max:80',
++        'gender'          => 'nullable|in:M,F',
++        'birth_date'      => 'nullable|date|before:today',
++        'matricule'       => 'nullable|string|max:30',
++        'phone'           => 'nullable|phone',
++        'phone_alt'       => 'nullable|phone',
++        'email'           => 'nullable|email|max:190',
++        'address'         => 'nullable|string|max:255',
++        'hire_date'       => 'nullable|date',
++        'employment_type' => 'nullable|in:permanent,contract,volunteer',
++        'qualification'   => 'nullable|string|max:120',
++        'specialty'       => 'nullable|string|max:120',
++        'notes'           => 'nullable|string|max:255',
++    ];
++}
++
++/**
++ * Construit le tableau d'écriture à partir des entrées.
++ *
++ * @param bool $partial Ne retenir que les clés présentes dans l'envoi.
++ */
++function teachers_payload_from_input(array $source, bool $partial = false): array
++{
++    $transforms = [
++        'last_name'       => static fn ($v) => sanitize_string((string) $v, 80),
++        'post_name'       => static fn ($v) => sanitize_string($v, 80),
++        'first_name'      => static fn ($v) => sanitize_string((string) $v, 80),
++        'gender'          => static fn ($v) => $v !== '' ? (string) $v : null,
++        'birth_date'      => static fn ($v) => $v !== '' ? $v : null,
++        'matricule'       => static fn ($v) => sanitize_string($v, 30),
++        'phone'           => static fn ($v) => sanitize_phone($v),
++        'phone_alt'       => static fn ($v) => sanitize_phone($v),
++        'email'           => static fn ($v) => $v !== '' ? $v : null,
++        'address'         => static fn ($v) => sanitize_string($v, 255),
++        'hire_date'       => static fn ($v) => $v !== '' ? $v : null,
++        'employment_type' => static fn ($v) => $v !== '' ? (string) $v : 'permanent',
++        'qualification'   => static fn ($v) => sanitize_string($v, 120),
++        'specialty'       => static fn ($v) => sanitize_string($v, 120),
++        'notes'           => static fn ($v) => sanitize_string($v, 255),
++    ];
++
++    $payload = [];
++
++    foreach ($transforms as $field => $transform) {
++        if ($partial && !array_key_exists($field, $source)) {
++            continue;
++        }
++
++        $value = $source[$field] ?? '';
++
++        // Un champ posté sous forme de tableau (name="post_name[]")
++        // provoquerait une erreur de type dans sanitize_string(). On le
++        // ramène à une chaîne vide : la validation a déjà rejeté la
++        // requête si le champ était obligatoire.
++        $payload[$field] = $transform(is_scalar($value) ? (string) $value : '');
++    }
++
++    // Le compte de connexion n'est écrit que s'il figure explicitement
++    // dans l'envoi : il ouvre un périmètre d'accès, il ne doit jamais
++    // être modifié par omission.
++    if (array_key_exists('user_id', $source)) {
++        $payload['user_id'] = ($source['user_id'] !== '' && $source['user_id'] !== null)
++            ? (int) $source['user_id']
++            : null;
++    }
++
++    return $payload;
++}
+diff --git a/app/modules/teachers/repositories.php b/app/modules/teachers/repositories.php
+new file mode 100644
+index 0000000..2eb1ca4
+--- /dev/null
++++ b/app/modules/teachers/repositories.php
+@@ -0,0 +1,352 @@
++<?php
++/**
++ * Module TEACHERS — dépôts.
++ *
++ * Deux préoccupations distinctes vivent ici :
++ *
++ *  · la consultation du personnel enseignant (liste, fiche, service) ;
++ *  · le calcul du PÉRIMÈTRE d'un enseignant, c'est-à-dire l'ensemble des
++ *    classes et des branches qu'il est autorisé à toucher.
++ *
++ * Le second point est une brique de sécurité, pas une commodité
++ * d'affichage : la saisie des notes s'y adossera en phase 4B.
++ */
++
++declare(strict_types=1);
++
++// =====================================================================
++//  CONSULTATION
++// =====================================================================
++
++/**
++ * Liste paginée des enseignants.
++ *
++ * @param array $filters q, status, classroom_id
++ * @return array{rows: array, total: int, pages: int, page: int}
++ */
++function teachers_repo_search(array $filters, int $page = 1, int $perPage = 25): array
++{
++    $where  = ['t.school_id = :school_id', 't.deleted_at IS NULL'];
++    $params = ['school_id' => tenant_require()];
++
++    if (!empty($filters['q'])) {
++        // Même règle que pour les élèves : recherche par préfixe, pour
++        // rester sur l'index idx_teacher_names, et jokers échappés.
++        $term = teachers_escape_like(trim((string) $filters['q']));
++        $where[] = '(t.last_name LIKE :q1 OR t.post_name LIKE :q2
++                     OR t.first_name LIKE :q3 OR t.matricule LIKE :q4)';
++        $params['q1'] = $term . '%';
++        $params['q2'] = $term . '%';
++        $params['q3'] = $term . '%';
++        $params['q4'] = $term . '%';
++    }
++
++    if (!empty($filters['status'])) {
++        $where[] = 't.status = :status';
++        $params['status'] = (string) $filters['status'];
++    }
++
++    if (!empty($filters['specialty'])) {
++        $where[] = 't.specialty = :specialty';
++        $params['specialty'] = (string) $filters['specialty'];
++    }
++
++    // La jointure sur users porte AUSSI sur school_id : users est une
++    // table globale, le garde-fou multi-école ne la couvre pas. Sans ce
++    // filtre, un identifiant de compte d'une autre école pourrait
++    // s'afficher si les données venaient à diverger.
++    $from = 'FROM teachers t
++             LEFT JOIN users u ON u.id = t.user_id AND u.school_id = t.school_id
++             WHERE ' . implode(' AND ', $where);
++
++    $total  = (int) db_value('SELECT COUNT(DISTINCT t.id) ' . $from, $params);
++    $pages  = max(1, (int) ceil($total / $perPage));
++    $page   = min(max(1, $page), $pages);
++    $offset = ($page - 1) * $perPage;
++
++    $rows = db_all(
++        'SELECT t.*, u.username
++         ' . $from . '
++         ORDER BY t.last_name, t.post_name, t.first_name
++         LIMIT ' . (int) $perPage . ' OFFSET ' . (int) $offset,
++        $params
++    );
++
++    // Le nombre d'affectations est ajouté en UNE requête pour la page
++    // affichée, et non par enseignant : une liste de 25 enseignants ne
++    // doit pas produire 26 requêtes.
++    if ($rows !== []) {
++        $ids     = array_map(static fn (array $r): int => (int) $r['id'], $rows);
++        $inList  = implode(',', array_map('intval', $ids));
++        $counts  = db_all(
++            'SELECT teacher_id, COUNT(*) AS total, COUNT(DISTINCT classroom_id) AS classrooms
++               FROM teacher_subjects
++              WHERE school_id = :school_id AND teacher_id IN (' . $inList . ')
++              GROUP BY teacher_id',
++            ['school_id' => tenant_require()]
++        );
++
++        $byTeacher = [];
++
++        foreach ($counts as $row) {
++            $byTeacher[(int) $row['teacher_id']] = $row;
++        }
++
++        foreach ($rows as $index => $row) {
++            $id = (int) $row['id'];
++            $rows[$index]['assignment_count'] = (int) ($byTeacher[$id]['total'] ?? 0);
++            $rows[$index]['classroom_count']  = (int) ($byTeacher[$id]['classrooms'] ?? 0);
++        }
++    }
++
++    return ['rows' => $rows, 'total' => $total, 'pages' => $pages, 'page' => $page];
++}
++
++/** Échappe les jokers d'un terme destiné à un LIKE. */
++function teachers_escape_like(string $term): string
++{
++    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
++}
++
++/** Fiche d'un enseignant. */
++function teachers_repo_find(int $id): ?array
++{
++    return tenant_one('teachers', 'id = :id AND deleted_at IS NULL', ['id' => $id]);
++}
++
++/** Enseignant rattaché à un compte utilisateur. */
++function teachers_repo_find_by_user(int $userId): ?array
++{
++    return tenant_one(
++        'teachers',
++        'user_id = :user_id AND deleted_at IS NULL',
++        ['user_id' => $userId]
++    );
++}
++
++/**
++ * Comptes utilisateurs de l'école qui ne sont encore liés à aucune fiche.
++ *
++ * Sert à alimenter le sélecteur « compte de connexion » du formulaire.
++ * L'enseignant en cours d'édition garde son propre compte dans la liste,
++ * sans quoi une simple modification de son téléphone le détacherait.
++ */
++function teachers_repo_available_users(?int $currentTeacherId = null): array
++{
++    return db_all(
++        'SELECT u.id, u.username, u.last_name, u.post_name, u.first_name
++           FROM users u
++           LEFT JOIN teachers t ON t.user_id = u.id
++                               AND t.school_id = u.school_id
++                               AND t.deleted_at IS NULL
++                               AND (:current IS NULL OR t.id <> :current2)
++          WHERE u.school_id = :school_id
++            AND u.status = \'active\'
++            AND t.id IS NULL
++          ORDER BY u.last_name, u.first_name',
++        [
++            'school_id' => tenant_require(),
++            'current'   => $currentTeacherId,
++            'current2'  => $currentTeacherId ?? 0,
++        ]
++    );
++}
++
++/**
++ * Service d'un enseignant pour une année : ses branches, classe par classe.
++ */
++function teachers_repo_assignments(int $teacherId, int $yearId): array
++{
++    return db_all(
++        'SELECT ts.id, ts.weekly_hours, ts.classroom_id, ts.curriculum_subject_id,
++                c.code AS classroom_code, c.name AS classroom_name,
++                s.name AS subject_name, s.short_name AS subject_short,
++                cs.max_points, cs.weekly_hours AS program_hours,
++                l.short_name AS level_short
++           FROM teacher_subjects ts
++           JOIN classrooms c          ON c.id = ts.classroom_id AND c.school_id = ts.school_id
++           JOIN curriculum_subjects cs ON cs.id = ts.curriculum_subject_id AND cs.school_id = ts.school_id
++           JOIN subjects s            ON s.id = cs.subject_id AND s.school_id = cs.school_id
++           JOIN curriculums cu        ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
++           JOIN education_levels l    ON l.id = cu.education_level_id
++          WHERE ts.school_id = :school_id
++            AND ts.teacher_id = :teacher_id
++            AND ts.academic_year_id = :year_id
++          ORDER BY l.order_number, c.code, cs.order_number, s.name',
++        ['school_id' => tenant_require(), 'teacher_id' => $teacherId, 'year_id' => $yearId]
++    );
++}
++
++/**
++ * Répartition d'une classe : chaque branche du programme et, si elle est
++ * pourvue, l'enseignant qui l'assure.
++ *
++ * Une seule requête : c'est l'écran de travail du préfet des études, il
++ * doit rester utilisable avec quarante branches.
++ */
++function teachers_repo_classroom_grid(int $classroomId): array
++{
++    return db_all(
++        'SELECT cs.id AS curriculum_subject_id, cs.max_points, cs.weekly_hours,
++                cs.is_optional, cs.order_number,
++                s.name AS subject_name, s.short_name AS subject_short,
++                ts.id AS assignment_id, ts.weekly_hours AS assigned_hours,
++                t.id AS teacher_id, t.last_name, t.post_name, t.first_name
++           FROM classrooms c
++           JOIN curriculum_subjects cs ON cs.curriculum_id = c.curriculum_id
++                                      AND cs.school_id = c.school_id
++           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
++           LEFT JOIN teacher_subjects ts ON ts.curriculum_subject_id = cs.id
++                                        AND ts.classroom_id = c.id
++                                        AND ts.school_id = c.school_id
++           LEFT JOIN teachers t ON t.id = ts.teacher_id AND t.school_id = ts.school_id
++          WHERE c.school_id = :school_id AND c.id = :classroom_id
++          ORDER BY cs.order_number, s.name',
++        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
++    );
++}
++
++/** Charge horaire totale d'un enseignant sur une année. */
++function teachers_repo_weekly_load(int $teacherId, int $yearId): float
++{
++    return (float) db_value(
++        'SELECT COALESCE(SUM(COALESCE(ts.weekly_hours, cs.weekly_hours, 0)), 0)
++           FROM teacher_subjects ts
++           JOIN curriculum_subjects cs ON cs.id = ts.curriculum_subject_id
++                                      AND cs.school_id = ts.school_id
++          WHERE ts.school_id = :school_id
++            AND ts.teacher_id = :teacher_id
++            AND ts.academic_year_id = :year_id',
++        ['school_id' => tenant_require(), 'teacher_id' => $teacherId, 'year_id' => $yearId]
++    );
++}
++
++/** Classes dont l'enseignant est titulaire. */
++function teachers_repo_main_classrooms(int $teacherId, int $yearId): array
++{
++    return tenant_all(
++        'classrooms',
++        'main_teacher_id = :teacher_id AND academic_year_id = :year_id ORDER BY code',
++        ['teacher_id' => $teacherId, 'year_id' => $yearId]
++    );
++}
++
++// =====================================================================
++//  PÉRIMÈTRE DE L'ENSEIGNANT
++//
++//  Un enseignant est responsable de ce qu'on lui a confié, et de rien
++//  d'autre. Deux titres ouvrent ce périmètre :
++//
++//    · être TITULAIRE d'une classe (classrooms.main_teacher_id) ;
++//    · ASSURER une branche dans une classe (teacher_subjects).
++//
++//  Ces fonctions sont la source unique de vérité. Toute autorisation
++//  pédagogique — consultation d'élèves, saisie de notes, appel des
++//  présences — doit les interroger plutôt que refaire la requête.
++// =====================================================================
++
++/**
++ * Identifiants des classes confiées à l'utilisateur courant.
++ *
++ * @return int[] Vide s'il n'est pas enseignant, ou n'a rien reçu.
++ */
++function teachers_scope_classroom_ids(?int $yearId = null): array
++{
++    $userId = auth_id();
++
++    if ($userId === null) {
++        return [];
++    }
++
++    $teacher = teachers_repo_find_by_user($userId);
++
++    if ($teacher === null || $teacher['status'] !== 'active') {
++        return [];
++    }
++
++    // Chaque branche de l'UNION reçoit SES PROPRES paramètres, avec des
++    // noms distincts. En requêtes réellement préparées
++    // (ATTR_EMULATE_PREPARES = false), MySQL refuse qu'un même paramètre
++    // nommé apparaisse deux fois : il répond « Invalid parameter number ».
++    $params = [
++        'school_main'  => tenant_require(),
++        'teacher_main' => (int) $teacher['id'],
++        'school_sub'   => tenant_require(),
++        'teacher_sub'  => (int) $teacher['id'],
++    ];
++
++    $yearMain = '';
++    $yearSub  = '';
++
++    if ($yearId !== null) {
++        $yearMain = ' AND c.academic_year_id = :year_main';
++        $yearSub  = ' AND c.academic_year_id = :year_sub';
++        $params['year_main'] = $yearId;
++        $params['year_sub']  = $yearId;
++    }
++
++    $rows = db_all(
++        'SELECT c.id
++           FROM classrooms c
++          WHERE c.school_id = :school_main AND c.main_teacher_id = :teacher_main' . $yearMain . '
++          UNION
++         SELECT ts.classroom_id AS id
++           FROM teacher_subjects ts
++           JOIN classrooms c ON c.id = ts.classroom_id AND c.school_id = ts.school_id
++          WHERE ts.school_id = :school_sub AND ts.teacher_id = :teacher_sub' . $yearSub,
++        $params
++    );
++
++    return array_map(static fn (array $row): int => (int) $row['id'], $rows);
++}
++
++/**
++ * L'utilisateur courant assure-t-il CETTE branche dans CETTE classe ?
++ *
++ * C'est le contrôle qui autorisera la saisie d'une note en phase 4B.
++ * Être titulaire de la classe ne suffit pas : le titulaire encadre, il
++ * ne note pas les branches qu'il n'enseigne pas.
++ */
++function teachers_can_teach(int $classroomId, int $curriculumSubjectId): bool
++{
++    $userId = auth_id();
++
++    if ($userId === null) {
++        return false;
++    }
++
++    $teacher = teachers_repo_find_by_user($userId);
++
++    if ($teacher === null || $teacher['status'] !== 'active') {
++        return false;
++    }
++
++    return db_exists(
++        'SELECT 1 FROM teacher_subjects
++          WHERE school_id = :school_id
++            AND teacher_id = :teacher_id
++            AND classroom_id = :classroom_id
++            AND curriculum_subject_id = :subject_id
++          LIMIT 1',
++        [
++            'school_id'    => tenant_require(),
++            'teacher_id'   => (int) $teacher['id'],
++            'classroom_id' => $classroomId,
++            'subject_id'   => $curriculumSubjectId,
++        ]
++    );
++}
++
++/** L'utilisateur courant est-il un enseignant en activité ? */
++function teachers_current_is_teacher(): bool
++{
++    $userId = auth_id();
++
++    if ($userId === null) {
++        return false;
++    }
++
++    $teacher = teachers_repo_find_by_user($userId);
++
++    return $teacher !== null && $teacher['status'] === 'active';
++}
+diff --git a/app/modules/teachers/services.php b/app/modules/teachers/services.php
+new file mode 100644
+index 0000000..38e900c
+--- /dev/null
++++ b/app/modules/teachers/services.php
+@@ -0,0 +1,458 @@
++<?php
++/**
++ * Module TEACHERS — règles métier.
++ *
++ * Toutes les écritures du module passent par ici. Les contrôleurs
++ * valident la forme des données ; ce fichier vérifie la cohérence
++ * métier et l'appartenance à l'établissement.
++ */
++
++declare(strict_types=1);
++
++require_once __DIR__ . '/repositories.php';
++
++/** Statuts d'un enseignant, dans l'ordre d'affichage. */
++const TEACHER_STATUSES = [
++    'active'    => 'En activité',
++    'suspended' => 'Suspendu',
++    'left'      => 'Parti de l\'établissement',
++];
++
++const TEACHER_EMPLOYMENT_TYPES = [
++    'permanent' => 'Permanent',
++    'contract'  => 'Sous contrat',
++    'volunteer' => 'Bénévole / vacataire',
++];
++
++// =====================================================================
++//  FICHE ENSEIGNANT
++// =====================================================================
++
++/**
++ * Crée une fiche enseignant.
++ *
++ * @return array{ok: bool, id: int|null, message: string}
++ */
++function teachers_service_create(array $data): array
++{
++    $userCheck = teachers_service_check_user_link($data['user_id'] ?? null, null);
++
++    if (!$userCheck['ok']) {
++        return ['ok' => false, 'id' => null, 'message' => $userCheck['message']];
++    }
++
++    $matriculeCheck = teachers_service_check_matricule($data['matricule'] ?? null, null);
++
++    if (!$matriculeCheck['ok']) {
++        return ['ok' => false, 'id' => null, 'message' => $matriculeCheck['message']];
++    }
++
++    $teacherId = db_transaction(static function () use ($data): int {
++        $id = tenant_insert('teachers', [
++            'uuid'            => str_uuid(),
++            'user_id'         => $data['user_id'] ?? null,
++            'matricule'       => $data['matricule'] ?? null,
++            'last_name'       => $data['last_name'],
++            'post_name'       => $data['post_name'] ?? null,
++            'first_name'      => $data['first_name'],
++            'gender'          => $data['gender'] ?? null,
++            'birth_date'      => $data['birth_date'] ?? null,
++            'phone'           => $data['phone'] ?? null,
++            'phone_alt'       => $data['phone_alt'] ?? null,
++            'email'           => $data['email'] ?? null,
++            'address'         => $data['address'] ?? null,
++            'hire_date'       => $data['hire_date'] ?? null,
++            'employment_type' => $data['employment_type'] ?? 'permanent',
++            'qualification'   => $data['qualification'] ?? null,
++            'specialty'       => $data['specialty'] ?? null,
++            'status'          => 'active',
++            'notes'           => $data['notes'] ?? null,
++            'created_by'      => auth_id(),
++        ]);
++
++        audit_log(
++            'create',
++            'teacher',
++            $id,
++            null,
++            ['name' => $data['last_name'] . ' ' . $data['first_name']],
++            'Création d\'une fiche enseignant'
++        );
++
++        return $id;
++    });
++
++    return ['ok' => true, 'id' => $teacherId, 'message' => ''];
++}
++
++/**
++ * Met à jour une fiche enseignant.
++ *
++ * Seules les clés présentes dans $data sont écrites — même règle que
++ * pour le dossier élève : une requête partielle ne doit jamais vider les
++ * colonnes qu'elle ne mentionne pas.
++ *
++ * @return array{ok: bool, message: string}
++ */
++function teachers_service_update(int $teacherId, array $data): array
++{
++    $teacher = teachers_repo_find($teacherId);
++
++    if ($teacher === null) {
++        return ['ok' => false, 'message' => 'Enseignant introuvable.'];
++    }
++
++    if (array_key_exists('user_id', $data)) {
++        $userCheck = teachers_service_check_user_link($data['user_id'], $teacherId);
++
++        if (!$userCheck['ok']) {
++            return ['ok' => false, 'message' => $userCheck['message']];
++        }
++    }
++
++    if (array_key_exists('matricule', $data)) {
++        $matriculeCheck = teachers_service_check_matricule($data['matricule'], $teacherId);
++
++        if (!$matriculeCheck['ok']) {
++            return ['ok' => false, 'message' => $matriculeCheck['message']];
++        }
++    }
++
++    if ($data === []) {
++        return ['ok' => false, 'message' => 'Aucune donnée à enregistrer.'];
++    }
++
++    tenant_update('teachers', $data, 'id = :id', ['id' => $teacherId]);
++    audit_update('teacher', $teacherId, $teacher, $data, 'Modification d\'une fiche enseignant');
++
++    return ['ok' => true, 'message' => ''];
++}
++
++/**
++ * Vérifie qu'un compte utilisateur peut être rattaché à cette fiche.
++ *
++ * Trois refus possibles, et chacun protège une chose différente :
++ *  · compte inexistant ou d'une autre école → fuite inter-école ;
++ *  · compte déjà lié à un autre enseignant → périmètres cumulés ;
++ *  · compte désactivé → accès rouvert par une fiche.
++ */
++function teachers_service_check_user_link(?int $userId, ?int $currentTeacherId): array
++{
++    if ($userId === null) {
++        return ['ok' => true, 'message' => ''];
++    }
++
++    // users est une table globale : le filtre par école est explicite.
++    $user = db_one(
++        'SELECT id, status FROM users
++          WHERE id = :id AND school_id = :school_id LIMIT 1',
++        ['id' => $userId, 'school_id' => tenant_require()],
++        true
++    );
++
++    if ($user === null) {
++        return ['ok' => false, 'message' => 'Ce compte utilisateur n\'appartient pas à l\'établissement.'];
++    }
++
++    if ($user['status'] !== 'active') {
++        return ['ok' => false, 'message' => 'Ce compte utilisateur n\'est pas actif.'];
++    }
++
++    $existing = teachers_repo_find_by_user($userId);
++
++    if ($existing !== null && (int) $existing['id'] !== $currentTeacherId) {
++        return [
++            'ok'      => false,
++            'message' => 'Ce compte est déjà rattaché à ' . full_name(
++                $existing['last_name'],
++                $existing['post_name'],
++                $existing['first_name']
++            ) . '.',
++        ];
++    }
++
++    return ['ok' => true, 'message' => ''];
++}
++
++/** Vérifie l'unicité du matricule dans l'établissement. */
++function teachers_service_check_matricule(?string $matricule, ?int $currentTeacherId): array
++{
++    if ($matricule === null || trim($matricule) === '') {
++        return ['ok' => true, 'message' => ''];
++    }
++
++    $existing = tenant_one(
++        'teachers',
++        'matricule = :m AND deleted_at IS NULL',
++        ['m' => trim($matricule)]
++    );
++
++    if ($existing !== null && (int) $existing['id'] !== $currentTeacherId) {
++        return ['ok' => false, 'message' => 'Ce matricule est déjà attribué à un autre enseignant.'];
++    }
++
++    return ['ok' => true, 'message' => ''];
++}
++
++/**
++ * Change le statut d'un enseignant.
++ *
++ * Un départ ne supprime rien : les affectations passées restent, sans
++ * quoi les bulletins déjà produits perdraient le nom du professeur qui
++ * a enseigné la branche. Elles cessent simplement d'ouvrir un périmètre,
++ * puisque teachers_scope_classroom_ids() exige le statut « active ».
++ */
++function teachers_service_change_status(int $teacherId, string $status, string $reason = ''): array
++{
++    if (!array_key_exists($status, TEACHER_STATUSES)) {
++        return ['ok' => false, 'message' => 'Statut inconnu.'];
++    }
++
++    $teacher = teachers_repo_find($teacherId);
++
++    if ($teacher === null) {
++        return ['ok' => false, 'message' => 'Enseignant introuvable.'];
++    }
++
++    $changes = [
++        'status'  => $status,
++        'left_on' => $status === 'left' ? date('Y-m-d') : null,
++    ];
++
++    if ($reason !== '') {
++        $changes['notes'] = mb_substr($reason, 0, 255);
++    }
++
++    tenant_update('teachers', $changes, 'id = :id', ['id' => $teacherId]);
++
++    audit_log(
++        'update',
++        'teacher',
++        $teacherId,
++        ['status' => $teacher['status']],
++        ['status' => $status],
++        TEACHER_STATUSES[$status] . ($reason !== '' ? ' — ' . $reason : '')
++    );
++
++    return ['ok' => true, 'message' => ''];
++}
++
++// =====================================================================
++//  AFFECTATIONS
++// =====================================================================
++
++/**
++ * Affecte un enseignant à une branche d'une classe.
++ *
++ * Toutes les vérifications d'appartenance sont faites ici, et aucune ne
++ * peut être contournée par le formulaire :
++ *
++ *  1. l'enseignant appartient à l'école et est en activité ;
++ *  2. la classe appartient à l'école ;
++ *  3. l'année de la classe n'est pas clôturée ;
++ *  4. la branche appartient au PROGRAMME DE CETTE CLASSE — sans quoi on
++ *     pourrait affecter du latin dans une classe de primaire ;
++ *  5. la branche n'est pas déjà pourvue par quelqu'un d'autre.
++ *
++ * @return array{ok: bool, id: int|null, message: string}
++ */
++function teachers_service_assign(int $teacherId, int $classroomId, int $curriculumSubjectId, ?float $weeklyHours = null): array
++{
++    $teacher = teachers_repo_find($teacherId);
++
++    if ($teacher === null) {
++        return ['ok' => false, 'id' => null, 'message' => 'Enseignant introuvable.'];
++    }
++
++    if ($teacher['status'] !== 'active') {
++        return [
++            'ok' => false, 'id' => null,
++            'message' => 'Cet enseignant n\'est pas en activité : réactivez sa fiche avant de lui confier une branche.',
++        ];
++    }
++
++    $classroom = tenant_find('classrooms', $classroomId);
++
++    if ($classroom === null) {
++        return ['ok' => false, 'id' => null, 'message' => 'Classe introuvable.'];
++    }
++
++    $year = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++
++    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
++        return [
++            'ok' => false, 'id' => null,
++            'message' => 'Cette année scolaire est clôturée : la répartition ne peut plus être modifiée.',
++        ];
++    }
++
++    // La branche doit appartenir au programme de la classe. Le contrôle
++    // porte sur curriculum_id, pas seulement sur l'école : une branche
++    // d'un autre programme de la même école serait sinon acceptée.
++    $subject = tenant_one(
++        'curriculum_subjects',
++        'id = :id AND curriculum_id = :curriculum_id',
++        ['id' => $curriculumSubjectId, 'curriculum_id' => (int) $classroom['curriculum_id']]
++    );
++
++    if ($subject === null) {
++        return [
++            'ok' => false, 'id' => null,
++            'message' => 'Cette branche ne figure pas au programme de la classe.',
++        ];
++    }
++
++    $existing = tenant_one(
++        'teacher_subjects',
++        'classroom_id = :c AND curriculum_subject_id = :s',
++        ['c' => $classroomId, 's' => $curriculumSubjectId]
++    );
++
++    if ($existing !== null) {
++        if ((int) $existing['teacher_id'] === $teacherId) {
++            return ['ok' => false, 'id' => (int) $existing['id'], 'message' => 'Cet enseignant assure déjà cette branche dans cette classe.'];
++        }
++
++        $current = teachers_repo_find((int) $existing['teacher_id']);
++
++        return [
++            'ok' => false, 'id' => null,
++            'message' => 'Cette branche est déjà assurée par '
++                . ($current !== null
++                    ? full_name($current['last_name'], $current['post_name'], $current['first_name'])
++                    : 'un autre enseignant')
++                . '. Retirez l\'affectation existante avant d\'en créer une nouvelle.',
++        ];
++    }
++
++    $assignmentId = db_transaction(static function () use ($teacherId, $classroom, $classroomId, $curriculumSubjectId, $weeklyHours, $teacher): int {
++        $id = tenant_insert('teacher_subjects', [
++            'teacher_id'            => $teacherId,
++            'academic_year_id'      => (int) $classroom['academic_year_id'],
++            'classroom_id'          => $classroomId,
++            'curriculum_subject_id' => $curriculumSubjectId,
++            'weekly_hours'          => $weeklyHours,
++            'assigned_on'           => date('Y-m-d'),
++            'created_by'            => auth_id(),
++        ]);
++
++        audit_log(
++            'create',
++            'teacher_subject',
++            $id,
++            null,
++            ['teacher_id' => $teacherId, 'classroom' => $classroom['code']],
++            'Affectation de ' . full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name'])
++                . ' à une branche de ' . $classroom['code']
++        );
++
++        return $id;
++    });
++
++    return ['ok' => true, 'id' => $assignmentId, 'message' => ''];
++}
++
++/**
++ * Retire une affectation.
++ *
++ * En phase 4B, ce retrait devra refuser de s'exécuter si des notes ont
++ * déjà été saisies pour cette branche : l'auteur d'une note doit rester
++ * identifiable. Le point est signalé ici pour ne pas être oublié.
++ */
++function teachers_service_unassign(int $assignmentId): array
++{
++    $assignment = tenant_find('teacher_subjects', $assignmentId);
++
++    if ($assignment === null) {
++        return ['ok' => false, 'message' => 'Affectation introuvable.'];
++    }
++
++    $year = tenant_find('academic_years', (int) $assignment['academic_year_id']);
++
++    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
++        return ['ok' => false, 'message' => 'Cette année scolaire est clôturée.'];
++    }
++
++    tenant_delete('teacher_subjects', 'id = :id', ['id' => $assignmentId]);
++
++    audit_log(
++        'delete',
++        'teacher_subject',
++        $assignmentId,
++        ['teacher_id' => $assignment['teacher_id'], 'classroom_id' => $assignment['classroom_id']],
++        null,
++        'Retrait d\'une affectation'
++    );
++
++    return ['ok' => true, 'message' => ''];
++}
++
++/**
++ * Désigne le titulaire d'une classe.
++ *
++ * Le titulaire n'a pas besoin d'enseigner dans la classe : en primaire,
++ * il enseigne tout ; dans les humanités, il peut n'y assurer aucune
++ * branche et rester responsable de la discipline et du bulletin.
++ */
++function teachers_service_set_main_teacher(int $classroomId, ?int $teacherId): array
++{
++    $classroom = tenant_find('classrooms', $classroomId);
++
++    if ($classroom === null) {
++        return ['ok' => false, 'message' => 'Classe introuvable.'];
++    }
++
++    if ($teacherId !== null) {
++        $teacher = teachers_repo_find($teacherId);
++
++        if ($teacher === null) {
++            return ['ok' => false, 'message' => 'Enseignant introuvable.'];
++        }
++
++        if ($teacher['status'] !== 'active') {
++            return ['ok' => false, 'message' => 'Cet enseignant n\'est pas en activité.'];
++        }
++    }
++
++    tenant_update('classrooms', ['main_teacher_id' => $teacherId], 'id = :id', ['id' => $classroomId]);
++
++    audit_log(
++        'update',
++        'classroom',
++        $classroomId,
++        ['main_teacher_id' => $classroom['main_teacher_id']],
++        ['main_teacher_id' => $teacherId],
++        $teacherId !== null ? 'Désignation du titulaire' : 'Retrait du titulaire'
++    );
++
++    return ['ok' => true, 'message' => ''];
++}
++
++// =====================================================================
++//  PARAMÈTRE PÉDAGOGIQUE
++// =====================================================================
++
++/** Seuil de réussite de l'établissement, en pourcentage. */
++const PASSING_THRESHOLD_DEFAULT = 50.0;
++
++/**
++ * Seuil de réussite applicable.
++ *
++ * La règle nationale est 50 %. Elle est lue depuis les paramètres de
++ * l'établissement plutôt qu'écrite dans le code : une école
++ * conventionnée peut retenir un autre seuil, et un changement
++ * réglementaire ne doit pas imposer une nouvelle version du logiciel.
++ *
++ * Les bornes protègent d'une saisie absurde : un seuil de 0 ferait
++ * réussir tout le monde, un seuil de 100 ne laisserait passer personne.
++ */
++function teachers_passing_threshold(): float
++{
++    $value = (float) school_setting('grading.passing_threshold', PASSING_THRESHOLD_DEFAULT);
++
++    if ($value < 1.0 || $value > 99.0) {
++        return PASSING_THRESHOLD_DEFAULT;
++    }
++
++    return $value;
++}
+diff --git a/app/views/partials/sidebar.php b/app/views/partials/sidebar.php
+index 4bd2e33..f048fc8 100644
+--- a/app/views/partials/sidebar.php
++++ b/app/views/partials/sidebar.php
+@@ -69,26 +69,26 @@ $isPlatform = $user['school_id'] === null;
+                 </a>
+             <?php endif; ?>
+ 
+-            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view'])): ?>
++            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view', 'teacher.view'])): ?>
+                 <p class="nav-heading">Pédagogie</p>
+-                <?php if (can('grade.view')): ?>
++                <?php if (can('grade.view') && route_exists('/notes')): ?>
+                     <a class="nav-item <?= nav_active('/notes') ?>" href="<?= e(url('/notes')) ?>">
+                         <i class="bi bi-journal-check"></i><span>Notes et bulletins</span>
+                     </a>
+                 <?php endif; ?>
+-                <?php if (can('attendance.view')): ?>
++                <?php if (can('attendance.view') && route_exists('/presences')): ?>
+                     <a class="nav-item <?= nav_active('/presences') ?>" href="<?= e(url('/presences')) ?>">
+                         <i class="bi bi-calendar-check"></i><span>Présences</span>
+                     </a>
+                 <?php endif; ?>
+-                <?php if (can('teacher.view')): ?>
++                <?php if (can('teacher.view') && route_exists('/enseignants')): ?>
+                     <a class="nav-item <?= nav_active('/enseignants') ?>" href="<?= e(url('/enseignants')) ?>">
+                         <i class="bi bi-person-video3"></i><span>Enseignants</span>
+                     </a>
+                 <?php endif; ?>
+             <?php endif; ?>
+ 
+-            <?php if (can('finance.view')): ?>
++            <?php if (can('finance.view') && route_exists('/finances')): ?>
+                 <p class="nav-heading">Finances</p>
+                 <a class="nav-item <?= nav_active('/finances') ?>" href="<?= e(url('/finances')) ?>">
+                     <i class="bi bi-cash-coin"></i><span>Frais et paiements</span>
+@@ -98,25 +98,25 @@ $isPlatform = $user['school_id'] === null;
+             <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view'])): ?>
+                 <p class="nav-heading">Administration</p>
+ 
+-                <?php if (can('academic_year.view')): ?>
++                <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
+                     <a class="nav-item <?= nav_active('/annees-scolaires') ?>" href="<?= e(url('/annees-scolaires')) ?>">
+                         <i class="bi bi-calendar3"></i><span>Années scolaires</span>
+                     </a>
+                 <?php endif; ?>
+ 
+-                <?php if (can('curriculum.view')): ?>
++                <?php if (can('curriculum.view') && route_exists('/referentiel')): ?>
+                     <a class="nav-item <?= nav_active('/referentiel') ?>" href="<?= e(url('/referentiel')) ?>">
+                         <i class="bi bi-diagram-3"></i><span>Référentiel scolaire</span>
+                     </a>
+                 <?php endif; ?>
+ 
+-                <?php if (can('user.view')): ?>
++                <?php if (can('user.view') && route_exists('/utilisateurs')): ?>
+                     <a class="nav-item <?= nav_active('/utilisateurs') ?>" href="<?= e(url('/utilisateurs')) ?>">
+                         <i class="bi bi-person-badge"></i><span>Utilisateurs</span>
+                     </a>
+                 <?php endif; ?>
+ 
+-                <?php if (can('school.edit')): ?>
++                <?php if (can('school.edit') && route_exists('/ecole/parametres')): ?>
+                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
+                         <i class="bi bi-gear"></i><span>Mon établissement</span>
+                     </a>
+diff --git a/app/views/teachers/form.php b/app/views/teachers/form.php
+new file mode 100644
+index 0000000..89390ef
+--- /dev/null
++++ b/app/views/teachers/form.php
+@@ -0,0 +1,156 @@
++<?php
++/**
++ * Création d'une fiche enseignant.
++ *
++ * @var array|null $teacher
++ * @var array      $statuses
++ * @var array      $employmentTypes
++ * @var array      $availableUsers
++ */
++declare(strict_types=1);
++
++set_title('Nouvel enseignant');
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title">Nouvel enseignant</h1>
++        <p class="page-subtitle">
++            Le nom s'écrit NOM Postnom Prénom, comme sur les documents officiels.
++        </p>
++    </div>
++    <a href="<?= e(url('/enseignants')) ?>" class="btn btn-outline-secondary">
++        <i class="bi bi-arrow-left me-1"></i> Retour
++    </a>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<form method="post" action="<?= e(url('/enseignants')) ?>">
++    <?= csrf_field() ?>
++
++    <div class="card mb-3">
++        <div class="card-header"><strong>Identité</strong></div>
++        <div class="card-body">
++            <div class="row g-3">
++                <div class="col-12 col-md-4">
++                    <label for="last_name" class="form-label">Nom <span class="text-danger">*</span></label>
++                    <input type="text" id="last_name" name="last_name" class="form-control"
++                           value="<?= old('last_name') ?>" required maxlength="80" autofocus>
++                </div>
++                <div class="col-12 col-md-4">
++                    <label for="post_name" class="form-label">Postnom</label>
++                    <input type="text" id="post_name" name="post_name" class="form-control"
++                           value="<?= old('post_name') ?>" maxlength="80">
++                </div>
++                <div class="col-12 col-md-4">
++                    <label for="first_name" class="form-label">Prénom <span class="text-danger">*</span></label>
++                    <input type="text" id="first_name" name="first_name" class="form-control"
++                           value="<?= old('first_name') ?>" required maxlength="80">
++                </div>
++
++                <div class="col-6 col-md-3">
++                    <label for="gender" class="form-label">Sexe</label>
++                    <select id="gender" name="gender" class="form-select">
++                        <option value="">—</option>
++                        <option value="M" <?= old('gender') === 'M' ? 'selected' : '' ?>>Masculin</option>
++                        <option value="F" <?= old('gender') === 'F' ? 'selected' : '' ?>>Féminin</option>
++                    </select>
++                </div>
++                <div class="col-6 col-md-3">
++                    <label for="birth_date" class="form-label">Date de naissance</label>
++                    <input type="date" id="birth_date" name="birth_date" class="form-control"
++                           value="<?= old('birth_date') ?>">
++                </div>
++                <div class="col-12 col-md-3">
++                    <label for="matricule" class="form-label">Matricule</label>
++                    <input type="text" id="matricule" name="matricule" class="form-control"
++                           value="<?= old('matricule') ?>" maxlength="30" placeholder="SECOPE ou interne">
++                </div>
++                <div class="col-12 col-md-3">
++                    <label for="phone" class="form-label">Téléphone</label>
++                    <input type="tel" id="phone" name="phone" class="form-control"
++                           value="<?= old('phone') ?>" placeholder="+243…">
++                </div>
++
++                <div class="col-12 col-md-6">
++                    <label for="email" class="form-label">Email</label>
++                    <input type="email" id="email" name="email" class="form-control"
++                           value="<?= old('email') ?>" maxlength="190">
++                </div>
++                <div class="col-12 col-md-6">
++                    <label for="address" class="form-label">Adresse</label>
++                    <input type="text" id="address" name="address" class="form-control"
++                           value="<?= old('address') ?>" maxlength="255">
++                </div>
++            </div>
++        </div>
++    </div>
++
++    <div class="card mb-3">
++        <div class="card-header"><strong>Situation professionnelle</strong></div>
++        <div class="card-body">
++            <div class="row g-3">
++                <div class="col-12 col-md-3">
++                    <label for="hire_date" class="form-label">Date d'entrée</label>
++                    <input type="date" id="hire_date" name="hire_date" class="form-control"
++                           value="<?= old('hire_date') ?>">
++                </div>
++                <div class="col-12 col-md-3">
++                    <label for="employment_type" class="form-label">Type d'engagement</label>
++                    <select id="employment_type" name="employment_type" class="form-select">
++                        <?php foreach ($employmentTypes as $code => $label): ?>
++                            <option value="<?= e($code) ?>" <?= old('employment_type') === $code ? 'selected' : '' ?>>
++                                <?= e($label) ?>
++                            </option>
++                        <?php endforeach; ?>
++                    </select>
++                </div>
++                <div class="col-12 col-md-3">
++                    <label for="qualification" class="form-label">Diplôme</label>
++                    <input type="text" id="qualification" name="qualification" class="form-control"
++                           value="<?= old('qualification') ?>" maxlength="120" placeholder="D6, G3, L2…">
++                </div>
++                <div class="col-12 col-md-3">
++                    <label for="specialty" class="form-label">Spécialité</label>
++                    <input type="text" id="specialty" name="specialty" class="form-control"
++                           value="<?= old('specialty') ?>" maxlength="120" placeholder="Mathématiques…">
++                </div>
++            </div>
++        </div>
++    </div>
++
++    <div class="card mb-3">
++        <div class="card-header"><strong>Compte de connexion</strong></div>
++        <div class="card-body">
++            <div class="row g-3 align-items-end">
++                <div class="col-12 col-md-6">
++                    <label for="user_id" class="form-label">Compte rattaché</label>
++                    <select id="user_id" name="user_id" class="form-select">
++                        <option value="">Aucun — l'enseignant ne se connecte pas</option>
++                        <?php foreach ($availableUsers as $user): ?>
++                            <option value="<?= (int) $user['id'] ?>" <?= old('user_id') === (string) $user['id'] ? 'selected' : '' ?>>
++                                <?= e($user['username']) ?> —
++                                <?= e(full_name($user['last_name'], $user['post_name'], $user['first_name'])) ?>
++                            </option>
++                        <?php endforeach; ?>
++                    </select>
++                </div>
++                <div class="col-12 col-md-6">
++                    <p class="small text-secondary mb-0">
++                        Ce rattachement détermine ce que l'enseignant verra en se connectant :
++                        uniquement les élèves des classes dont il est titulaire ou dans lesquelles
++                        il assure une branche. Sans compte, il n'a aucun accès.
++                    </p>
++                </div>
++            </div>
++        </div>
++    </div>
++
++    <div class="d-flex gap-2">
++        <button type="submit" class="btn btn-primary">
++            <i class="bi bi-check-lg me-1"></i> Enregistrer
++        </button>
++        <a href="<?= e(url('/enseignants')) ?>" class="btn btn-outline-secondary">Annuler</a>
++    </div>
++</form>
+diff --git a/app/views/teachers/index.php b/app/views/teachers/index.php
+new file mode 100644
+index 0000000..7c715ea
+--- /dev/null
++++ b/app/views/teachers/index.php
+@@ -0,0 +1,167 @@
++<?php
++/**
++ * Liste du personnel enseignant.
++ *
++ * @var array      $teachers
++ * @var int        $total
++ * @var int        $pages
++ * @var int        $page
++ * @var array      $filters
++ * @var array      $statuses
++ * @var array|null $year
++ * @var array      $years
++ */
++declare(strict_types=1);
++
++set_title('Enseignants');
++
++$badge = [
++    'active'    => 'bg-success-subtle text-success-emphasis',
++    'suspended' => 'bg-warning-subtle text-warning-emphasis',
++    'left'      => 'bg-secondary-subtle text-secondary-emphasis',
++];
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title">Enseignants</h1>
++        <p class="page-subtitle">
++            <?= (int) $total ?> fiche(s)
++            <?php if ($year !== null): ?>
++                · année <strong><?= e($year['code']) ?></strong>
++            <?php endif; ?>
++        </p>
++    </div>
++
++    <?php if (can('teacher.manage')): ?>
++        <a href="<?= e(url('/enseignants/nouveau')) ?>" class="btn btn-primary">
++            <i class="bi bi-person-plus me-1"></i> Nouvel enseignant
++        </a>
++    <?php endif; ?>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<div class="card mb-3">
++    <div class="card-body py-3">
++        <form method="get" action="<?= e(url('/enseignants')) ?>" class="row g-2 align-items-end">
++            <div class="col-12 col-md-5">
++                <label for="q" class="form-label form-label-sm">Nom ou matricule</label>
++                <input type="search" id="q" name="q" class="form-control form-control-sm"
++                       value="<?= e($filters['q']) ?>" placeholder="Début du nom…">
++            </div>
++
++            <div class="col-6 col-md-3">
++                <label for="statut" class="form-label form-label-sm">Statut</label>
++                <select id="statut" name="statut" class="form-select form-select-sm">
++                    <option value="">Tous</option>
++                    <?php foreach ($statuses as $code => $label): ?>
++                        <option value="<?= e($code) ?>" <?= $filters['status'] === $code ? 'selected' : '' ?>>
++                            <?= e($label) ?>
++                        </option>
++                    <?php endforeach; ?>
++                </select>
++            </div>
++
++            <div class="col-6 col-md-4 d-flex gap-2">
++                <button type="submit" class="btn btn-sm btn-outline-primary">
++                    <i class="bi bi-search me-1"></i> Filtrer
++                </button>
++                <?php if ($filters['q'] !== '' || $filters['status'] !== ''): ?>
++                    <a href="<?= e(url('/enseignants')) ?>" class="btn btn-sm btn-outline-secondary">Réinitialiser</a>
++                <?php endif; ?>
++            </div>
++        </form>
++    </div>
++</div>
++
++<?php if ($teachers === []): ?>
++    <div class="card">
++        <div class="card-body text-center py-5">
++            <i class="bi bi-people display-6 text-secondary d-block mb-2"></i>
++            <p class="mb-1 fw-medium">Aucun enseignant ne correspond.</p>
++            <p class="text-secondary small mb-0">
++                La répartition des branches et la saisie des notes s'appuient sur ces fiches.
++            </p>
++        </div>
++    </div>
++<?php else: ?>
++    <div class="card">
++        <div class="table-responsive">
++            <table class="table table-hover align-middle mb-0">
++                <thead>
++                    <tr>
++                        <th scope="col">Nom</th>
++                        <th scope="col" class="d-none d-md-table-cell">Matricule</th>
++                        <th scope="col" class="d-none d-lg-table-cell">Spécialité</th>
++                        <th scope="col" class="text-center">Branches</th>
++                        <th scope="col" class="d-none d-md-table-cell">Compte</th>
++                        <th scope="col">Statut</th>
++                    </tr>
++                </thead>
++                <tbody>
++                    <?php foreach ($teachers as $teacher): ?>
++                        <tr>
++                            <td>
++                                <a href="<?= e(url('/enseignants/' . (int) $teacher['id'])) ?>"
++                                   class="fw-medium text-decoration-none">
++                                    <?= e(full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name'])) ?>
++                                </a>
++                                <?php if (!empty($teacher['phone'])): ?>
++                                    <div class="small text-secondary d-md-none"><?= e($teacher['phone']) ?></div>
++                                <?php endif; ?>
++                            </td>
++                            <td class="d-none d-md-table-cell">
++                                <?= $teacher['matricule'] !== null ? e($teacher['matricule']) : '<span class="text-secondary">—</span>' ?>
++                            </td>
++                            <td class="d-none d-lg-table-cell">
++                                <?= $teacher['specialty'] !== null ? e($teacher['specialty']) : '<span class="text-secondary">—</span>' ?>
++                            </td>
++                            <td class="text-center">
++                                <?php if ((int) ($teacher['assignment_count'] ?? 0) > 0): ?>
++                                    <span class="badge bg-primary-subtle text-primary-emphasis">
++                                        <?= (int) $teacher['assignment_count'] ?>
++                                    </span>
++                                    <span class="small text-secondary">
++                                        dans <?= (int) $teacher['classroom_count'] ?> classe(s)
++                                    </span>
++                                <?php else: ?>
++                                    <span class="text-secondary">—</span>
++                                <?php endif; ?>
++                            </td>
++                            <td class="d-none d-md-table-cell">
++                                <?php if ($teacher['username'] !== null): ?>
++                                    <span class="small"><i class="bi bi-person-check text-success me-1"></i><?= e($teacher['username']) ?></span>
++                                <?php else: ?>
++                                    <span class="small text-secondary"><i class="bi bi-dash-circle me-1"></i>aucun</span>
++                                <?php endif; ?>
++                            </td>
++                            <td>
++                                <span class="badge <?= e($badge[$teacher['status']] ?? 'bg-secondary-subtle') ?>">
++                                    <?= e($statuses[$teacher['status']] ?? $teacher['status']) ?>
++                                </span>
++                            </td>
++                        </tr>
++                    <?php endforeach; ?>
++                </tbody>
++            </table>
++        </div>
++    </div>
++
++    <?php if ($pages > 1): ?>
++        <nav class="mt-3" aria-label="Pagination">
++            <ul class="pagination pagination-sm justify-content-center mb-0">
++                <?php for ($p = 1; $p <= $pages; $p++): ?>
++                    <li class="page-item <?= $p === $page ? 'active' : '' ?>">
++                        <a class="page-link"
++                           href="<?= e(url('/enseignants', array_filter([
++                               'q'      => $filters['q'],
++                               'statut' => $filters['status'],
++                               'page'   => $p,
++                           ]))) ?>"><?= $p ?></a>
++                    </li>
++                <?php endfor; ?>
++            </ul>
++        </nav>
++    <?php endif; ?>
++<?php endif; ?>
+diff --git a/app/views/teachers/repartition.php b/app/views/teachers/repartition.php
+new file mode 100644
+index 0000000..36fa129
+--- /dev/null
++++ b/app/views/teachers/repartition.php
+@@ -0,0 +1,207 @@
++<?php
++/**
++ * Répartition des branches d'une classe.
++ *
++ * Écran de travail du préfet des études : une ligne par branche du
++ * programme, l'enseignant qui l'assure, et ce qui reste à pourvoir.
++ *
++ * @var array      $classroom
++ * @var array|null $year
++ * @var array      $rows
++ * @var array      $teachers
++ * @var array|null $mainTeacher
++ */
++declare(strict_types=1);
++
++set_title('Répartition — ' . $classroom['name']);
++
++$assigned = 0;
++$hours    = 0.0;
++
++foreach ($rows as $row) {
++    if ($row['assignment_id'] !== null) {
++        $assigned++;
++        $hours += (float) ($row['assigned_hours'] ?? $row['weekly_hours'] ?? 0);
++    }
++}
++
++$pending  = count($rows) - $assigned;
++$editable = can('teacher.assign')
++    && $year !== null
++    && !in_array($year['status'], ['closed', 'archived'], true);
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title">Répartition des branches</h1>
++        <p class="page-subtitle">
++            <strong><?= e($classroom['name']) ?></strong>
++            <span class="text-secondary">(<?= e($classroom['code']) ?>)</span>
++            <?php if ($year !== null): ?> · année <?= e($year['code']) ?><?php endif; ?>
++            · <?= $assigned ?> / <?= count($rows) ?> branche(s) pourvue(s)
++            · <?= e(number_format($hours, 1, ',', ' ')) ?> h/semaine
++        </p>
++    </div>
++
++    <a href="<?= e(url('/classes/' . (int) $classroom['id'])) ?>" class="btn btn-outline-secondary">
++        <i class="bi bi-arrow-left me-1"></i> La classe
++    </a>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<?php if ($year !== null && in_array($year['status'], ['closed', 'archived'], true)): ?>
++    <div class="alert alert-secondary d-flex align-items-start gap-2">
++        <i class="bi bi-lock"></i>
++        <div>
++            Cette année scolaire est clôturée. La répartition reste consultable
++            mais ne peut plus être modifiée : elle documente ce qui a réellement
++            été enseigné.
++        </div>
++    </div>
++<?php endif; ?>
++
++<?php if ($pending > 0 && $editable): ?>
++    <div class="alert alert-warning d-flex align-items-start gap-2">
++        <i class="bi bi-exclamation-triangle"></i>
++        <div>
++            <strong><?= $pending ?></strong> branche(s) sans enseignant.
++            Tant qu'une branche n'est pas pourvue, aucune note ne pourra y être saisie.
++        </div>
++    </div>
++<?php endif; ?>
++
++<!-- -------------------------------------------------------------------
++     Titulaire
++-------------------------------------------------------------------- -->
++<div class="card mb-3">
++    <div class="card-body py-3">
++        <div class="row g-2 align-items-end">
++            <div class="col-12 col-md-6">
++                <label class="form-label form-label-sm mb-1">Titulaire de la classe</label>
++                <?php if ($editable): ?>
++                    <form method="post" action="<?= e(url('/classes/' . (int) $classroom['id'] . '/titulaire')) ?>"
++                          class="d-flex gap-2">
++                        <?= csrf_field() ?>
++                        <select name="main_teacher_id" class="form-select form-select-sm">
++                            <option value="">Aucun</option>
++                            <?php foreach ($teachers as $teacher): ?>
++                                <option value="<?= (int) $teacher['id'] ?>"
++                                    <?= (int) $classroom['main_teacher_id'] === (int) $teacher['id'] ? 'selected' : '' ?>>
++                                    <?= e(full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name'])) ?>
++                                </option>
++                            <?php endforeach; ?>
++                        </select>
++                        <button type="submit" class="btn btn-sm btn-outline-primary">Enregistrer</button>
++                    </form>
++                <?php else: ?>
++                    <p class="mb-0">
++                        <?= $mainTeacher !== null
++                            ? e(full_name($mainTeacher['last_name'], $mainTeacher['post_name'], $mainTeacher['first_name']))
++                            : '<span class="text-secondary">Aucun</span>' ?>
++                    </p>
++                <?php endif; ?>
++            </div>
++            <div class="col-12 col-md-6">
++                <p class="small text-secondary mb-0">
++                    Le titulaire encadre la classe et voit tous ses élèves.
++                    Il ne note que les branches qui lui sont confiées ci-dessous.
++                </p>
++            </div>
++        </div>
++    </div>
++</div>
++
++<!-- -------------------------------------------------------------------
++     Branches
++-------------------------------------------------------------------- -->
++<div class="card">
++    <div class="table-responsive">
++        <table class="table table-hover align-middle mb-0">
++            <thead>
++                <tr>
++                    <th scope="col">Branche</th>
++                    <th scope="col" class="text-center">Maximum</th>
++                    <th scope="col" class="text-center d-none d-md-table-cell">Heures</th>
++                    <th scope="col">Enseignant</th>
++                    <?php if ($editable): ?><th scope="col" class="text-end">Action</th><?php endif; ?>
++                </tr>
++            </thead>
++            <tbody>
++                <?php foreach ($rows as $row): ?>
++                    <tr class="<?= $row['assignment_id'] === null ? 'table-warning' : '' ?>">
++                        <td>
++                            <span class="fw-medium"><?= e($row['subject_name']) ?></span>
++                            <?php if ((int) $row['is_optional'] === 1): ?>
++                                <span class="badge bg-light text-secondary ms-1">facultative</span>
++                            <?php endif; ?>
++                        </td>
++                        <td class="text-center"><?= (int) $row['max_points'] ?></td>
++                        <td class="text-center d-none d-md-table-cell">
++                            <?= $row['weekly_hours'] !== null
++                                ? e(number_format((float) $row['weekly_hours'], 1, ',', ' '))
++                                : '<span class="text-secondary">—</span>' ?>
++                        </td>
++                        <td>
++                            <?php if ($row['teacher_id'] !== null): ?>
++                                <a href="<?= e(url('/enseignants/' . (int) $row['teacher_id'])) ?>"
++                                   class="text-decoration-none">
++                                    <?= e(full_name($row['last_name'], $row['post_name'], $row['first_name'])) ?>
++                                </a>
++                            <?php elseif ($editable): ?>
++                                <form method="post"
++                                      action="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition')) ?>"
++                                      class="d-flex gap-1">
++                                    <?= csrf_field() ?>
++                                    <input type="hidden" name="curriculum_subject_id"
++                                           value="<?= (int) $row['curriculum_subject_id'] ?>">
++                                    <select name="teacher_id" class="form-select form-select-sm"
++                                            aria-label="Enseignant pour <?= e($row['subject_name']) ?>" required>
++                                        <option value="">Choisir…</option>
++                                        <?php foreach ($teachers as $teacher): ?>
++                                            <option value="<?= (int) $teacher['id'] ?>">
++                                                <?= e(full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name'])) ?>
++                                            </option>
++                                        <?php endforeach; ?>
++                                    </select>
++                                    <input type="number" name="weekly_hours" class="form-control form-control-sm"
++                                           style="max-width:5.5rem" step="0.5" min="0" max="40"
++                                           placeholder="h" aria-label="Heures hebdomadaires">
++                                    <button type="submit" class="btn btn-sm btn-primary">
++                                        <i class="bi bi-check-lg"></i>
++                                    </button>
++                                </form>
++                            <?php else: ?>
++                                <span class="text-secondary">Non pourvue</span>
++                            <?php endif; ?>
++                        </td>
++
++                        <?php if ($editable): ?>
++                            <td class="text-end">
++                                <?php if ($row['assignment_id'] !== null): ?>
++                                    <form method="post"
++                                          action="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition/' . (int) $row['assignment_id'] . '/retirer')) ?>"
++                                          data-confirm="Retirer cette branche à l'enseignant ?">
++                                        <?= csrf_field() ?>
++                                        <button type="submit" class="btn btn-sm btn-outline-danger">
++                                            <i class="bi bi-x-lg"></i>
++                                            <span class="d-none d-md-inline ms-1">Retirer</span>
++                                        </button>
++                                    </form>
++                                <?php endif; ?>
++                            </td>
++                        <?php endif; ?>
++                    </tr>
++                <?php endforeach; ?>
++            </tbody>
++        </table>
++    </div>
++</div>
++
++<?php if ($rows === []): ?>
++    <div class="alert alert-info mt-3">
++        Le programme de cette classe ne comporte aucune branche.
++        Complétez-le depuis <a href="<?= e(url('/referentiel/programmes')) ?>">le référentiel</a>
++        avant de répartir les enseignants.
++    </div>
++<?php endif; ?>
+diff --git a/app/views/teachers/show.php b/app/views/teachers/show.php
+new file mode 100644
+index 0000000..a9e43ca
+--- /dev/null
++++ b/app/views/teachers/show.php
+@@ -0,0 +1,244 @@
++<?php
++/**
++ * Fiche enseignant : identité, service de l'année, statut.
++ *
++ * @var array      $teacher
++ * @var array|null $year
++ * @var array      $years
++ * @var array      $assignments
++ * @var array      $mainClassrooms
++ * @var float      $weeklyLoad
++ * @var array      $statuses
++ * @var array      $employmentTypes
++ * @var array      $availableUsers
++ */
++declare(strict_types=1);
++
++$fullName = full_name($teacher['last_name'], $teacher['post_name'], $teacher['first_name']);
++set_title($fullName);
++
++$badge = [
++    'active'    => 'bg-success-subtle text-success-emphasis',
++    'suspended' => 'bg-warning-subtle text-warning-emphasis',
++    'left'      => 'bg-secondary-subtle text-secondary-emphasis',
++];
++
++// Regroupement par classe : l'enseignant lit son service classe par
++// classe, pas branche par branche.
++$byClassroom = [];
++
++foreach ($assignments as $row) {
++    $key = (int) $row['classroom_id'];
++
++    if (!isset($byClassroom[$key])) {
++        $byClassroom[$key] = [
++            'code'     => $row['classroom_code'],
++            'name'     => $row['classroom_name'],
++            'level'    => $row['level_short'],
++            'subjects' => [],
++        ];
++    }
++
++    $byClassroom[$key]['subjects'][] = $row;
++}
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title"><?= e($fullName) ?></h1>
++        <p class="page-subtitle">
++            <span class="badge <?= e($badge[$teacher['status']] ?? 'bg-secondary-subtle') ?>">
++                <?= e($statuses[$teacher['status']] ?? $teacher['status']) ?>
++            </span>
++            <?php if ($teacher['matricule'] !== null): ?>
++                · Matricule <strong><?= e($teacher['matricule']) ?></strong>
++            <?php endif; ?>
++            <?php if ($teacher['specialty'] !== null): ?>
++                · <?= e($teacher['specialty']) ?>
++            <?php endif; ?>
++        </p>
++    </div>
++
++    <div class="d-flex gap-2 align-items-center">
++        <?php if (count($years) > 1 && $year !== null): ?>
++            <form method="get" action="<?= e(url('/enseignants/' . (int) $teacher['id'])) ?>">
++                <select name="annee" class="form-select form-select-sm" data-auto-submit>
++                    <?php foreach ($years as $option): ?>
++                        <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
++                            <?= e($option['code']) ?>
++                        </option>
++                    <?php endforeach; ?>
++                </select>
++                <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
++            </form>
++        <?php endif; ?>
++        <a href="<?= e(url('/enseignants')) ?>" class="btn btn-outline-secondary">
++            <i class="bi bi-arrow-left me-1"></i> Liste
++        </a>
++    </div>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<div class="row g-3">
++    <!-- ---------------------------------------------------------------
++         Service de l'année
++    ---------------------------------------------------------------- -->
++    <div class="col-12 col-lg-7">
++        <div class="card mb-3">
++            <div class="card-header d-flex justify-content-between align-items-center">
++                <strong>Service <?= $year !== null ? e($year['code']) : '' ?></strong>
++                <span class="small text-secondary">
++                    <?= count($assignments) ?> branche(s) ·
++                    <?= e(number_format($weeklyLoad, 1, ',', ' ')) ?> h/semaine
++                </span>
++            </div>
++
++            <?php if ($byClassroom === []): ?>
++                <div class="card-body text-center py-4">
++                    <p class="mb-1">Aucune branche confiée pour cette année.</p>
++                    <p class="small text-secondary mb-0">
++                        Les affectations se font depuis la répartition de chaque classe.
++                    </p>
++                </div>
++            <?php else: ?>
++                <div class="list-group list-group-flush">
++                    <?php foreach ($byClassroom as $classroomId => $group): ?>
++                        <div class="list-group-item">
++                            <div class="d-flex justify-content-between align-items-start mb-2">
++                                <div>
++                                    <a href="<?= e(url('/classes/' . (int) $classroomId . '/repartition')) ?>"
++                                       class="fw-medium text-decoration-none">
++                                        <?= e($group['name']) ?>
++                                    </a>
++                                    <span class="small text-secondary ms-1"><?= e($group['code']) ?></span>
++                                </div>
++                                <span class="badge bg-light text-secondary"><?= e($group['level']) ?></span>
++                            </div>
++
++                            <div class="d-flex flex-wrap gap-1">
++                                <?php foreach ($group['subjects'] as $subject): ?>
++                                    <span class="badge bg-primary-subtle text-primary-emphasis fw-normal">
++                                        <?= e($subject['subject_name']) ?>
++                                        <span class="opacity-75">/ <?= (int) $subject['max_points'] ?></span>
++                                    </span>
++                                <?php endforeach; ?>
++                            </div>
++                        </div>
++                    <?php endforeach; ?>
++                </div>
++            <?php endif; ?>
++        </div>
++
++        <?php if ($mainClassrooms !== []): ?>
++            <div class="card mb-3">
++                <div class="card-header"><strong>Titulaire de classe</strong></div>
++                <div class="list-group list-group-flush">
++                    <?php foreach ($mainClassrooms as $classroom): ?>
++                        <a href="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition')) ?>"
++                           class="list-group-item list-group-item-action d-flex justify-content-between">
++                            <span><?= e($classroom['name']) ?></span>
++                            <span class="small text-secondary"><?= e($classroom['code']) ?></span>
++                        </a>
++                    <?php endforeach; ?>
++                </div>
++            </div>
++        <?php endif; ?>
++    </div>
++
++    <!-- ---------------------------------------------------------------
++         Identité et administration
++    ---------------------------------------------------------------- -->
++    <div class="col-12 col-lg-5">
++        <div class="card mb-3">
++            <div class="card-header"><strong>Coordonnées</strong></div>
++            <div class="card-body">
++                <dl class="row mb-0 small">
++                    <dt class="col-5 text-secondary fw-normal">Téléphone</dt>
++                    <dd class="col-7">
++                        <?php if ($teacher['phone'] !== null): ?>
++                            <a href="tel:<?= e($teacher['phone']) ?>"><?= e($teacher['phone']) ?></a>
++                        <?php else: ?>
++                            <span class="text-secondary">—</span>
++                        <?php endif; ?>
++                    </dd>
++
++                    <dt class="col-5 text-secondary fw-normal">Email</dt>
++                    <dd class="col-7"><?= $teacher['email'] !== null ? e($teacher['email']) : '<span class="text-secondary">—</span>' ?></dd>
++
++                    <dt class="col-5 text-secondary fw-normal">Adresse</dt>
++                    <dd class="col-7"><?= $teacher['address'] !== null ? e($teacher['address']) : '<span class="text-secondary">—</span>' ?></dd>
++
++                    <dt class="col-5 text-secondary fw-normal">Diplôme</dt>
++                    <dd class="col-7"><?= $teacher['qualification'] !== null ? e($teacher['qualification']) : '<span class="text-secondary">—</span>' ?></dd>
++
++                    <dt class="col-5 text-secondary fw-normal">Engagement</dt>
++                    <dd class="col-7"><?= e($employmentTypes[$teacher['employment_type']] ?? $teacher['employment_type']) ?></dd>
++
++                    <dt class="col-5 text-secondary fw-normal">Entrée en fonction</dt>
++                    <dd class="col-7"><?= $teacher['hire_date'] !== null ? e($teacher['hire_date']) : '<span class="text-secondary">—</span>' ?></dd>
++                </dl>
++            </div>
++        </div>
++
++        <?php if (can('teacher.manage')): ?>
++            <div class="card mb-3">
++                <div class="card-header"><strong>Compte de connexion</strong></div>
++                <div class="card-body">
++                    <form method="post" action="<?= e(url('/enseignants/' . (int) $teacher['id'])) ?>">
++                        <?= csrf_field() ?>
++                        <input type="hidden" name="last_name" value="<?= e($teacher['last_name']) ?>">
++                        <input type="hidden" name="first_name" value="<?= e($teacher['first_name']) ?>">
++
++                        <label for="user_id" class="form-label form-label-sm">Compte rattaché</label>
++                        <select id="user_id" name="user_id" class="form-select form-select-sm mb-2">
++                            <option value="">Aucun — pas d'accès à la plateforme</option>
++                            <?php foreach ($availableUsers as $user): ?>
++                                <option value="<?= (int) $user['id'] ?>"
++                                    <?= (int) $teacher['user_id'] === (int) $user['id'] ? 'selected' : '' ?>>
++                                    <?= e($user['username']) ?> —
++                                    <?= e(full_name($user['last_name'], $user['post_name'], $user['first_name'])) ?>
++                                </option>
++                            <?php endforeach; ?>
++                        </select>
++
++                        <p class="small text-secondary">
++                            Le compte ouvre l'accès aux seuls élèves de ses classes.
++                        </p>
++
++                        <button type="submit" class="btn btn-sm btn-outline-primary">Enregistrer</button>
++                    </form>
++                </div>
++            </div>
++
++            <div class="card">
++                <div class="card-header"><strong>Statut</strong></div>
++                <div class="card-body">
++                    <form method="post" action="<?= e(url('/enseignants/' . (int) $teacher['id'] . '/statut')) ?>"
++                          data-confirm="Confirmez-vous le changement de statut de cet enseignant ?">
++                        <?= csrf_field() ?>
++
++                        <select name="status" class="form-select form-select-sm mb-2" aria-label="Nouveau statut">
++                            <?php foreach ($statuses as $code => $label): ?>
++                                <option value="<?= e($code) ?>" <?= $teacher['status'] === $code ? 'selected' : '' ?>>
++                                    <?= e($label) ?>
++                                </option>
++                            <?php endforeach; ?>
++                        </select>
++
++                        <input type="text" name="reason" class="form-control form-control-sm mb-2"
++                               maxlength="255" placeholder="Motif (facultatif)">
++
++                        <p class="small text-secondary">
++                            Un départ ne supprime rien : les affectations passées restent,
++                            pour que les bulletins déjà produits gardent le nom du professeur.
++                            Elles cessent simplement de donner accès aux élèves.
++                        </p>
++
++                        <button type="submit" class="btn btn-sm btn-outline-secondary">Appliquer</button>
++                    </form>
++                </div>
++            </div>
++        <?php endif; ?>
++    </div>
++</div>
+diff --git a/database/migrations/2026_09_13_005_phase4_enseignants.sql b/database/migrations/2026_09_13_005_phase4_enseignants.sql
+new file mode 100644
+index 0000000..62e50b4
+--- /dev/null
++++ b/database/migrations/2026_09_13_005_phase4_enseignants.sql
+@@ -0,0 +1,187 @@
++-- =====================================================================
++--  MIGRATION — Phase 4A : Enseignants et affectations pédagogiques
++--
++--  Périmètre : fiche enseignant, rattachement à un compte utilisateur,
++--  affectation « une branche dans une classe », titulaire de classe.
++--
++--  Pourquoi cette phase vient AVANT les notes
++--  ------------------------------------------
++--  L'audit de la phase 3 a montré qu'une permission ne dit jamais sur
++--  QUI elle s'exerce. « grade.enter » ne suffira donc pas à autoriser la
++--  saisie d'une note : il faudra prouver que l'enseignant assure bien
++--  cette branche dans cette classe. Cette preuve, c'est teacher_subjects.
++--
++--  Sans cette table, la saisie des notes ne pourrait être autorisée que
++--  globalement — c'est-à-dire mal.
++--
++--  Elle referme aussi la dette ouverte par l'audit : l'enseignant ne
++--  voyait AUCUN élève, faute de périmètre calculable.
++--
++--  À appliquer avec : php database/migrate.php
++-- =====================================================================
++
++SET NAMES utf8mb4;
++
++
++-- =====================================================================
++--  SECTION 1 — FICHE ENSEIGNANT
++-- =====================================================================
++
++CREATE TABLE teachers (
++    id                BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
++    school_id         BIGINT UNSIGNED  NOT NULL,
++    uuid              CHAR(36)         NOT NULL,
++
++    -- Compte de connexion. NULL tant que l'enseignant n'en a pas :
++    -- beaucoup d'établissements saisissent d'abord le personnel, et
++    -- n'ouvrent les comptes qu'ensuite. Le périmètre de consultation
++    -- s'appuie sur cette colonne : sans compte, pas d'accès, ce qui est
++    -- le comportement voulu.
++    user_id           BIGINT UNSIGNED  NULL,
++
++    matricule         VARCHAR(30)      NULL COMMENT 'Matricule interne ou numéro SECOPE',
++
++    -- Nom complet à la congolaise : NOM Postnom Prénom.
++    last_name         VARCHAR(80)      NOT NULL,
++    post_name         VARCHAR(80)      NULL,
++    first_name        VARCHAR(80)      NOT NULL,
++    gender            ENUM('M','F')    NULL,
++    birth_date        DATE             NULL,
++
++    phone             VARCHAR(30)      NULL,
++    phone_alt         VARCHAR(30)      NULL,
++    email             VARCHAR(190)     NULL,
++    address           VARCHAR(255)     NULL,
++
++    hire_date         DATE             NULL,
++    employment_type   ENUM('permanent','contract','volunteer') NOT NULL DEFAULT 'permanent',
++    qualification     VARCHAR(120)     NULL COMMENT 'Diplôme : D6, G3, L2…',
++    specialty         VARCHAR(120)     NULL COMMENT 'Discipline principale',
++
++    status            ENUM('active','suspended','left') NOT NULL DEFAULT 'active',
++    left_on           DATE             NULL,
++    notes             VARCHAR(255)     NULL,
++
++    created_by        BIGINT UNSIGNED  NULL,
++    created_at        DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at        DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++    deleted_at        DATETIME         NULL,
++
++    PRIMARY KEY (id),
++    UNIQUE KEY uq_teacher_uuid (uuid),
++
++    -- Le matricule est facultatif ; MySQL ignore les NULL dans un index
++    -- unique, plusieurs enseignants peuvent donc rester sans matricule.
++    UNIQUE KEY uq_teacher_matricule (school_id, matricule),
++
++    -- Un compte utilisateur ne peut représenter qu'un seul enseignant.
++    -- Sans cette contrainte, deux fiches partageant un compte donneraient
++    -- à une même personne deux périmètres cumulés.
++    UNIQUE KEY uq_teacher_user (school_id, user_id),
++
++    KEY idx_teacher_names (school_id, last_name, post_name, first_name),
++    KEY idx_teacher_status (school_id, status, deleted_at),
++
++    CONSTRAINT fk_teacher_school FOREIGN KEY (school_id)
++        REFERENCES schools (id) ON DELETE CASCADE ON UPDATE CASCADE,
++    CONSTRAINT fk_teacher_user FOREIGN KEY (user_id)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE,
++    CONSTRAINT fk_teacher_creator FOREIGN KEY (created_by)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
++  COMMENT='Personnel enseignant de l établissement';
++
++
++-- =====================================================================
++--  SECTION 2 — AFFECTATION PÉDAGOGIQUE
++--
++--  Une ligne = « cet enseignant assure CETTE branche dans CETTE classe,
++--  pour CETTE année ».
++--
++--  La branche est désignée par curriculum_subjects et non par subjects :
++--  c'est le programme qui porte le maximum de points et le volume
++--  horaire. Passer par la branche nue perdrait le lien avec le programme
++--  de la classe, et permettrait d'affecter une branche qui n'y figure
++--  même pas.
++--
++--  Règle : une branche d'une classe n'a qu'un enseignant. C'est ce qui
++--  rend la saisie des notes non ambiguë et permet au bulletin de nommer
++--  un responsable par branche. Un établissement pratiquant le
++--  co-enseignement devra faire évoluer cette contrainte explicitement —
++--  ce n'est pas un oubli.
++-- =====================================================================
++
++CREATE TABLE teacher_subjects (
++    id                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
++    school_id             BIGINT UNSIGNED NOT NULL,
++    teacher_id            BIGINT UNSIGNED NOT NULL,
++    academic_year_id      BIGINT UNSIGNED NOT NULL,
++    classroom_id          BIGINT UNSIGNED NOT NULL,
++    curriculum_subject_id BIGINT UNSIGNED NOT NULL,
++
++    -- Volume horaire réellement assuré. Peut différer de celui du
++    -- programme (dédoublement, heures partagées).
++    weekly_hours          DECIMAL(4,1)    NULL,
++
++    assigned_on           DATE            NOT NULL DEFAULT (CURRENT_DATE),
++    created_by            BIGINT UNSIGNED NULL,
++    created_at            DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at            DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++
++    PRIMARY KEY (id),
++
++    UNIQUE KEY uq_assignment_slot (school_id, academic_year_id, classroom_id, curriculum_subject_id),
++
++    -- Index du périmètre : « quelles classes pour cet enseignant ? »
++    -- est la question posée à chaque requête d'un compte enseignant.
++    KEY idx_assignment_teacher (school_id, teacher_id, academic_year_id),
++    KEY idx_assignment_classroom (school_id, classroom_id),
++
++    CONSTRAINT fk_assignment_school FOREIGN KEY (school_id)
++        REFERENCES schools (id) ON DELETE CASCADE ON UPDATE CASCADE,
++    CONSTRAINT fk_assignment_teacher FOREIGN KEY (teacher_id)
++        REFERENCES teachers (id) ON DELETE CASCADE ON UPDATE CASCADE,
++    CONSTRAINT fk_assignment_year FOREIGN KEY (academic_year_id)
++        REFERENCES academic_years (id) ON DELETE CASCADE ON UPDATE CASCADE,
++    CONSTRAINT fk_assignment_classroom FOREIGN KEY (classroom_id)
++        REFERENCES classrooms (id) ON DELETE CASCADE ON UPDATE CASCADE,
++
++    -- RESTRICT : retirer une branche d'un programme alors qu'un
++    -- enseignant l'assure doit être un refus explicite, pas une
++    -- suppression silencieuse de son service.
++    CONSTRAINT fk_assignment_subject FOREIGN KEY (curriculum_subject_id)
++        REFERENCES curriculum_subjects (id) ON DELETE RESTRICT ON UPDATE CASCADE,
++
++    CONSTRAINT fk_assignment_creator FOREIGN KEY (created_by)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
++  COMMENT='Affectation : un enseignant, une branche, une classe, une année';
++
++
++-- =====================================================================
++--  SECTION 3 — TITULAIRE DE CLASSE
++--
++--  Annoncé dès la phase 3, reporté faute de table teachers.
++--  SET NULL : le départ d'un enseignant ne doit pas supprimer la classe.
++-- =====================================================================
++
++ALTER TABLE classrooms
++    ADD COLUMN main_teacher_id BIGINT UNSIGNED NULL
++        COMMENT 'Titulaire de la classe' AFTER room_id,
++    ADD KEY idx_classroom_main_teacher (school_id, main_teacher_id),
++    ADD CONSTRAINT fk_classroom_main_teacher FOREIGN KEY (main_teacher_id)
++        REFERENCES teachers (id) ON DELETE SET NULL ON UPDATE CASCADE;
++
++
++-- =====================================================================
++--  SECTION 4 — PARAMÈTRE : SEUIL DE RÉUSSITE
++--
++--  La règle nationale est 50 %. Elle est néanmoins enregistrée comme un
++--  paramètre d'établissement, et non écrite dans le code : une école
++--  conventionnée peut appliquer un seuil différent, et une modification
++--  réglementaire ne doit pas imposer une nouvelle version du logiciel.
++--
++--  Rien n'est inséré ici : school_setting() renvoie la valeur par défaut
++--  tant qu'une école n'a rien enregistré. Insérer une ligne par école
++--  créerait une copie à maintenir pour chaque établissement.
++-- =====================================================================
+diff --git a/tests/teachers_isolation.php b/tests/teachers_isolation.php
+new file mode 100644
+index 0000000..f336d4c
+--- /dev/null
++++ b/tests/teachers_isolation.php
+@@ -0,0 +1,499 @@
++<?php
++/**
++ * Phase 4A — enseignants, affectations et périmètre pédagogique.
++ *
++ * Ce que ces tests protègent
++ * --------------------------
++ * L'affectation d'un enseignant à une branche est la pièce sur laquelle
++ * s'appuiera toute l'autorisation pédagogique : saisie des notes, appel
++ * des présences, consultation des élèves. Si elle peut être forgée —
++ * une classe d'une autre école, une branche absente du programme, un
++ * enseignant parti — alors toute la phase 4 repose sur du sable.
++ *
++ * Usage : php tests/teachers_isolation.php
++ */
++declare(strict_types=1);
++
++require dirname(__DIR__) . '/app/bootstrap.php';
++require APP_PATH . '/modules/curriculum/services.php';
++require APP_PATH . '/modules/students/services.php';
++require APP_PATH . '/modules/teachers/services.php';
++
++$pass = 0;
++$fail = 0;
++
++function check(string $label, bool $ok, string $detail = ''): void
++{
++    global $pass, $fail;
++    $ok ? $pass++ : $fail++;
++    printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
++}
++
++/** Ouvre une session de test au nom d'un utilisateur portant un rôle système. */
++function act_as(int $schoolId, string $roleCode): int
++{
++    static $counter = 0;
++    $counter++;
++
++    $userId = db_insert('users', [
++        'uuid'          => str_uuid(),
++        'school_id'     => $schoolId,
++        'username'      => 'ens.' . strtolower($roleCode) . '.' . $counter,
++        'email'         => 'ens' . $counter . '@example.test',
++        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
++        'last_name'     => 'TEST',
++        'first_name'    => ucfirst(strtolower($roleCode)),
++        'status'        => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO user_roles (user_id, role_id)
++         SELECT :user_id, id FROM roles WHERE code = :code AND school_id IS NULL',
++        ['user_id' => $userId, 'code' => $roleCode],
++        true
++    );
++
++    $_SESSION['user_id']   = $userId;
++    $_SESSION['school_id'] = $schoolId;
++
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++
++    return $userId;
++}
++
++/** École complète : année, référentiel, programme activé, deux classes. */
++function build_school(string $code, string $name): array
++{
++    $schoolId = db_insert('schools', [
++        'uuid' => str_uuid(), 'code' => $code, 'slug' => strtolower($code),
++        'name' => $name, 'status' => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO school_cycles (school_id, cycle_id, is_active)
++         SELECT :school_id, id, 1 FROM education_cycles',
++        ['school_id' => $schoolId]
++    );
++
++    tenant_set($schoolId);
++
++    $yearId = tenant_insert('academic_years', [
++        'code' => '2070-2071', 'name' => 'Test phase 4', 'starts_on' => '2070-09-01',
++        'ends_on' => '2071-07-31', 'status' => 'active', 'is_current' => 1,
++    ]);
++
++    curriculum_service_import_national();
++    curriculum_service_create_standard_periods($yearId);
++
++    $levelId = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_5'", [], true);
++    $program = curriculum_service_create_program($yearId, $levelId, null, null);
++    curriculum_service_fill_program((int) $program['id']);
++    curriculum_service_activate((int) $program['id']);
++
++    $classA = tenant_insert('classrooms', [
++        'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
++        'code' => '5A', 'name' => '5ème primaire A', 'capacity' => 40,
++    ]);
++
++    $classB = tenant_insert('classrooms', [
++        'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
++        'code' => '5B', 'name' => '5ème primaire B', 'capacity' => 40,
++    ]);
++
++    $subjects = tenant_all(
++        'curriculum_subjects',
++        'curriculum_id = :c ORDER BY order_number LIMIT 3',
++        ['c' => (int) $program['id']]
++    );
++
++    return [
++        'school_id'   => $schoolId,
++        'year_id'     => $yearId,
++        'program_id'  => (int) $program['id'],
++        'classroom_a' => $classA,
++        'classroom_b' => $classB,
++        'subjects'    => array_map(static fn (array $s): int => (int) $s['id'], $subjects),
++    ];
++}
++
++echo "\n  ENSEIGNANTS, AFFECTATIONS ET PÉRIMÈTRE PÉDAGOGIQUE\n";
++echo "  ──────────────────────────────────────────────────────────\n\n";
++
++$createdSchools = [];
++
++try {
++    $a = build_school('ENS-A', 'École Alpha');
++    $b = build_school('ENS-B', 'École Beta');
++    $createdSchools = [$a['school_id'], $b['school_id']];
++
++    // =================================================================
++    //  FICHE ENSEIGNANT
++    // =================================================================
++    act_as($a['school_id'], 'DIRECTION');
++    tenant_set($a['school_id']);
++
++    $created = teachers_service_create([
++        'last_name' => 'MULUMBA', 'post_name' => 'Kalala', 'first_name' => 'Pierre',
++        'gender' => 'M', 'matricule' => 'ENS-001', 'specialty' => 'Mathématiques',
++    ]);
++    check('Création d\'une fiche enseignant', $created['ok'], $created['message']);
++
++    $teacherA = (int) $created['id'];
++
++    $duplicate = teachers_service_create([
++        'last_name' => 'NGOY', 'first_name' => 'Jean', 'matricule' => 'ENS-001',
++    ]);
++    check(
++        'Matricule déjà attribué : refusé',
++        !$duplicate['ok'] && str_contains($duplicate['message'], 'déjà attribué'),
++        $duplicate['message']
++    );
++
++    // =================================================================
++    //  LISTE
++    //
++    //  Ces quatre contrôles existent parce qu'un défaut réel leur a
++    //  échappé : la requête de liste sélectionnait une colonne d'une
++    //  table qu'elle ne joignait pas. Les services étaient testés, pas
++    //  l'écran qui les affiche. Un dépôt non exécuté est un dépôt non
++    //  testé.
++    // =================================================================
++    $list = teachers_repo_search([]);
++    check('La liste s\'exécute et renvoie l\'enseignant', $list['total'] === 1, $list['total'] . ' trouvé(s)');
++
++    $listQ = teachers_repo_search(['q' => 'MULU']);
++    check('Recherche par préfixe du nom', $listQ['total'] === 1, $listQ['total'] . ' trouvé(s)');
++
++    $listWild = teachers_repo_search(['q' => '%']);
++    check('Un « % » saisi ne ramène pas tout le fichier', $listWild['total'] === 0);
++
++    $listStatus = teachers_repo_search(['status' => 'left']);
++    check('Filtre par statut', $listStatus['total'] === 0, $listStatus['total'] . ' trouvé(s)');
++
++    // =================================================================
++    //  ISOLATION MULTI-ÉCOLE
++    // =================================================================
++    tenant_set($b['school_id']);
++
++    $listB = teachers_repo_search([]);
++    check('La liste de l\'école B est vide', $listB['total'] === 0, $listB['total'] . ' trouvé(s)');
++
++    check('École B ne voit pas l\'enseignant de A', teachers_repo_find($teacherA) === null);
++
++    tenant_set($a['school_id']);
++    check('École A voit bien son enseignant', teachers_repo_find($teacherA) !== null);
++
++    // Affecter l'enseignant de A à une classe de B.
++    $crossClass = teachers_service_assign($teacherA, $b['classroom_a'], $a['subjects'][0]);
++    check(
++        'Classe d\'une AUTRE ÉCOLE refusée à l\'affectation',
++        !$crossClass['ok'] && str_contains($crossClass['message'], 'introuvable'),
++        $crossClass['message']
++    );
++
++    // Affecter une branche d'une autre école.
++    $crossSubject = teachers_service_assign($teacherA, $a['classroom_a'], $b['subjects'][0]);
++    check(
++        'Branche d\'une AUTRE ÉCOLE refusée',
++        !$crossSubject['ok'] && str_contains($crossSubject['message'], 'ne figure pas au programme'),
++        $crossSubject['message']
++    );
++
++    // =================================================================
++    //  AFFECTATION
++    // =================================================================
++    $assign = teachers_service_assign($teacherA, $a['classroom_a'], $a['subjects'][0], 6.0);
++    check('Affectation d\'une branche', $assign['ok'], $assign['message']);
++
++    $again = teachers_service_assign($teacherA, $a['classroom_a'], $a['subjects'][0]);
++    check(
++        'Deux fois la même branche au même enseignant : refusé',
++        !$again['ok'] && str_contains($again['message'], 'assure déjà'),
++        $again['message']
++    );
++
++    $other = teachers_service_create(['last_name' => 'KASONGO', 'first_name' => 'Alice']);
++    $teacherB = (int) $other['id'];
++
++    $taken = teachers_service_assign($teacherB, $a['classroom_a'], $a['subjects'][0]);
++    check(
++        'Branche déjà pourvue : le second enseignant est refusé',
++        !$taken['ok'] && str_contains($taken['message'], 'déjà assurée'),
++        $taken['message']
++    );
++
++    // Une branche d'un AUTRE programme de la MÊME école serait acceptée
++    // si le contrôle ne portait que sur school_id.
++    $foreignProgram = curriculum_service_create_program(
++        $a['year_id'],
++        (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_3'", [], true),
++        null,
++        null
++    );
++    curriculum_service_fill_program((int) $foreignProgram['id']);
++
++    $foreignSubject = tenant_one(
++        'curriculum_subjects',
++        'curriculum_id = :c ORDER BY order_number',
++        ['c' => (int) $foreignProgram['id']]
++    );
++
++    $wrongProgram = teachers_service_assign(
++        $teacherA,
++        $a['classroom_a'],
++        (int) $foreignSubject['id']
++    );
++    check(
++        'Branche d\'un AUTRE PROGRAMME de la même école : refusée',
++        !$wrongProgram['ok'] && str_contains($wrongProgram['message'], 'ne figure pas au programme'),
++        $wrongProgram['message']
++    );
++
++    // =================================================================
++    //  ENSEIGNANT PARTI
++    // =================================================================
++    teachers_service_change_status($teacherB, 'left', 'Fin de contrat');
++
++    $goneAssign = teachers_service_assign($teacherB, $a['classroom_b'], $a['subjects'][1]);
++    check(
++        'Enseignant parti : aucune nouvelle affectation',
++        !$goneAssign['ok'] && str_contains($goneAssign['message'], 'pas en activité'),
++        $goneAssign['message']
++    );
++
++    $goneMain = teachers_service_set_main_teacher($a['classroom_b'], $teacherB);
++    check(
++        'Enseignant parti : ne peut pas devenir titulaire',
++        !$goneMain['ok'] && str_contains($goneMain['message'], 'pas en activité'),
++        $goneMain['message']
++    );
++
++    teachers_service_change_status($teacherB, 'active');
++
++    // =================================================================
++    //  PÉRIMÈTRE DE L'ENSEIGNANT
++    // =================================================================
++    // Deux élèves : un en 5A (classe de l'enseignant), un en 5B.
++    $eleveA = students_service_enroll_new(
++        ['last_name' => 'KABILA', 'first_name' => 'Grace', 'gender' => 'F'],
++        $a['year_id'],
++        $a['classroom_a']
++    );
++    $eleveB = students_service_enroll_new(
++        ['last_name' => 'MUKENDI', 'first_name' => 'Joseph', 'gender' => 'M'],
++        $a['year_id'],
++        $a['classroom_b']
++    );
++    check('Deux élèves inscrits dans deux classes', $eleveA['ok'] && $eleveB['ok']);
++
++    // Compte de connexion pour l'enseignant.
++    $teacherUserId = act_as($a['school_id'], 'ENSEIGNANT');
++    tenant_set($a['school_id']);
++
++    check(
++        'L\'enseignant ne détient pas student.view.all',
++        !perm_has('student.view.all')
++    );
++
++    // Sans rattachement, il ne voit rien.
++    $before = students_repo_search([], $a['year_id']);
++    check(
++        'Compte non rattaché à une fiche : aucun élève',
++        $before['total'] === 0,
++        $before['total'] . ' trouvé(s)'
++    );
++
++    // Rattachement du compte à la fiche enseignant.
++    tenant_update('teachers', ['user_id' => $teacherUserId], 'id = :id', ['id' => $teacherA]);
++
++    $after = students_repo_search([], $a['year_id']);
++    check(
++        'Rattaché et affecté en 5A : il voit un seul élève',
++        $after['total'] === 1,
++        $after['total'] . ' trouvé(s)'
++    );
++
++    check(
++        'L\'élève vu est bien celui de SA classe',
++        $after['total'] === 1 && (int) $after['rows'][0]['id'] === (int) $eleveA['id']
++    );
++
++    check(
++        'ACCÈS DIRECT à l\'élève d\'une autre classe : refusé',
++        !students_can_view((int) $eleveB['id'])
++    );
++
++    check(
++        'Accès direct à l\'élève de sa classe : autorisé',
++        students_can_view((int) $eleveA['id'])
++    );
++
++    // La recherche ne doit pas élargir le périmètre.
++    $search = students_repo_search(['q' => 'MUKENDI'], $a['year_id']);
++    check(
++        'La RECHERCHE ne contourne pas le périmètre enseignant',
++        $search['total'] === 0,
++        $search['total'] . ' trouvé(s)'
++    );
++
++    // =================================================================
++    //  AUTORISATION DE SAISIE (socle de la phase 4B)
++    // =================================================================
++    check(
++        'Il peut enseigner la branche qui lui est confiée',
++        teachers_can_teach($a['classroom_a'], $a['subjects'][0])
++    );
++
++    check(
++        'Il ne peut PAS enseigner une branche qu\'on ne lui a pas confiée',
++        !teachers_can_teach($a['classroom_a'], $a['subjects'][1])
++    );
++
++    check(
++        'Il ne peut PAS enseigner dans une classe qui n\'est pas la sienne',
++        !teachers_can_teach($a['classroom_b'], $a['subjects'][0])
++    );
++
++    // Titulaire sans branche : il voit les élèves, il ne note pas.
++    act_as($a['school_id'], 'DIRECTION');
++    tenant_set($a['school_id']);
++    teachers_service_set_main_teacher($a['classroom_b'], $teacherA);
++
++    $_SESSION['user_id'] = $teacherUserId;
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++
++    $asMain = students_repo_search([], $a['year_id']);
++    check(
++        'Titulaire d\'une seconde classe : il voit les deux élèves',
++        $asMain['total'] === 2,
++        $asMain['total'] . ' trouvé(s)'
++    );
++
++    check(
++        'Titulaire mais sans la branche : la saisie reste refusée',
++        !teachers_can_teach($a['classroom_b'], $a['subjects'][0])
++    );
++
++    // =================================================================
++    //  ANNÉE CLÔTURÉE
++    // =================================================================
++    act_as($a['school_id'], 'DIRECTION');
++    tenant_set($a['school_id']);
++
++    tenant_update('academic_years', ['status' => 'closed'], 'id = :id', ['id' => $a['year_id']]);
++
++    $closed = teachers_service_assign($teacherB, $a['classroom_b'], $a['subjects'][1]);
++    check(
++        'Année clôturée : plus aucune affectation',
++        !$closed['ok'] && str_contains($closed['message'], 'clôturée'),
++        $closed['message']
++    );
++
++    $closedRemove = teachers_service_unassign((int) $assign['id']);
++    check(
++        'Année clôturée : plus aucun retrait',
++        !$closedRemove['ok'] && str_contains($closedRemove['message'], 'clôturée'),
++        $closedRemove['message']
++    );
++
++    tenant_update('academic_years', ['status' => 'active'], 'id = :id', ['id' => $a['year_id']]);
++
++    // =================================================================
++    //  COMPTE DE CONNEXION
++    // =================================================================
++    $sharedAccount = teachers_service_update($teacherB, ['user_id' => $teacherUserId]);
++    check(
++        'Un compte ne peut pas être rattaché à deux enseignants',
++        !$sharedAccount['ok'] && str_contains($sharedAccount['message'], 'déjà rattaché'),
++        $sharedAccount['message']
++    );
++
++    // Un compte d'une autre école.
++    $foreignUser = db_insert('users', [
++        'uuid' => str_uuid(), 'school_id' => $b['school_id'], 'username' => 'etranger',
++        'email' => 'etranger@example.test',
++        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
++        'last_name' => 'ETRANGER', 'first_name' => 'Compte', 'status' => 'active',
++    ], true);
++
++    $crossUser = teachers_service_update($teacherB, ['user_id' => $foreignUser]);
++    check(
++        'Compte d\'une AUTRE ÉCOLE refusé',
++        !$crossUser['ok'] && str_contains($crossUser['message'], 'n\'appartient pas'),
++        $crossUser['message']
++    );
++
++    // =================================================================
++    //  SEUIL DE RÉUSSITE
++    // =================================================================
++    check(
++        'Seuil de réussite par défaut : 50 %',
++        abs(teachers_passing_threshold() - 50.0) < 0.001,
++        (string) teachers_passing_threshold()
++    );
++
++    school_setting_set('grading.passing_threshold', 60);
++    check(
++        'Seuil paramétrable par école',
++        abs(teachers_passing_threshold() - 60.0) < 0.001,
++        (string) teachers_passing_threshold()
++    );
++
++    school_setting_set('grading.passing_threshold', 0);
++    check(
++        'Seuil absurde ignoré : retour à 50 %',
++        abs(teachers_passing_threshold() - 50.0) < 0.001,
++        (string) teachers_passing_threshold()
++    );
++
++    school_setting_set('grading.passing_threshold', PASSING_THRESHOLD_DEFAULT);
++
++    // =================================================================
++    //  GARDE-FOU MULTI-ÉCOLE
++    // =================================================================
++    foreach (['teachers', 'teacher_subjects'] as $table) {
++        $blocked = false;
++
++        try {
++            db_query("SELECT * FROM {$table} LIMIT 1");
++        } catch (Throwable) {
++            $blocked = true;
++        }
++
++        check("Garde-fou actif sur « {$table} »", $blocked);
++    }
++} finally {
++    unset($_SESSION['user_id'], $_SESSION['school_id']);
++
++    foreach ($createdSchools as $schoolId) {
++        tenant_set($schoolId);
++
++        db_query('UPDATE classrooms SET main_teacher_id = NULL WHERE school_id = :s', ['s' => $schoolId]);
++
++        foreach ([
++            'student_history', 'orientations', 'student_guardians', 'enrollments',
++            'guardians', 'students', 'student_counters',
++            'teacher_subjects', 'teachers',
++            'classrooms', 'curriculum_subjects', 'curriculums', 'grade_periods',
++            'subjects', 'options', 'sections', 'academic_years', 'audit_logs',
++        ] as $table) {
++            db_query("DELETE FROM {$table} WHERE school_id = :school_id", ['school_id' => $schoolId]);
++        }
++
++        db_query('DELETE FROM school_settings WHERE school_id = :s', ['s' => $schoolId]);
++        db_query('DELETE FROM user_roles WHERE user_id IN (SELECT id FROM users WHERE school_id = :s)',
++            ['s' => $schoolId], true);
++        db_query('DELETE FROM users WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM school_cycles WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM schools WHERE id = :s', ['s' => $schoolId], true);
++    }
++}
++
++echo "\n  ──────────────────────────────────────────────────\n";
++printf("  %d test(s) réussi(s), %d échec(s)\n\n", $pass, $fail);
++
++exit($fail === 0 ? 0 : 1);
+-- 
+2.43.0
+

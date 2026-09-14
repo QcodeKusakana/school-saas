@@ -1,0 +1,2352 @@
+From b5257cf47c2635628e55fb3760a5f3e63e4ac239 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 13 Sep 2026 20:08:06 +0000
+Subject: [PATCH 1/5] =?UTF-8?q?Audit=20phase=203=20:=20p=C3=A9rim=C3=A8tre?=
+ =?UTF-8?q?=20de=20lecture,=20int=C3=A9grit=C3=A9=20et=20unification=20de?=
+ =?UTF-8?q?=20l'installation?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Défauts corrigés, par gravité.
+
+CRITIQUE — fichier élèves lisible par tout compte de l'école
+ENSEIGNANT et PARENT détenaient student.view sans aucun filtrage de
+périmètre : état civil de mineurs, adresses et téléphones des parents
+étaient accessibles par la liste, la recherche et l'accès direct.
+Ajout de students_scope_clause() / students_can_view() et d'une
+permission student.view.all stockée en base (migration 004). Le
+périmètre parent s'appuie sur guardians.user_id ; l'enseignant est
+refusé par défaut jusqu'à la table teachers.
+
+ÉLEVÉ
+- IDOR : ctrl_students_assign ignorait l'élève de l'URL, permettant de
+  déplacer l'inscription d'un camarade en journalisant sous un autre.
+- Archivage d'un dossier possible avec student.edit seul ; la permission
+  student.delete n'était appliquée nulle part.
+- Sélecteur d'année inopérant : onchange en attribut, bloqué par la CSP,
+  sur quatre écrans sans bouton d'envoi. Remplacé par data-auto-submit.
+
+MOYEN
+- Installation et migrations divergeaient : install.php n'appliquait pas
+  le référentiel national et migrate.php --seed échouait sur doublon.
+  Noyau commun database/runner.php, registre unique, reprise par témoin
+  pour les bases antérieures, ordre schéma → seeds → migrations.
+- Mise à jour d'un élève écrivant les entrées brutes : un POST partiel
+  effaçait l'état civil.
+- Année clôturée ignorée par l'affectation et l'orientation.
+- Capacité de classe contrôlée hors transaction (dépassement possible).
+- Inscription annulée réactivée par une affectation (ternaire mort).
+- Tuteurs : déduplication sur le seul téléphone, confondant père et mère
+  d'un même foyer. Comparaison sur téléphone ET identité, dans la
+  transaction.
+
+FAIBLE
+- audit_logs soumis au garde-fou multi-école ; classification de roles et
+  user_sessions documentée.
+- Jokers LIKE échappés dans la recherche.
+- students_repo_find ignorait deleted_at.
+- Paramètres de route en camelCase échappant à la règle numérique.
+- Middleware school absent : erreur 500 pour le super administrateur.
+
+Tests : 102 au vert sur base vierge (17 + 25 + 35 + 25), dont une suite
+students_perimetre dédiée. Le harnais ouvre désormais une session au nom
+d'un rôle : la couche de permissions n'était jamais traversée.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+---
+ app/config/routes.php                         |  72 ++--
+ app/core/router.php                           |  44 +-
+ app/core/tenant.php                           |  40 +-
+ app/modules/students/controllers.php          |  51 ++-
+ app/modules/students/repositories.php         | 144 ++++++-
+ app/modules/students/services.php             | 182 ++++++--
+ app/views/classrooms/index.php                |   3 +-
+ app/views/curriculum/index.php                |   3 +-
+ app/views/curriculum/programs.php             |   3 +-
+ app/views/students/index.php                  |   3 +-
+ database/install.php                          | 132 ++----
+ database/migrate.php                          | 190 ++------
+ .../2026_09_13_001b_referentiel_national.sql} |   0
+ .../2026_09_13_004_perimetre_eleves.sql       |  89 ++++
+ database/runner.php                           | 337 +++++++++++++++
+ public/assets/js/app.js                       |  36 ++
+ tests/students_isolation.php                  |  74 +++-
+ tests/students_perimetre.php                  | 404 ++++++++++++++++++
+ 18 files changed, 1461 insertions(+), 346 deletions(-)
+ rename database/{seeds/003_referentiel_national.sql => migrations/2026_09_13_001b_referentiel_national.sql} (100%)
+ create mode 100644 database/migrations/2026_09_13_004_perimetre_eleves.sql
+ create mode 100644 database/runner.php
+ create mode 100644 tests/students_perimetre.php
+
+diff --git a/app/config/routes.php b/app/config/routes.php
+index 87b6179..d03a8ab 100644
+--- a/app/config/routes.php
++++ b/app/config/routes.php
+@@ -47,57 +47,57 @@ route('GET',  '/tableau-de-bord',       'dashboard', 'ctrl_dashboard_index', ['a
+ // ---------------------------------------------------------------------
+ // Phase 2 — Référentiel scolaire
+ // ---------------------------------------------------------------------
+-route('GET',  '/referentiel',                    'curriculum', 'ctrl_curriculum_index',            ['auth', 'perm:curriculum.view']);
+-route('POST', '/referentiel/importer',           'curriculum', 'ctrl_curriculum_import',           ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/periodes',           'curriculum', 'ctrl_curriculum_create_periods',   ['auth', 'perm:curriculum.manage']);
++route('GET',  '/referentiel',                    'curriculum', 'ctrl_curriculum_index',            ['auth', 'school', 'perm:curriculum.view']);
++route('POST', '/referentiel/importer',           'curriculum', 'ctrl_curriculum_import',           ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/periodes',           'curriculum', 'ctrl_curriculum_create_periods',   ['auth', 'school', 'perm:curriculum.manage']);
+ 
+ // Branches
+-route('GET',  '/referentiel/branches',           'curriculum', 'ctrl_curriculum_subjects',         ['auth', 'perm:curriculum.view']);
+-route('POST', '/referentiel/branches',           'curriculum', 'ctrl_curriculum_store_subject',    ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/branches/{id}',      'curriculum', 'ctrl_curriculum_update_subject',   ['auth', 'perm:curriculum.manage']);
++route('GET',  '/referentiel/branches',           'curriculum', 'ctrl_curriculum_subjects',         ['auth', 'school', 'perm:curriculum.view']);
++route('POST', '/referentiel/branches',           'curriculum', 'ctrl_curriculum_store_subject',    ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/branches/{id}',      'curriculum', 'ctrl_curriculum_update_subject',   ['auth', 'school', 'perm:curriculum.manage']);
+ 
+ // Sections et options
+-route('GET',  '/referentiel/sections',           'curriculum', 'ctrl_curriculum_sections',         ['auth', 'perm:curriculum.view']);
+-route('POST', '/referentiel/sections/{id}/etat', 'curriculum', 'ctrl_curriculum_toggle_section',   ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/options/{id}/etat',  'curriculum', 'ctrl_curriculum_toggle_option',    ['auth', 'perm:curriculum.manage']);
+-route('GET',  '/referentiel/sections/{id}/options', 'curriculum', 'ctrl_curriculum_section_options', ['auth', 'perm:curriculum.view']);
++route('GET',  '/referentiel/sections',           'curriculum', 'ctrl_curriculum_sections',         ['auth', 'school', 'perm:curriculum.view']);
++route('POST', '/referentiel/sections/{id}/etat', 'curriculum', 'ctrl_curriculum_toggle_section',   ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/options/{id}/etat',  'curriculum', 'ctrl_curriculum_toggle_option',    ['auth', 'school', 'perm:curriculum.manage']);
++route('GET',  '/referentiel/sections/{id}/options', 'curriculum', 'ctrl_curriculum_section_options', ['auth', 'school', 'perm:curriculum.view']);
+ 
+ // Programmes
+-route('GET',  '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_programs',           ['auth', 'perm:curriculum.view']);
+-route('POST', '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_store_program',      ['auth', 'perm:curriculum.manage']);
+-route('GET',  '/referentiel/programmes/{id}',         'curriculum', 'ctrl_curriculum_show_program',       ['auth', 'perm:curriculum.view']);
+-route('POST', '/referentiel/programmes/{id}/remplir', 'curriculum', 'ctrl_curriculum_fill_program',       ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/programmes/{id}/branches','curriculum', 'ctrl_curriculum_add_subject',        ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/programmes/{id}/maxima',  'curriculum', 'ctrl_curriculum_update_subjects',    ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/programmes/{id}/activer', 'curriculum', 'ctrl_curriculum_activate_program',   ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/programmes/{id}/dupliquer','curriculum','ctrl_curriculum_duplicate_program',  ['auth', 'perm:curriculum.manage']);
+-route('POST', '/referentiel/programmes/{id}/branches/{subjectId}/retirer', 'curriculum', 'ctrl_curriculum_remove_subject', ['auth', 'perm:curriculum.manage']);
++route('GET',  '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_programs',           ['auth', 'school', 'perm:curriculum.view']);
++route('POST', '/referentiel/programmes',              'curriculum', 'ctrl_curriculum_store_program',      ['auth', 'school', 'perm:curriculum.manage']);
++route('GET',  '/referentiel/programmes/{id}',         'curriculum', 'ctrl_curriculum_show_program',       ['auth', 'school', 'perm:curriculum.view']);
++route('POST', '/referentiel/programmes/{id}/remplir', 'curriculum', 'ctrl_curriculum_fill_program',       ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/programmes/{id}/branches','curriculum', 'ctrl_curriculum_add_subject',        ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/programmes/{id}/maxima',  'curriculum', 'ctrl_curriculum_update_subjects',    ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/programmes/{id}/activer', 'curriculum', 'ctrl_curriculum_activate_program',   ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/programmes/{id}/dupliquer','curriculum','ctrl_curriculum_duplicate_program',  ['auth', 'school', 'perm:curriculum.manage']);
++route('POST', '/referentiel/programmes/{id}/branches/{subjectId}/retirer', 'curriculum', 'ctrl_curriculum_remove_subject', ['auth', 'school', 'perm:curriculum.manage']);
+ 
+ // ---------------------------------------------------------------------
+ // Phase 3 — Classes
+ // ---------------------------------------------------------------------
+-route('GET',  '/classes',            'classrooms', 'ctrl_classrooms_index',      ['auth', 'perm:classroom.view']);
+-route('POST', '/classes',            'classrooms', 'ctrl_classrooms_store',      ['auth', 'perm:classroom.manage']);
+-route('GET',  '/classes/{id}',       'classrooms', 'ctrl_classrooms_show',       ['auth', 'perm:classroom.view']);
+-route('POST', '/classes/{id}',       'classrooms', 'ctrl_classrooms_update',     ['auth', 'perm:classroom.manage']);
+-route('POST', '/classes/salles',     'classrooms', 'ctrl_classrooms_store_room', ['auth', 'perm:classroom.manage']);
++route('GET',  '/classes',            'classrooms', 'ctrl_classrooms_index',      ['auth', 'school', 'perm:classroom.view']);
++route('POST', '/classes',            'classrooms', 'ctrl_classrooms_store',      ['auth', 'school', 'perm:classroom.manage']);
++route('GET',  '/classes/{id}',       'classrooms', 'ctrl_classrooms_show',       ['auth', 'school', 'perm:classroom.view']);
++route('POST', '/classes/{id}',       'classrooms', 'ctrl_classrooms_update',     ['auth', 'school', 'perm:classroom.manage']);
++route('POST', '/classes/salles',     'classrooms', 'ctrl_classrooms_store_room', ['auth', 'school', 'perm:classroom.manage']);
+ 
+ // ---------------------------------------------------------------------
+ // Phase 3 — Élèves
+ // ---------------------------------------------------------------------
+-route('GET',  '/eleves',             'students', 'ctrl_students_index',        ['auth', 'perm:student.view']);
+-route('GET',  '/eleves/nouveau',     'students', 'ctrl_students_create_form',  ['auth', 'perm:student.create']);
+-route('POST', '/eleves',             'students', 'ctrl_students_store',        ['auth', 'perm:student.create']);
+-route('GET',  '/eleves/recherche',   'students', 'ctrl_students_quick_search', ['auth', 'perm:student.view']);
+-route('GET',  '/eleves/{id}',        'students', 'ctrl_students_show',         ['auth', 'perm:student.view']);
+-route('POST', '/eleves/{id}',        'students', 'ctrl_students_update',       ['auth', 'perm:student.edit']);
++route('GET',  '/eleves',             'students', 'ctrl_students_index',        ['auth', 'school', 'perm:student.view']);
++route('GET',  '/eleves/nouveau',     'students', 'ctrl_students_create_form',  ['auth', 'school', 'perm:student.create']);
++route('POST', '/eleves',             'students', 'ctrl_students_store',        ['auth', 'school', 'perm:student.create']);
++route('GET',  '/eleves/recherche',   'students', 'ctrl_students_quick_search', ['auth', 'school', 'perm:student.view']);
++route('GET',  '/eleves/{id}',        'students', 'ctrl_students_show',         ['auth', 'school', 'perm:student.view']);
++route('POST', '/eleves/{id}',        'students', 'ctrl_students_update',       ['auth', 'school', 'perm:student.edit']);
+ 
+-route('POST', '/eleves/{id}/reinscription', 'students', 'ctrl_students_re_enroll',    ['auth', 'perm:enrollment.manage']);
+-route('POST', '/eleves/{id}/affectation',   'students', 'ctrl_students_assign',       ['auth', 'perm:classroom.assign']);
+-route('POST', '/eleves/{id}/tuteurs',       'students', 'ctrl_students_add_guardian', ['auth', 'perm:student.edit']);
+-route('POST', '/eleves/{id}/tuteurs/{linkId}/retirer', 'students', 'ctrl_students_detach_guardian', ['auth', 'perm:student.edit']);
+-route('POST', '/eleves/{id}/orientation',   'students', 'ctrl_students_orient',        ['auth', 'perm:orientation.manage']);
+-route('POST', '/eleves/{id}/statut',        'students', 'ctrl_students_change_status', ['auth', 'perm:student.edit']);
++route('POST', '/eleves/{id}/reinscription', 'students', 'ctrl_students_re_enroll',    ['auth', 'school', 'perm:enrollment.manage']);
++route('POST', '/eleves/{id}/affectation',   'students', 'ctrl_students_assign',       ['auth', 'school', 'perm:classroom.assign']);
++route('POST', '/eleves/{id}/tuteurs',       'students', 'ctrl_students_add_guardian', ['auth', 'school', 'perm:student.edit']);
++route('POST', '/eleves/{id}/tuteurs/{link_id}/retirer', 'students', 'ctrl_students_detach_guardian', ['auth', 'school', 'perm:student.edit']);
++route('POST', '/eleves/{id}/orientation',   'students', 'ctrl_students_orient',        ['auth', 'school', 'perm:orientation.manage']);
++route('POST', '/eleves/{id}/statut',        'students', 'ctrl_students_change_status', ['auth', 'school', 'perm:student.edit']);
+ 
+ // ---------------------------------------------------------------------
+ // Les modules des phases suivantes viendront s'ajouter ici :
+diff --git a/app/core/router.php b/app/core/router.php
+index e26add1..3f4d751 100644
+--- a/app/core/router.php
++++ b/app/core/router.php
+@@ -49,6 +49,23 @@ function router_table(string $action, ?array $route = null): array
+     return $routes;
+ }
+ 
++/**
++ * Une route est-elle déclarée ?
++ *
++ * Sert aux middlewares qui redirigent : rediriger vers une route qui
++ * n'existe pas encore transforme un refus d'accès en page introuvable.
++ */
++function router_has_route(string $method, string $pattern): bool
++{
++    foreach (router_table('get') as $route) {
++        if ($route['method'] === strtoupper($method) && $route['path'] === '/' . trim($pattern, '/')) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
+ /**
+  * Résout la requête courante et exécute le gestionnaire correspondant.
+  */
+@@ -114,9 +131,15 @@ function router_match(string $pattern, string $path): ?array
+     foreach ($segments as $segment) {
+         if ($segment[0] === '{') {
+             $name = trim($segment, '{}');
+-            // {id}, {student_id} n'acceptent que des chiffres ;
++            // {id}, {student_id}, {subjectId} n'acceptent que des chiffres ;
+             // {slug}, {code} acceptent lettres, chiffres, tiret et souligné.
+-            $regex .= str_ends_with($name, 'id') ? '(\d+)' : '([a-zA-Z0-9_\-]+)';
++            //
++            // La comparaison est insensible à la casse : écrite
++            // sensible, elle laissait passer {linkId} et {subjectId}
++            // dans la branche alphanumérique, et la garantie « un
++            // identifiant n'est que des chiffres » devenait fausse sans
++            // que rien ne le signale.
++            $regex .= str_ends_with(strtolower($name), 'id') ? '(\d+)' : '([a-zA-Z0-9_\-]+)';
+         } else {
+             $regex .= preg_quote($segment, '#');
+         }
+@@ -173,9 +196,22 @@ function router_run_middleware(array $middleware): void
+ 
+             case 'school':
+                 // La page exige un établissement dans le contexte courant.
++                //
++                // Sans ce contrôle, un super administrateur (school_id
++                // NULL, toutes les permissions) atteignait les pages de
++                // l'école et provoquait une erreur 500 sur le premier
++                // tenant_require() rencontré.
+                 if (tenant_id() === null) {
+-                    flash_warning('Veuillez sélectionner un établissement.');
+-                    redirect('/plateforme/ecoles');
++                    // La page de sélection d'établissement appartient à
++                    // la phase plateforme. Tant qu'elle n'est pas
++                    // publiée, rediriger enverrait vers une 404 : mieux
++                    // vaut un refus explicite.
++                    if (router_has_route('GET', '/plateforme/ecoles')) {
++                        flash_warning('Veuillez sélectionner un établissement.');
++                        redirect('/plateforme/ecoles');
++                    }
++
++                    abort(403, 'Cette page appartient à un établissement. Connectez-vous avec un compte rattaché à une école.');
+                 }
+                 break;
+ 
+diff --git a/app/core/tenant.php b/app/core/tenant.php
+index 074c493..d02a963 100644
+--- a/app/core/tenant.php
++++ b/app/core/tenant.php
+@@ -62,6 +62,15 @@ const TENANT_TABLES = [
+     'enrollments',
+     'orientations',
+     'student_history',
++
++    // Journal d'audit : school_id vaut NULL pour les actions de la
++    // plateforme, et l'identifiant de l'école pour toutes les autres.
++    // Il est soumis au garde-fou : une future page « historique des
++    // actions » qui oublierait le filtre exposerait l'activité complète
++    // d'un autre établissement — c'est précisément ce qu'une trace ne
++    // doit jamais laisser faire.
++    'audit_logs',
++
+     // Phases suivantes — déclarées d'avance pour ne pas être oubliées
+     'teachers',
+     'teacher_subjects',
+@@ -92,19 +101,42 @@ const GLOBAL_TABLES = [
+     'schools',
+     'plans',
+     'permissions',
+-    'roles',              // school_id nullable : rôles système partagés
+-    'role_permissions',
+-    'user_roles',
+     'education_cycles',
+     'education_levels',
+     'learning_domains',      // modèle national, phase 2
+     'reference_sections',
+     'reference_options',
+     'reference_subjects',
+-    'audit_logs',         // school_id nullable : trace aussi la plateforme
+     'login_attempts',
+     'password_resets',
++
++    // ----------------------------------------------------------------
++    //  Deux tables portent une colonne school_id et restent pourtant
++    //  déclarées globales. Ce n'est pas un oubli, et la raison doit
++    //  rester écrite ici, sinon quelqu'un « corrigera » un jour la
++    //  classification et cassera l'authentification.
++    // ----------------------------------------------------------------
++
++    // roles : les rôles système ont school_id NULL et sont partagés par
++    // toutes les écoles. perm_all() et perm_roles() résolvent les rôles
++    // par user_id — un utilisateur n'appartenant qu'à une seule école,
++    // le cloisonnement vient de là. Toute page listant les rôles devra
++    // en revanche filtrer explicitement
++    // (school_id IS NULL OR school_id = :school_id), faute de quoi les
++    // rôles personnalisés d'une autre école deviendraient visibles.
++    'roles',
++    'role_permissions',
++    'user_roles',
++
++    // user_sessions : la session est créée à l'authentification, avant
++    // qu'un établissement ne soit placé dans le contexte. Elle est lue
++    // et révoquée par user_id. La colonne school_id n'y est qu'une
++    // dénormalisation de confort.
+     'user_sessions',
++
++    // Registre de l'applicateur de migrations : infrastructure, jamais
++    // rattachée à un établissement.
++    'schema_migrations',
+ ];
+ 
+ // ---------------------------------------------------------------------
+diff --git a/app/modules/students/controllers.php b/app/modules/students/controllers.php
+index 94fd0de..614e6e4 100644
+--- a/app/modules/students/controllers.php
++++ b/app/modules/students/controllers.php
+@@ -90,7 +90,10 @@ function ctrl_students_show(string $id): void
+     $studentId = (int) $id;
+     $student   = students_repo_find($studentId);
+ 
+-    if ($student === null) {
++    // Restreindre la liste ne protège rien si la fiche reste accessible
++    // par son identifiant. Un 404, et non un 403 : confirmer l'existence
++    // d'un dossier qu'on n'a pas le droit de lire est déjà une fuite.
++    if ($student === null || !students_can_view($studentId)) {
+         abort(404, 'Élève introuvable.');
+     }
+ 
+@@ -223,19 +226,41 @@ function ctrl_students_update(string $id): void
+         redirect('/eleves/' . $studentId);
+     }
+ 
+-    $after = [
+-        'last_name'   => sanitize_string((string) input('last_name'), 80),
+-        'post_name'   => sanitize_string(input('post_name'), 80),
+-        'first_name'  => sanitize_string((string) input('first_name'), 80),
+-        'gender'      => (string) input('gender'),
+-        'birth_date'  => input('birth_date'),
+-        'birth_place' => sanitize_string(input('birth_place'), 120),
+-        'nationality' => sanitize_string(input('nationality'), 60),
+-        'address'     => sanitize_string(input('address'), 255),
+-        'phone'       => sanitize_phone(input('phone')),
+-        'email'       => input('email'),
++    // Seuls les champs RÉELLEMENT transmis sont écrits.
++    //
++    // Écrire systématiquement les dix colonnes effaçait l'état civil dès
++    // qu'une requête n'en portait qu'une partie : les règles « nullable »
++    // laissent passer un champ absent, input() renvoie null, et la date
++    // de naissance, le lieu, l'adresse et le téléphone partaient à NULL
++    // sans la moindre erreur SQL.
++    $source = input_all();
++
++    $writable = [
++        'last_name'   => static fn ($v) => sanitize_string((string) $v, 80),
++        'post_name'   => static fn ($v) => sanitize_string($v, 80),
++        'first_name'  => static fn ($v) => sanitize_string((string) $v, 80),
++        'gender'      => static fn ($v) => (string) $v,
++        'birth_date'  => static fn ($v) => $v !== '' ? $v : null,
++        'birth_place' => static fn ($v) => sanitize_string($v, 120),
++        'nationality' => static fn ($v) => sanitize_string($v, 60),
++        'address'     => static fn ($v) => sanitize_string($v, 255),
++        'phone'       => static fn ($v) => sanitize_phone($v),
++        'email'       => static fn ($v) => $v !== '' ? $v : null,
+     ];
+ 
++    $after = [];
++
++    foreach ($writable as $field => $transform) {
++        if (array_key_exists($field, $source)) {
++            $after[$field] = $transform($source[$field]);
++        }
++    }
++
++    if ($after === []) {
++        flash_error('Aucune donnée à enregistrer.');
++        redirect('/eleves/' . $studentId);
++    }
++
+     tenant_update('students', $after, 'id = :id', ['id' => $studentId]);
+     audit_update('student', $studentId, $student, $after, 'Modification du dossier élève');
+ 
+@@ -286,7 +311,7 @@ function ctrl_students_assign(string $id): void
+         redirect('/eleves/' . $studentId);
+     }
+ 
+-    $outcome = students_service_assign_classroom($enrollmentId, $classroomId);
++    $outcome = students_service_assign_classroom($studentId, $enrollmentId, $classroomId);
+ 
+     $outcome['ok']
+         ? flash_success('Élève affecté à la classe.')
+diff --git a/app/modules/students/repositories.php b/app/modules/students/repositories.php
+index d4784c7..05fafb8 100644
+--- a/app/modules/students/repositories.php
++++ b/app/modules/students/repositories.php
+@@ -9,6 +9,109 @@
+ 
+ declare(strict_types=1);
+ 
++// =====================================================================
++//  PÉRIMÈTRE DE LECTURE
++//
++//  Une permission dit ce qu'un utilisateur a le droit de FAIRE ; elle ne
++//  dit jamais SUR QUI. Les deux doivent être posés séparément, sans
++//  quoi « consulter un élève » devient « consulter tous les élèves ».
++//
++//  Cette couche manquait : ENSEIGNANT et PARENT détenaient student.view
++//  et lisaient donc l'intégralité du fichier de l'établissement.
++// =====================================================================
++
++/**
++ * Condition SQL restreignant la lecture au périmètre de l'utilisateur.
++ *
++ * Renvoie une condition portant sur l'alias `s` de la table students,
++ * et les paramètres associés.
++ *
++ * Trois cas, dans cet ordre :
++ *   1. student.view.all  → aucune restriction ;
++ *   2. compte rattaché à une fiche tuteur → ses enfants uniquement ;
++ *   3. tout le reste → aucun élève.
++ *
++ * Le cas 2 s'appuie sur guardians.user_id, c'est-à-dire sur un lien de
++ * données réel, et non sur le code du rôle : renommer ou dupliquer le
++ * rôle « PARENT » ne peut donc pas ouvrir le fichier par inadvertance.
++ *
++ * Le cas 3 refuse par défaut. L'enseignant en fait partie tant que la
++ * table teachers n'existe pas (phase 4) : mieux vaut une page vide,
++ * corrigible, qu'une divulgation, irréversible.
++ *
++ * @return array{0: string, 1: array<string, mixed>}
++ */
++function students_scope_clause(): array
++{
++    if (perm_has('student.view.all')) {
++        return ['1 = 1', []];
++    }
++
++    $userId = auth_id();
++
++    if ($userId !== null) {
++        $isGuardian = db_exists(
++            'SELECT 1 FROM guardians
++              WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
++              LIMIT 1',
++            ['school_id' => tenant_require(), 'user_id' => $userId]
++        );
++
++        if ($isGuardian) {
++            return [
++                's.id IN (SELECT sg.student_id
++                            FROM student_guardians sg
++                            JOIN guardians g ON g.id = sg.guardian_id
++                                            AND g.school_id = sg.school_id
++                           WHERE sg.school_id = :scope_school
++                             AND g.user_id = :scope_user
++                             AND g.deleted_at IS NULL)',
++                ['scope_school' => tenant_require(), 'scope_user' => $userId],
++            ];
++        }
++    }
++
++    return ['1 = 0', []];
++}
++
++/**
++ * L'utilisateur courant a-t-il le droit de consulter CET élève ?
++ *
++ * Utilisé par les contrôleurs avant d'afficher une fiche : la
++ * restriction de la liste ne protège rien si l'accès direct par
++ * identifiant reste ouvert.
++ */
++function students_can_view(int $studentId): bool
++{
++    [$clause, $params] = students_scope_clause();
++
++    if ($clause === '1 = 1') {
++        return true;
++    }
++
++    if ($clause === '1 = 0') {
++        return false;
++    }
++
++    return db_exists(
++        'SELECT 1 FROM students s
++          WHERE s.school_id = :school_id AND s.id = :id AND ' . $clause . ' LIMIT 1',
++        $params + ['school_id' => tenant_require(), 'id' => $studentId]
++    );
++}
++
++/**
++ * Échappe les jokers d'un terme destiné à un LIKE.
++ *
++ * Sans cela, un simple « % » saisi dans la barre de recherche
++ * transforme la recherche par préfixe — pensée pour l'index
++ * idx_student_names — en balayage complet de la table.
++ */
++function students_escape_like(string $term): string
++{
++    return str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $term);
++}
++
+ /**
+  * Liste paginée des élèves, avec leur inscription de l'année demandée.
+  *
+@@ -20,11 +123,18 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
+     $where  = ['s.school_id = :school_id', 's.deleted_at IS NULL'];
+     $params = ['school_id' => tenant_require(), 'year_id' => $academicYearId];
+ 
++    // Périmètre d'abord : aucune autre condition ne doit pouvoir
++    // l'élargir. Un parent ne voit ses enfants quels que soient les
++    // filtres saisis dans l'interface.
++    [$scopeClause, $scopeParams] = students_scope_clause();
++    $where[] = $scopeClause;
++    $params += $scopeParams;
++
+     // Recherche plein texte simple : nom, postnom, prénom, matricule.
+     // LIKE 'terme%' sur les noms utilise l'index idx_student_names ;
+     // un '%terme%' en tête l'empêcherait et forcerait un balayage complet.
+     if (!empty($filters['q'])) {
+-        $term = trim((string) $filters['q']);
++        $term = students_escape_like(trim((string) $filters['q']));
+         $where[] = '(s.matricule LIKE :q_exact
+                      OR s.last_name LIKE :q_start
+                      OR s.post_name LIKE :q_start2
+@@ -85,10 +195,16 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
+     return ['rows' => $rows, 'total' => $total, 'pages' => $pages, 'page' => $page];
+ }
+ 
+-/** Fiche complète d'un élève. */
++/**
++ * Fiche complète d'un élève.
++ *
++ * Le filtre deleted_at est posé ici et pas seulement dans la recherche :
++ * sans lui, un dossier supprimé resterait consultable, modifiable et
++ * réinscriptible par accès direct à son identifiant.
++ */
+ function students_repo_find(int $id): ?array
+ {
+-    return tenant_find('students', $id);
++    return tenant_one('students', 'id = :id AND deleted_at IS NULL', ['id' => $id]);
+ }
+ 
+ /** Élève retrouvé par son matricule (recherche du secrétariat). */
+@@ -236,6 +352,28 @@ function guardians_repo_find_by_phone(string $phone): ?array
+     return tenant_one('guardians', 'phone = :p AND deleted_at IS NULL', ['p' => $phone]);
+ }
+ 
++/**
++ * Tuteur retrouvé par téléphone ET identité.
++ *
++ * Le téléphone seul ne suffit pas à identifier une personne : dans
++ * beaucoup de familles, le père et la mère donnent le même numéro, celui
++ * du foyer ou de l'unique téléphone de la maison. Dédupliquer sur ce seul
++ * critère revenait à rattacher la mère à l'élève alors que le secrétariat
++ * saisissait le père — silencieusement, sans le moindre avertissement.
++ *
++ * La comparaison porte donc sur le numéro et sur le nom. Elle reste
++ * insensible à la casse et aux accents (collation utf8mb4_unicode_ci),
++ * ce qui suffit pour retrouver le même parent d'un enfant à l'autre.
++ */
++function guardians_repo_find_same_person(string $phone, string $lastName, string $firstName): ?array
++{
++    return tenant_one(
++        'guardians',
++        'phone = :p AND last_name = :ln AND first_name = :fn AND deleted_at IS NULL',
++        ['p' => $phone, 'ln' => trim($lastName), 'fn' => trim($firstName)]
++    );
++}
++
+ /** Liste paginée des tuteurs, avec le nombre d'enfants. */
+ function guardians_repo_search(string $term = '', int $page = 1, int $perPage = 25): array
+ {
+diff --git a/app/modules/students/services.php b/app/modules/students/services.php
+index 4325c9c..b0acf45 100644
+--- a/app/modules/students/services.php
++++ b/app/modules/students/services.php
+@@ -156,7 +156,21 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
+ 
+     $entryYear = (int) date('Y', (int) strtotime((string) $year['starts_on']));
+ 
+-    return db_transaction(static function () use ($data, $yearId, $classroomId, $entryYear, $year): array {
++    try {
++        return db_transaction(static function () use ($data, $yearId, $classroomId, $entryYear, $year): array {
++        // Le contrôle ci-dessus donne un message immédiat dans le cas
++        // courant ; celui-ci, verrou posé, est le seul qui fasse foi
++        // lorsque deux inscriptions arrivent en même temps.
++        if ($classroomId !== null) {
++            students_service_lock_classroom($classroomId);
++
++            $recheck = students_service_check_capacity($classroomId);
++
++            if (!$recheck['ok']) {
++                throw new RuntimeException($recheck['message']);
++            }
++        }
++
+         $matricule = students_service_next_matricule($entryYear);
+ 
+         $studentId = tenant_insert('students', [
+@@ -210,7 +224,10 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
+         );
+ 
+         return ['ok' => true, 'id' => $studentId, 'matricule' => $matricule, 'message' => ''];
+-    });
++        });
++    } catch (RuntimeException $e) {
++        return ['ok' => false, 'id' => null, 'matricule' => null, 'message' => $e->getMessage()];
++    }
+ }
+ 
+ // =====================================================================
+@@ -275,7 +292,18 @@ function students_service_re_enroll(int $studentId, int $yearId, ?int $classroom
+         }
+     }
+ 
+-    return db_transaction(static function () use ($studentId, $yearId, $classroomId, $repeated, $year, $student): array {
++    try {
++        return db_transaction(static function () use ($studentId, $yearId, $classroomId, $repeated, $year, $student): array {
++        if ($classroomId !== null) {
++            students_service_lock_classroom($classroomId);
++
++            $recheck = students_service_check_capacity($classroomId);
++
++            if (!$recheck['ok']) {
++                throw new RuntimeException($recheck['message']);
++            }
++        }
++
+         $enrollmentId = tenant_insert('enrollments', [
+             'student_id'        => $studentId,
+             'academic_year_id'  => $yearId,
+@@ -309,7 +337,10 @@ function students_service_re_enroll(int $studentId, int $yearId, ?int $classroom
+         );
+ 
+         return ['ok' => true, 'id' => $enrollmentId, 'message' => ''];
+-    });
++        });
++    } catch (RuntimeException $e) {
++        return ['ok' => false, 'id' => null, 'message' => $e->getMessage()];
++    }
+ }
+ 
+ // =====================================================================
+@@ -354,13 +385,37 @@ function students_service_check_capacity(int $classroomId): array
+     return ['ok' => true, 'message' => '', 'current' => $current, 'capacity' => $capacity];
+ }
+ 
+-/** Affecte ou change la classe d'une inscription. */
+-function students_service_assign_classroom(int $enrollmentId, int $classroomId): array
++/**
++ * Affecte ou change la classe d'une inscription.
++ *
++ * $studentId est obligatoire et vérifié : le contrôleur reçoit l'élève
++ * dans l'URL et l'inscription dans le corps du formulaire. Sans ce
++ * recoupement, remplacer enrollment_id dans le POST déplaçait l'élève
++ * d'un CAMARADE de classe, en journalisant l'opération sous l'élève
++ * affiché — une modification invisible à la relecture.
++ */
++function students_service_assign_classroom(int $studentId, int $enrollmentId, int $classroomId): array
+ {
+     $enrollment = tenant_find('enrollments', $enrollmentId);
+ 
+-    if ($enrollment === null) {
+-        return ['ok' => false, 'message' => 'Inscription introuvable.'];
++    if ($enrollment === null || (int) $enrollment['student_id'] !== $studentId) {
++        return ['ok' => false, 'message' => 'Inscription introuvable pour cet élève.'];
++    }
++
++    if ($enrollment['status'] === 'cancelled') {
++        return [
++            'ok'      => false,
++            'message' => 'Cette inscription est annulée : elle ne peut pas recevoir de classe.',
++        ];
++    }
++
++    $year = tenant_find('academic_years', (int) $enrollment['academic_year_id']);
++
++    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
++        return [
++            'ok'      => false,
++            'message' => 'Cette année scolaire est clôturée : elle ne peut plus être modifiée.',
++        ];
+     }
+ 
+     $classroom = tenant_one(
+@@ -373,32 +428,62 @@ function students_service_assign_classroom(int $enrollmentId, int $classroomId):
+         return ['ok' => false, 'message' => 'La classe n\'appartient pas à l\'année scolaire de cette inscription.'];
+     }
+ 
+-    if ((int) $enrollment['classroom_id'] !== $classroomId) {
+-        $check = students_service_check_capacity($classroomId);
+-
+-        if (!$check['ok']) {
+-            return ['ok' => false, 'message' => $check['message']];
+-        }
++    $unchanged = (int) $enrollment['classroom_id'] === $classroomId;
++
++    try {
++        db_transaction(static function () use ($enrollment, $enrollmentId, $classroomId, $classroom, $unchanged): void {
++            if (!$unchanged) {
++                students_service_lock_classroom($classroomId);
++
++                $check = students_service_check_capacity($classroomId);
++
++                if (!$check['ok']) {
++                    throw new RuntimeException($check['message']);
++                }
++            }
++
++            tenant_update('enrollments', [
++                'classroom_id' => $classroomId,
++                'status'       => 'enrolled',
++                'enrolled_on'  => $enrollment['enrolled_on'] ?? date('Y-m-d'),
++            ], 'id = :id', ['id' => $enrollmentId]);
++
++            audit_log(
++                'update',
++                'enrollment',
++                $enrollmentId,
++                ['classroom_id' => $enrollment['classroom_id']],
++                ['classroom_id' => $classroomId],
++                'Affectation à la classe ' . $classroom['name']
++            );
++        });
++    } catch (RuntimeException $e) {
++        return ['ok' => false, 'message' => $e->getMessage()];
+     }
+ 
+-    tenant_update('enrollments', [
+-        'classroom_id' => $classroomId,
+-        'status'       => $enrollment['status'] === 'enrolled' ? 'enrolled' : 'enrolled',
+-        'enrolled_on'  => $enrollment['enrolled_on'] ?? date('Y-m-d'),
+-    ], 'id = :id', ['id' => $enrollmentId]);
+-
+-    audit_log(
+-        'update',
+-        'enrollment',
+-        $enrollmentId,
+-        ['classroom_id' => $enrollment['classroom_id']],
+-        ['classroom_id' => $classroomId],
+-        'Affectation à la classe ' . $classroom['name']
+-    );
+-
+     return ['ok' => true, 'message' => ''];
+ }
+ 
++/**
++ * Verrouille la ligne d'une classe jusqu'à la fin de la transaction.
++ *
++ * Le contrôle de capacité est un COUNT suivi d'un INSERT. Sans verrou,
++ * deux secrétaires validant une inscription à la même seconde lisent le
++ * même effectif, passent tous les deux le contrôle et dépassent la
++ * capacité — exactement le scénario que le matricule évite déjà par le
++ * même moyen. Aucune contrainte SQL ne rattrape un effectif dépassé.
++ *
++ * À appeler dans une transaction ouverte, avant students_service_check_capacity().
++ */
++function students_service_lock_classroom(int $classroomId): void
++{
++    db_query(
++        'SELECT id FROM classrooms
++          WHERE school_id = :school_id AND id = :id FOR UPDATE',
++        ['school_id' => tenant_require(), 'id' => $classroomId]
++    );
++}
++
+ // =====================================================================
+ //  TUTEURS
+ // =====================================================================
+@@ -419,10 +504,21 @@ function students_service_attach_guardian(int $studentId, array $data): array
+         return ['ok' => false, 'guardian_id' => null, 'created' => false, 'message' => 'Élève introuvable.'];
+     }
+ 
+-    $phone    = sanitize_phone((string) ($data['phone'] ?? ''));
+-    $existing = $phone !== null ? guardians_repo_find_by_phone($phone) : null;
++    $phone = sanitize_phone((string) ($data['phone'] ?? ''));
++
++    return db_transaction(static function () use ($data, $phone, $studentId, $student): array {
++        // La recherche est faite DANS la transaction : hors transaction,
++        // deux rattachements simultanés du même parent à deux enfants
++        // d'une fratrie créaient deux fiches, ce que la déduplication
++        // est justement censée empêcher.
++        //
++        // Le critère est le téléphone ET le nom : voir
++        // guardians_repo_find_same_person(). Le père et la mère donnent
++        // souvent le même numéro.
++        $existing = $phone !== null
++            ? guardians_repo_find_same_person($phone, (string) $data['last_name'], (string) $data['first_name'])
++            : null;
+ 
+-    return db_transaction(static function () use ($existing, $data, $phone, $studentId, $student): array {
+         $created = false;
+ 
+         if ($existing !== null) {
+@@ -518,6 +614,13 @@ function students_service_orient(
+         return ['ok' => false, 'message' => 'Année scolaire introuvable.'];
+     }
+ 
++    // Une décision d'orientation datée d'aujourd'hui n'a rien à faire
++    // dans une année déjà clôturée : la clôture doit valoir pour toutes
++    // les écritures, pas seulement pour les inscriptions.
++    if (in_array($year['status'], ['closed', 'archived'], true)) {
++        return ['ok' => false, 'message' => 'Cette année scolaire est clôturée : aucune orientation ne peut y être prononcée.'];
++    }
++
+     $enrollment = students_repo_enrollment($studentId, $yearId);
+ 
+     if ($enrollment === null) {
+@@ -650,6 +753,21 @@ function students_service_change_status(int $studentId, string $status, string $
+         return ['ok' => false, 'message' => 'Élève introuvable.'];
+     }
+ 
++    // Sortir un élève de la vie scolaire n'est pas une modification de
++    // dossier : la réinscription le refuse ensuite, et le dossier
++    // disparaît des effectifs. Le catalogue prévoit une permission
++    // distincte pour cela, « student.delete », qui n'était appliquée
++    // nulle part — le secrétariat pouvait donc archiver tout le fichier
++    // avec le seul droit de modification.
++    $sensitive = ['graduated', 'transferred', 'dropped', 'archived'];
++
++    if (in_array($status, $sensitive, true) && !perm_has('student.delete')) {
++        return [
++            'ok'      => false,
++            'message' => 'Vous n\'avez pas le droit de clôturer ou d\'archiver un dossier élève.',
++        ];
++    }
++
+     $labels = [
+         'active'      => 'Dossier réactivé',
+         'graduated'   => 'Fin des études secondaires',
+diff --git a/app/views/classrooms/index.php b/app/views/classrooms/index.php
+index 038da1a..a41fea8 100644
+--- a/app/views/classrooms/index.php
++++ b/app/views/classrooms/index.php
+@@ -29,13 +29,14 @@ foreach ($classrooms as $classroom) {
+ 
+     <?php if (count($years) > 1): ?>
+         <form method="get" action="<?= e(url('/classes')) ?>">
+-            <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
++            <select name="annee" class="form-select form-select-sm" data-auto-submit>
+                 <?php foreach ($years as $option): ?>
+                     <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
+                         <?= e($option['code']) ?>
+                     </option>
+                 <?php endforeach; ?>
+             </select>
++            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
+         </form>
+     <?php endif; ?>
+ </div>
+diff --git a/app/views/curriculum/index.php b/app/views/curriculum/index.php
+index 0fbad67..0e57edc 100644
+--- a/app/views/curriculum/index.php
++++ b/app/views/curriculum/index.php
+@@ -34,7 +34,7 @@ $isEmpty        = $sections === [] && $subjects === [];
+ 
+     <?php if (count($years) > 1): ?>
+         <form method="get" action="<?= e(url('/referentiel')) ?>" class="d-flex gap-2">
+-            <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
++            <select name="annee" class="form-select form-select-sm" data-auto-submit>
+                 <?php foreach ($years as $option): ?>
+                     <option value="<?= (int) $option['id'] ?>"
+                         <?= $year !== null && (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
+@@ -42,6 +42,7 @@ $isEmpty        = $sections === [] && $subjects === [];
+                     </option>
+                 <?php endforeach; ?>
+             </select>
++            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
+         </form>
+     <?php endif; ?>
+ </div>
+diff --git a/app/views/curriculum/programs.php b/app/views/curriculum/programs.php
+index 7b3a05f..15c3c4f 100644
+--- a/app/views/curriculum/programs.php
++++ b/app/views/curriculum/programs.php
+@@ -38,13 +38,14 @@ foreach ($options as $option) {
+ 
+     <?php if (count($years) > 1): ?>
+         <form method="get" action="<?= e(url('/referentiel/programmes')) ?>">
+-            <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
++            <select name="annee" class="form-select form-select-sm" data-auto-submit>
+                 <?php foreach ($years as $option): ?>
+                     <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
+                         <?= e($option['code']) ?>
+                     </option>
+                 <?php endforeach; ?>
+             </select>
++            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
+         </form>
+     <?php endif; ?>
+ </div>
+diff --git a/app/views/students/index.php b/app/views/students/index.php
+index 6380eed..5057156 100644
+--- a/app/views/students/index.php
++++ b/app/views/students/index.php
+@@ -40,13 +40,14 @@ $queryBase = array_filter([
+     <div class="d-flex gap-2 flex-wrap">
+         <?php if (count($years) > 1): ?>
+             <form method="get" action="<?= e(url('/eleves')) ?>">
+-                <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
++                <select name="annee" class="form-select form-select-sm" data-auto-submit>
+                     <?php foreach ($years as $option): ?>
+                         <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
+                             <?= e($option['code']) ?>
+                         </option>
+                     <?php endforeach; ?>
+                 </select>
++                <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
+             </form>
+         <?php endif; ?>
+ 
+diff --git a/database/install.php b/database/install.php
+index 3a354e4..b433b3e 100644
+--- a/database/install.php
++++ b/database/install.php
+@@ -27,6 +27,7 @@ define('APP_PATH', BASE_PATH . '/app');
+ 
+ require APP_PATH . '/core/helpers.php';
+ require APP_PATH . '/core/logger.php';
++require __DIR__ . '/runner.php';
+ 
+ $options = getopt('', ['fresh', 'demo', 'help']);
+ 
+@@ -106,34 +107,45 @@ echo "  ✓ Base « {$dbName} » prête\n\n";
+ // ---------------------------------------------------------------------
+ // Exécution des fichiers SQL
+ // ---------------------------------------------------------------------
+-$files = [
+-    'Schéma des tables'            => __DIR__ . '/schema.sql',
+-    'Référentiel RDC et offres'    => __DIR__ . '/seeds/001_reference_data.sql',
+-    'Permissions et rôles système' => __DIR__ . '/seeds/002_roles_permissions.sql',
+-];
+-
+-foreach ($files as $label => $file) {
+-    if (!is_file($file)) {
+-        fwrite(STDERR, "  ✗ Fichier manquant : {$file}\n");
+-        exit(1);
++// L'installateur n'a pas sa propre liste de fichiers : il applique le
++// catalogue commun (schéma, migrations, puis seeds), et l'enregistre au
++// fur et à mesure. C'est ce qui garantit qu'une base fraîchement
++// installée et une base migrée soient identiques, et que migrate.php
++// n'essaie jamais de rejouer ce que l'installateur a déjà appliqué.
++runner_ledger_ensure($pdo);
++
++$catalog = runner_catalog();
++
++foreach (runner_autobaseline($pdo, $catalog, runner_applied($pdo)) as $name) {
++    printf("  ≡ %-38s déjà en place, enregistré\n", $name);
++}
++
++$applied = runner_applied($pdo);
++$total   = 0;
++
++foreach ($catalog as $file) {
++    if (isset($applied[$file['name']])) {
++        continue;
+     }
+ 
+-    $statements = sql_split((string) file_get_contents($file));
+-    $count      = 0;
++    if (!is_file($file['path'])) {
++        fwrite(STDERR, "  ✗ Fichier manquant : {$file['path']}\n");
++        exit(1);
++    }
+ 
+-    foreach ($statements as $statement) {
+-        try {
+-            $pdo->exec($statement);
+-            $count++;
+-        } catch (PDOException $e) {
+-            fwrite(STDERR, "\n  ✗ Erreur dans {$label} :\n");
+-            fwrite(STDERR, "    {$e->getMessage()}\n");
+-            fwrite(STDERR, "    Instruction : " . substr(preg_replace('/\s+/', ' ', $statement) ?? '', 0, 160) . "…\n\n");
+-            exit(1);
+-        }
++    try {
++        $count = runner_apply($pdo, $file);
++    } catch (RuntimeException $e) {
++        fwrite(STDERR, "\n  ✗ {$e->getMessage()}\n\n");
++        exit(1);
+     }
+ 
+-    printf("  ✓ %-30s %3d instructions\n", $label, $count);
++    printf("  ✓ %-38s %3d instructions\n", $file['name'], $count);
++    $total++;
++}
++
++if ($total === 0) {
++    echo "  → Base déjà à jour, aucun fichier à appliquer.\n";
+ }
+ 
+ // ---------------------------------------------------------------------
+@@ -316,80 +328,6 @@ exit(0);
+ //  Fonctions utilitaires de l'installateur
+ // =====================================================================
+ 
+-/**
+- * Découpe un fichier SQL en instructions.
+- *
+- * Tient compte des chaînes entre quotes et des commentaires, afin qu'un
+- * point-virgule contenu dans un libellé ne coupe pas l'instruction.
+- *
+- * @return string[]
+- */
+-function sql_split(string $sql): array
+-{
+-    $statements = [];
+-    $current    = '';
+-    $inString   = false;
+-    $quoteChar  = '';
+-    $length     = strlen($sql);
+-
+-    for ($i = 0; $i < $length; $i++) {
+-        $char = $sql[$i];
+-        $next = $sql[$i + 1] ?? '';
+-
+-        // Commentaire sur une ligne
+-        if (!$inString && (($char === '-' && $next === '-') || $char === '#')) {
+-            while ($i < $length && $sql[$i] !== "\n") {
+-                $i++;
+-            }
+-            $current .= "\n";
+-            continue;
+-        }
+-
+-        // Commentaire multi-lignes
+-        if (!$inString && $char === '/' && $next === '*') {
+-            $end = strpos($sql, '*/', $i);
+-            $i   = $end === false ? $length : $end + 1;
+-            continue;
+-        }
+-
+-        // Entrée / sortie de chaîne
+-        if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
+-            if (!$inString) {
+-                $inString  = true;
+-                $quoteChar = $char;
+-            } elseif ($char === $quoteChar) {
+-                // '' à l'intérieur d'une chaîne = apostrophe échappée
+-                if ($next === $quoteChar) {
+-                    $current .= $char . $next;
+-                    $i++;
+-                    continue;
+-                }
+-                $inString = false;
+-            }
+-        }
+-
+-        if ($char === ';' && !$inString) {
+-            $statement = trim($current);
+-
+-            if ($statement !== '') {
+-                $statements[] = $statement;
+-            }
+-
+-            $current = '';
+-            continue;
+-        }
+-
+-        $current .= $char;
+-    }
+-
+-    $statement = trim($current);
+-
+-    if ($statement !== '') {
+-        $statements[] = $statement;
+-    }
+-
+-    return $statements;
+-}
+ 
+ /** Demande une valeur à l'utilisateur, avec valeur par défaut. */
+ function prompt(string $label, string $default = ''): string
+diff --git a/database/migrate.php b/database/migrate.php
+index dd63032..470e500 100644
+--- a/database/migrate.php
++++ b/database/migrate.php
+@@ -5,15 +5,19 @@
+  *   php database/migrate.php            Applique les migrations en attente
+  *   php database/migrate.php --status   Liste sans rien exécuter
+  *   php database/migrate.php --seed     Applique aussi les seeds non joués
++ *   php database/migrate.php --baseline Marque les fichiers comme appliqués
++ *                                       SANS les exécuter
+  *
+- * Chaque fichier de database/migrations/ n'est exécuté qu'une seule
+- * fois : la table schema_migrations garde la trace de ce qui a été
+- * appliqué, avec la date et une empreinte du contenu.
++ * Chaque fichier n'est exécuté qu'une seule fois : la table
++ * schema_migrations garde la trace de ce qui a été appliqué, avec la
++ * date et une empreinte du contenu.
+  *
+  * L'empreinte sert d'alerte : si un fichier déjà appliqué est modifié
+  * après coup, le script le signale. En équipe, modifier une migration
+  * déjà jouée chez un collègue produit deux bases divergentes — mieux
+  * vaut écrire une nouvelle migration.
++ *
++ * La logique d'exécution vit dans runner.php, partagée avec install.php.
+  */
+ 
+ declare(strict_types=1);
+@@ -28,6 +32,7 @@ define('APP_PATH', BASE_PATH . '/app');
+ 
+ require APP_PATH . '/core/helpers.php';
+ require APP_PATH . '/core/logger.php';
++require __DIR__ . '/runner.php';
+ 
+ $options    = getopt('', ['status', 'seed', 'baseline', 'help']);
+ $statusOnly = isset($options['status']);
+@@ -74,61 +79,45 @@ try {
+     exit(1);
+ }
+ 
+-// ---------------------------------------------------------------------
+-// Registre des migrations
+-// ---------------------------------------------------------------------
+-$pdo->exec(
+-    'CREATE TABLE IF NOT EXISTS schema_migrations (
+-        id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+-        filename    VARCHAR(190) NOT NULL,
+-        checksum    CHAR(64)     NOT NULL,
+-        kind        ENUM(\'migration\', \'seed\') NOT NULL DEFAULT \'migration\',
+-        statements  SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+-        applied_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+-        PRIMARY KEY (id),
+-        UNIQUE KEY uq_migration_file (filename)
+-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
+-);
+-
+-$applied = [];
+-
+-foreach ($pdo->query('SELECT filename, checksum, applied_at FROM schema_migrations') as $row) {
+-    $applied[$row['filename']] = $row;
+-}
++echo "\n  Migrations — base « " . config('database.name') . " »\n";
++echo "  ──────────────────────────────────────────────────────\n";
+ 
+ // ---------------------------------------------------------------------
+-// Fichiers candidats
++// Registre et reprise des bases antérieures
+ // ---------------------------------------------------------------------
+-$files = [];
++runner_ledger_ensure($pdo);
+ 
+-foreach (glob(__DIR__ . '/migrations/*.sql') ?: [] as $path) {
+-    $files[] = ['path' => $path, 'name' => basename($path), 'kind' => 'migration'];
+-}
++$catalog = runner_catalog();
++$adopted = runner_autobaseline($pdo, $catalog, runner_applied($pdo));
+ 
+-if ($withSeeds) {
+-    foreach (glob(__DIR__ . '/seeds/*.sql') ?: [] as $path) {
+-        $files[] = ['path' => $path, 'name' => 'seeds/' . basename($path), 'kind' => 'seed'];
+-    }
++foreach ($adopted as $name) {
++    printf("  ≡ %-52s déjà en place, enregistré\n", $name);
+ }
+ 
+-usort($files, static fn (array $a, array $b): int => strcmp($a['name'], $b['name']));
+-
+-echo "\n  Migrations — base « " . config('database.name') . " »\n";
+-echo "  ──────────────────────────────────────────────────────\n";
+-
+-if ($files === []) {
+-    echo "  Aucun fichier trouvé.\n\n";
+-    exit(0);
++if ($adopted !== []) {
++    echo "\n";
+ }
+ 
++$applied = runner_applied($pdo);
++
++// ---------------------------------------------------------------------
++// État des fichiers
++// ---------------------------------------------------------------------
+ $pending  = [];
+ $modified = [];
+ 
+-foreach ($files as $file) {
++foreach ($catalog as $file) {
++    if ($file['kind'] === 'seed' && !$withSeeds) {
++        continue;
++    }
++
++    if (!is_file($file['path'])) {
++        continue;
++    }
++
+     $checksum = hash_file('sha256', $file['path']);
+-    $isKnown  = isset($applied[$file['name']]);
+ 
+-    if (!$isKnown) {
++    if (!isset($applied[$file['name']])) {
+         $pending[] = $file + ['checksum' => $checksum];
+         printf("  ○ %-52s en attente\n", $file['name']);
+         continue;
+@@ -155,7 +144,7 @@ if ($modified !== []) {
+ }
+ 
+ if ($statusOnly) {
+-    echo "\n  " . count($pending) . " migration(s) en attente.\n\n";
++    echo "\n  " . count($pending) . " fichier(s) en attente.\n\n";
+     exit(0);
+ }
+ 
+@@ -177,17 +166,8 @@ if ($baseline) {
+         exit(1);
+     }
+ 
+-    $statement = $pdo->prepare(
+-        'INSERT INTO schema_migrations (filename, checksum, kind, statements)
+-         VALUES (:filename, :checksum, :kind, 0)'
+-    );
+-
+     foreach ($pending as $file) {
+-        $statement->execute([
+-            'filename' => $file['name'],
+-            'checksum' => $file['checksum'],
+-            'kind'     => $file['kind'],
+-        ]);
++        runner_record($pdo, $file['name'], $file['checksum'], $file['kind'], 0);
+         printf("  ✓ %-52s marqué appliqué\n", $file['name']);
+     }
+ 
+@@ -201,110 +181,16 @@ if ($baseline) {
+ echo "\n  Application de " . count($pending) . " fichier(s)…\n\n";
+ 
+ foreach ($pending as $file) {
+-    $statements = sql_split((string) file_get_contents($file['path']));
+-    $executed   = 0;
+-
+-    // Chaque fichier est appliqué dans sa propre transaction lorsque
+-    // c'est possible. MySQL valide implicitement les CREATE TABLE et
+-    // ALTER TABLE : la transaction ne protège donc pas un fichier de
+-    // schéma, d'où l'arrêt immédiat à la première erreur, pour ne pas
+-    // enchaîner sur une base à moitié migrée.
+     try {
+-        foreach ($statements as $statement) {
+-            $pdo->exec($statement);
+-            $executed++;
+-        }
+-    } catch (PDOException $e) {
+-        fwrite(STDERR, "  ✗ {$file['name']} — instruction " . ($executed + 1) . "\n");
+-        fwrite(STDERR, "    {$e->getMessage()}\n");
+-        fwrite(STDERR, "    " . substr(preg_replace('/\s+/', ' ', $statement) ?? '', 0, 160) . "…\n\n");
++        $executed = runner_apply($pdo, $file);
++    } catch (RuntimeException $e) {
++        fwrite(STDERR, "  ✗ {$e->getMessage()}\n\n");
+         fwrite(STDERR, "  Migration interrompue. Corrigez le fichier puis relancez.\n\n");
+         exit(1);
+     }
+ 
+-    $pdo->prepare(
+-        'INSERT INTO schema_migrations (filename, checksum, kind, statements)
+-         VALUES (:filename, :checksum, :kind, :statements)'
+-    )->execute([
+-        'filename'   => $file['name'],
+-        'checksum'   => $file['checksum'],
+-        'kind'       => $file['kind'],
+-        'statements' => $executed,
+-    ]);
+-
+     printf("  ✓ %-52s %3d instructions\n", $file['name'], $executed);
+ }
+ 
+ echo "\n  Terminé.\n\n";
+ exit(0);
+-
+-// =====================================================================
+-
+-/**
+- * Découpe un fichier SQL en instructions, en respectant les chaînes
+- * littérales et les commentaires.
+- *
+- * @return string[]
+- */
+-function sql_split(string $sql): array
+-{
+-    $statements = [];
+-    $current    = '';
+-    $inString   = false;
+-    $quoteChar  = '';
+-    $length     = strlen($sql);
+-
+-    for ($i = 0; $i < $length; $i++) {
+-        $char = $sql[$i];
+-        $next = $sql[$i + 1] ?? '';
+-
+-        if (!$inString && (($char === '-' && $next === '-') || $char === '#')) {
+-            while ($i < $length && $sql[$i] !== "\n") {
+-                $i++;
+-            }
+-            $current .= "\n";
+-            continue;
+-        }
+-
+-        if (!$inString && $char === '/' && $next === '*') {
+-            $end = strpos($sql, '*/', $i);
+-            $i   = $end === false ? $length : $end + 1;
+-            continue;
+-        }
+-
+-        if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
+-            if (!$inString) {
+-                $inString  = true;
+-                $quoteChar = $char;
+-            } elseif ($char === $quoteChar) {
+-                if ($next === $quoteChar) {
+-                    $current .= $char . $next;
+-                    $i++;
+-                    continue;
+-                }
+-                $inString = false;
+-            }
+-        }
+-
+-        if ($char === ';' && !$inString) {
+-            $statement = trim($current);
+-
+-            if ($statement !== '') {
+-                $statements[] = $statement;
+-            }
+-
+-            $current = '';
+-            continue;
+-        }
+-
+-        $current .= $char;
+-    }
+-
+-    $statement = trim($current);
+-
+-    if ($statement !== '') {
+-        $statements[] = $statement;
+-    }
+-
+-    return $statements;
+-}
+diff --git a/database/seeds/003_referentiel_national.sql b/database/migrations/2026_09_13_001b_referentiel_national.sql
+similarity index 100%
+rename from database/seeds/003_referentiel_national.sql
+rename to database/migrations/2026_09_13_001b_referentiel_national.sql
+diff --git a/database/migrations/2026_09_13_004_perimetre_eleves.sql b/database/migrations/2026_09_13_004_perimetre_eleves.sql
+new file mode 100644
+index 0000000..ff7dc5f
+--- /dev/null
++++ b/database/migrations/2026_09_13_004_perimetre_eleves.sql
+@@ -0,0 +1,89 @@
++-- =====================================================================
++--  MIGRATION 004 — Périmètre de consultation du fichier élèves
++--
++--  Défaut corrigé
++--  --------------
++--  La permission « student.view » était accordée aux rôles ENSEIGNANT,
++--  PARENT et COMPTABLE, avec en commentaire l'intention d'un filtrage
++--  métier (« ses classes », « ses enfants »). Ce filtrage n'a jamais été
++--  écrit. Conséquence : tout titulaire d'un compte de l'école pouvait
++--  lire la totalité du fichier élèves — état civil des mineurs, adresse
++--  du domicile, téléphone et profession des parents.
++--
++--  Correction
++--  ----------
++--  « student.view » ne signifie plus « voir tous les élèves », mais
++--  « accéder au module élèves ». Le droit de voir TOUT l'établissement
++--  devient une permission distincte, stockée en base et donc
++--  réattribuable par école sans toucher au code :
++--
++--      student.view      → accéder au module, dans son périmètre
++--      student.view.all  → voir tous les élèves de l'établissement
++--
++--  Qui ne détient pas student.view.all ne voit que les élèves de son
++--  périmètre, calculé par students_scope_clause(). Aujourd'hui seul le
++--  périmètre « parent » est implémenté ; le périmètre « enseignant »
++--  arrivera avec la table teachers (phase 4). D'ici là un enseignant ne
++--  voit rien plutôt que tout : en sécurité, le défaut se ferme.
++-- =====================================================================
++
++SET NAMES utf8mb4;
++
++
++-- ---------------------------------------------------------------------
++--  1. Nouvelle permission
++-- ---------------------------------------------------------------------
++INSERT INTO permissions (code, module, name, description, is_platform, sort_order)
++VALUES (
++    'student.view.all',
++    'student',
++    'Consulter tous les élèves de l''établissement',
++    'Sans cette permission, l''utilisateur ne voit que les élèves de son périmètre : ses enfants pour un parent, ses classes pour un enseignant.',
++    0,
++    51
++)
++ON DUPLICATE KEY UPDATE name = VALUES(name), description = VALUES(description), sort_order = VALUES(sort_order);
++
++
++-- ---------------------------------------------------------------------
++--  2. Attribution aux rôles qui gèrent l'établissement entier
++--
++--  DIRECTION, PREFET, SECRETARIAT et SCHOOL_ADMIN travaillent par
++--  nature sur tout le fichier. COMPTABLE y figure aussi : le suivi des
++--  frais scolaires porte sur l'ensemble des élèves.
++--
++--  SUPER_ADMIN reçoit toutes les permissions par une requête distincte
++--  du seed 002 ; il est traité plus bas.
++-- ---------------------------------------------------------------------
++INSERT IGNORE INTO role_permissions (role_id, permission_id)
++SELECT r.id, p.id
++  FROM roles r
++  JOIN permissions p ON p.code = 'student.view.all'
++ WHERE r.school_id IS NULL
++   AND r.code IN ('SCHOOL_ADMIN', 'DIRECTION', 'PREFET', 'SECRETARIAT', 'COMPTABLE');
++
++
++-- ---------------------------------------------------------------------
++--  3. Le super administrateur détient toutes les permissions
++-- ---------------------------------------------------------------------
++INSERT IGNORE INTO role_permissions (role_id, permission_id)
++SELECT r.id, p.id
++  FROM roles r
++  JOIN permissions p ON p.code = 'student.view.all'
++ WHERE r.school_id IS NULL AND r.code = 'SUPER_ADMIN';
++
++
++-- ---------------------------------------------------------------------
++--  4. Rôles personnalisés déjà créés par des écoles
++--
++--  Une école ayant dupliqué un rôle administratif avant cette migration
++--  doit conserver le comportement qu'elle connaît : tout rôle détenant
++--  déjà le droit de créer ou modifier un élève gérait forcément le
++--  fichier entier.
++-- ---------------------------------------------------------------------
++INSERT IGNORE INTO role_permissions (role_id, permission_id)
++SELECT rp.role_id, p.id
++  FROM role_permissions rp
++  JOIN permissions source ON source.id = rp.permission_id AND source.code = 'student.create'
++  JOIN permissions p      ON p.code = 'student.view.all'
++  JOIN roles r            ON r.id = rp.role_id AND r.school_id IS NOT NULL;
+diff --git a/database/runner.php b/database/runner.php
+new file mode 100644
+index 0000000..7e1964b
+--- /dev/null
++++ b/database/runner.php
+@@ -0,0 +1,337 @@
++<?php
++/**
++ * Noyau commun d'application des fichiers SQL.
++ *
++ * Ce fichier est le SEUL endroit du projet qui exécute un fichier .sql.
++ * install.php et migrate.php s'appuient tous les deux dessus.
++ *
++ * Pourquoi : avant, chacun des deux scripts appliquait des fichiers de
++ * son côté, avec sa propre copie de sql_split(), et un seul des deux
++ * tenait un registre. Résultat : une base installée par install.php ne
++ * contenait pas le référentiel national (seed 003, jamais listé), et
++ * migrate.php --seed rejouait les seeds 001 et 002 jusqu'à l'erreur
++ * « Duplicate entry ». Un registre unique supprime la classe entière.
++ *
++ * Trois règles portées ici :
++ *
++ *  1. ORDRE — schéma, puis seeds, puis migrations. Un seul enchaînement
++ *     possible, et il découle des dépendances réelles :
++ *
++ *       schema.sql   crée les tables de base
++ *       seeds/*      remplissent CES tables — référentiel national,
++ *                    rôles et permissions du produit
++ *       migrations/* font évoluer structure ET données à partir de là
++ *
++ *     Un seed ne peut donc dépendre que de schema.sql. Tout fichier de
++ *     données qui dépend d'une migration est lui-même une migration :
++ *     c'est le cas du référentiel national RDC, qui remplit des tables
++ *     créées en phase 2 et vit dans migrations/ pour cette raison.
++ *
++ *     Cette règle n'est pas cosmétique. Rangée dans l'autre sens
++ *     (migrations avant seeds), la migration 004 attribuait une
++ *     permission à des rôles que le seed 002 n'avait pas encore créés :
++ *     elle s'appliquait sans erreur et sans effet.
++ *
++ *  2. TRANSACTION — un seed ne contient que des INSERT : il est appliqué
++ *     dans une transaction, donc tout ou rien. Une migration contient du
++ *     DDL, que MySQL valide implicitement : la transaction n'y protège
++ *     rien, on s'arrête à la première erreur pour ne pas enchaîner sur
++ *     une base à moitié migrée.
++ *
++ *  3. TÉMOIN — un fichier de base peut avoir été appliqué avant que ce
++ *     registre n'existe (installation manuelle par phpMyAdmin, base
++ *     antérieure à cet outil). Chaque fichier de base porte donc une
++ *     requête témoin qui PROUVE que son contenu est déjà en place. Si le
++ *     témoin répond oui, le fichier est enregistré sans être exécuté.
++ *     Un témoin ne supprime ni ne modifie jamais rien.
++ */
++
++declare(strict_types=1);
++
++/**
++ * Catalogue ordonné des fichiers applicables.
++ *
++ * @return array<int, array{path: string, name: string, kind: string, witness: ?string}>
++ */
++function runner_catalog(): array
++{
++    $directory = __DIR__;
++    $files     = [];
++
++    // 1. Schéma de base.
++    $files[] = [
++        'path'    => $directory . '/schema.sql',
++        'name'    => 'schema.sql',
++        'kind'    => 'migration',
++        'witness' => "SELECT COUNT(*) FROM information_schema.tables
++                       WHERE table_schema = DATABASE() AND table_name = 'schools'",
++    ];
++
++    // 2. Données de base, par ordre de nom de fichier.
++    $seeds = glob($directory . '/seeds/*.sql') ?: [];
++    sort($seeds, SORT_STRING);
++
++    foreach ($seeds as $path) {
++        $files[] = [
++            'path'    => $path,
++            'name'    => 'seeds/' . basename($path),
++            'kind'    => 'seed',
++            'witness' => runner_witness(basename($path)),
++        ];
++    }
++
++    // 3. Migrations, par ordre de nom de fichier (préfixe daté).
++    $migrations = glob($directory . '/migrations/*.sql') ?: [];
++    sort($migrations, SORT_STRING);
++
++    foreach ($migrations as $path) {
++        $files[] = [
++            'path'    => $path,
++            'name'    => basename($path),
++            'kind'    => 'migration',
++            'witness' => runner_witness(basename($path)),
++        ];
++    }
++
++    return $files;
++}
++
++/**
++ * Requête prouvant qu'un fichier livré avec le produit est déjà en place.
++ *
++ * Seuls les fichiers susceptibles d'avoir été appliqués hors registre
++ * en ont un : les données de base, importées à la main sur hébergement
++ * mutualisé, et le référentiel national, qui a changé d'emplacement.
++ *
++ * Un fichier écrit après coup n'a pas de témoin : il s'applique
++ * normalement, ce qui est le comportement attendu.
++ */
++function runner_witness(string $basename): ?string
++{
++    return match ($basename) {
++        '001_reference_data.sql'    => 'SELECT COUNT(*) FROM education_cycles',
++        '002_roles_permissions.sql' => 'SELECT COUNT(*) FROM permissions',
++
++        // Ce fichier s'appelait seeds/003_referentiel_national.sql. Sans
++        // ce témoin, les bases déjà installées le rejoueraient sous son
++        // nouveau nom et échoueraient sur « Duplicate entry ».
++        '2026_09_13_001b_referentiel_national.sql' => 'SELECT COUNT(*) FROM learning_domains',
++
++        default => null,
++    };
++}
++
++/** Crée le registre s'il n'existe pas encore. */
++function runner_ledger_ensure(PDO $pdo): void
++{
++    $pdo->exec(
++        'CREATE TABLE IF NOT EXISTS schema_migrations (
++            id          INT UNSIGNED NOT NULL AUTO_INCREMENT,
++            filename    VARCHAR(190) NOT NULL,
++            checksum    CHAR(64)     NOT NULL,
++            kind        ENUM(\'migration\', \'seed\') NOT NULL DEFAULT \'migration\',
++            statements  SMALLINT UNSIGNED NOT NULL DEFAULT 0,
++            applied_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
++            PRIMARY KEY (id),
++            UNIQUE KEY uq_migration_file (filename)
++        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci'
++    );
++}
++
++/**
++ * Contenu actuel du registre, indexé par nom de fichier.
++ *
++ * @return array<string, array{filename: string, checksum: string, applied_at: string}>
++ */
++function runner_applied(PDO $pdo): array
++{
++    $applied = [];
++
++    foreach ($pdo->query('SELECT filename, checksum, applied_at FROM schema_migrations') as $row) {
++        $applied[$row['filename']] = $row;
++    }
++
++    return $applied;
++}
++
++/**
++ * Enregistre un fichier dans le registre.
++ */
++function runner_record(PDO $pdo, string $name, string $checksum, string $kind, int $statements): void
++{
++    $pdo->prepare(
++        'INSERT INTO schema_migrations (filename, checksum, kind, statements)
++         VALUES (:filename, :checksum, :kind, :statements)'
++    )->execute([
++        'filename'   => $name,
++        'checksum'   => $checksum,
++        'kind'       => $kind,
++        'statements' => $statements,
++    ]);
++}
++
++/**
++ * Enregistre sans exécuter les fichiers dont le témoin prouve qu'ils
++ * sont déjà en place.
++ *
++ * @param  array<int, array{path: string, name: string, kind: string, witness: ?string}> $catalog
++ * @param  array<string, mixed>                                                          $applied
++ * @return string[]  Noms des fichiers auto-enregistrés.
++ */
++function runner_autobaseline(PDO $pdo, array $catalog, array $applied): array
++{
++    $recorded = [];
++
++    foreach ($catalog as $file) {
++        if (isset($applied[$file['name']]) || $file['witness'] === null || !is_file($file['path'])) {
++            continue;
++        }
++
++        try {
++            $present = (int) $pdo->query($file['witness'])->fetchColumn() > 0;
++        } catch (PDOException) {
++            // Table absente : le fichier n'a jamais été appliqué.
++            $present = false;
++        }
++
++        if (!$present) {
++            continue;
++        }
++
++        runner_record($pdo, $file['name'], hash_file('sha256', $file['path']), $file['kind'], 0);
++        $recorded[] = $file['name'];
++    }
++
++    return $recorded;
++}
++
++/**
++ * Applique un fichier et l'enregistre.
++ *
++ * Les seeds passent en transaction (INSERT seulement, donc réversible).
++ * Les migrations non : MySQL valide implicitement le DDL.
++ *
++ * @param  array{path: string, name: string, kind: string, witness: ?string} $file
++ * @return int Nombre d'instructions exécutées.
++ * @throws RuntimeException si une instruction échoue.
++ */
++function runner_apply(PDO $pdo, array $file): int
++{
++    if (!is_file($file['path'])) {
++        throw new RuntimeException("Fichier manquant : {$file['path']}");
++    }
++
++    $sql           = (string) file_get_contents($file['path']);
++    $statements    = sql_split($sql);
++    $executed      = 0;
++    $current       = '';
++
++    // La transaction est décidée par le CONTENU, pas par le dossier :
++    // un fichier de migration qui ne contient que des INSERT mérite
++    // d'être tout ou rien, et un seed contenant du DDL ne le peut pas.
++    $transactional = !preg_match(
++        '/\b(CREATE|ALTER|DROP|TRUNCATE|RENAME)\s+(TABLE|INDEX|DATABASE|VIEW|SCHEMA)\b/i',
++        $sql
++    );
++
++    if ($transactional) {
++        $pdo->beginTransaction();
++    }
++
++    try {
++        foreach ($statements as $statement) {
++            $current = $statement;
++            $pdo->exec($statement);
++            $executed++;
++        }
++    } catch (PDOException $e) {
++        if ($transactional && $pdo->inTransaction()) {
++            $pdo->rollBack();
++        }
++
++        throw new RuntimeException(sprintf(
++            "%s — instruction %d\n    %s\n    %s…",
++            $file['name'],
++            $executed + 1,
++            $e->getMessage(),
++            substr(preg_replace('/\s+/', ' ', $current) ?? '', 0, 160)
++        ), 0, $e);
++    }
++
++    if ($transactional) {
++        $pdo->commit();
++    }
++
++    runner_record($pdo, $file['name'], hash_file('sha256', $file['path']), $file['kind'], $executed);
++
++    return $executed;
++}
++
++/**
++ * Découpe un fichier SQL en instructions, en respectant les chaînes
++ * littérales et les commentaires.
++ *
++ * @return string[]
++ */
++function sql_split(string $sql): array
++{
++    $statements = [];
++    $current    = '';
++    $inString   = false;
++    $quoteChar  = '';
++    $length     = strlen($sql);
++
++    for ($i = 0; $i < $length; $i++) {
++        $char = $sql[$i];
++        $next = $sql[$i + 1] ?? '';
++
++        if (!$inString && (($char === '-' && $next === '-') || $char === '#')) {
++            while ($i < $length && $sql[$i] !== "\n") {
++                $i++;
++            }
++            $current .= "\n";
++            continue;
++        }
++
++        if (!$inString && $char === '/' && $next === '*') {
++            $end = strpos($sql, '*/', $i);
++            $i   = $end === false ? $length : $end + 1;
++            continue;
++        }
++
++        if (($char === "'" || $char === '"') && ($i === 0 || $sql[$i - 1] !== '\\')) {
++            if (!$inString) {
++                $inString  = true;
++                $quoteChar = $char;
++            } elseif ($char === $quoteChar) {
++                if ($next === $quoteChar) {
++                    $current .= $char . $next;
++                    $i++;
++                    continue;
++                }
++                $inString = false;
++            }
++        }
++
++        if ($char === ';' && !$inString) {
++            $statement = trim($current);
++
++            if ($statement !== '') {
++                $statements[] = $statement;
++            }
++
++            $current = '';
++            continue;
++        }
++
++        $current .= $char;
++    }
++
++    $statement = trim($current);
++
++    if ($statement !== '') {
++        $statements[] = $statement;
++    }
++
++    return $statements;
++}
+diff --git a/public/assets/js/app.js b/public/assets/js/app.js
+index bf72ace..6948e7b 100644
+--- a/public/assets/js/app.js
++++ b/public/assets/js/app.js
+@@ -97,6 +97,41 @@
+         });
+     }
+ 
++    /* =================================================================
++       Soumission automatique d'un filtre
++       Usage : <select name="annee" data-auto-submit>
++
++       Ces sélecteurs portaient un onchange="this.form.submit()" écrit
++       directement dans le HTML. La politique de sécurité du contenu
++       (script-src 'self' 'nonce-…', sans unsafe-inline) interdit les
++       gestionnaires en attribut : le code n'était JAMAIS exécuté, et
++       comme ces formulaires n'ont pas de bouton d'envoi, changer
++       d'année scolaire était tout simplement impossible.
++
++       Le comportement vit donc ici, dans un fichier servi par le site
++       et chargé avec le nonce. Un bouton de secours est ajouté pour les
++       navigateurs sans JavaScript.
++       ================================================================= */
++
++    function initAutoSubmit() {
++        document.querySelectorAll('[data-auto-submit]').forEach((element) => {
++            const form = element.form;
++
++            if (!form) {
++                return;
++            }
++
++            element.addEventListener('change', () => form.submit());
++
++            // Sans JavaScript, le bouton reste visible et fonctionnel.
++            const fallback = form.querySelector('[data-auto-submit-fallback]');
++
++            if (fallback) {
++                fallback.hidden = true;
++            }
++        });
++    }
++
+     /* =================================================================
+        Confirmation avant action destructive
+        Usage : <button data-confirm="Supprimer cet élève ?">
+@@ -240,6 +275,7 @@
+     document.addEventListener('DOMContentLoaded', function () {
+         initSidebar();
+         initPasswordToggles();
++        initAutoSubmit();
+         initConfirmations();
+         initSubmitGuard();
+         initNetworkStatus();
+diff --git a/tests/students_isolation.php b/tests/students_isolation.php
+index 988390a..96be5d4 100644
+--- a/tests/students_isolation.php
++++ b/tests/students_isolation.php
+@@ -20,6 +20,63 @@ function check(string $label, bool $ok, string $detail = ''): void
+     printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
+ }
+ 
++/**
++ * Ouvre une session de test au nom d'un utilisateur portant un rôle système.
++ *
++ * Les tests s'exécutaient jusqu'ici sans aucun utilisateur connecté :
++ * perm_all() renvoyait un tableau vide et la couche de permissions
++ * n'était donc jamais réellement traversée. Tout contrôle ajouté dans
++ * les services passait inaperçu.
++ *
++ * @return int Identifiant de l'utilisateur créé.
++ */
++function act_as(int $schoolId, string $roleCode): int
++{
++    static $counter = 0;
++    $counter++;
++
++    $userId = db_insert('users', [
++        'uuid'          => str_uuid(),
++        'school_id'     => $schoolId,
++        'username'      => 'test.' . strtolower($roleCode) . '.' . $counter,
++        'email'         => 'test' . $counter . '@example.test',
++        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
++        'last_name'     => 'TEST',
++        'first_name'    => ucfirst(strtolower($roleCode)),
++        'status'        => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO user_roles (user_id, role_id)
++         SELECT :user_id, id FROM roles WHERE code = :code AND school_id IS NULL',
++        ['user_id' => $userId, 'code' => $roleCode],
++        true
++    );
++
++    $_SESSION['user_id']  = $userId;
++    $_SESSION['school_id'] = $schoolId;
++
++    // Les caches statiques sont remplis une fois par requête : sans
++    // rafraîchissement, le test conserverait les droits du rôle précédent.
++    // auth_user() met son résultat en cache statique : sans
++    // rafraîchissement, auth_id() renverrait l'utilisateur précédent et
++    // le périmètre serait calculé pour la mauvaise personne.
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++
++    return $userId;
++}
++
++/** Referme la session de test. */
++function act_as_nobody(): void
++{
++    unset($_SESSION['user_id'], $_SESSION['school_id']);
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++}
++
+ /** Prépare une école complète : cycles, année, référentiel, programme, classe. */
+ function build_school(string $code, string $name): array
+ {
+@@ -141,6 +198,7 @@ check('École A voit bien son élève', students_repo_find($studentA) !== null);
+ // en premier et le test validerait pour la mauvaise raison.
+ $enrollmentA = students_repo_enrollment($studentA, $a['year_id']);
+ $crossClassroom = students_service_assign_classroom(
++    $studentA,
+     (int) $enrollmentA['id'],
+     $b['classroom_id']
+ );
+@@ -272,8 +330,22 @@ check(
+     implode(', ', array_unique($types))
+ );
+ 
++// Séparation des devoirs : clôturer un dossier n'est pas le modifier.
++act_as($a['school_id'], 'SECRETARIAT');
++tenant_set($a['school_id']);
++
++$refused = students_service_change_status($studentA, 'archived', 'Tentative');
++check(
++    'Le secrétariat ne peut pas archiver un dossier',
++    !$refused['ok'] && str_contains($refused['message'], 'droit'),
++    $refused['message']
++);
++
++act_as($a['school_id'], 'DIRECTION');
++tenant_set($a['school_id']);
++
+ $graduated = students_service_change_status($studentA, 'graduated', 'Fin du cycle secondaire');
+-check('Changement de statut : fin des études', $graduated['ok']);
++check('La direction clôture le dossier : fin des études', $graduated['ok'], $graduated['message']);
+ 
+ $student = students_repo_find($studentA);
+ check('Le dossier est conservé, pas supprimé', $student !== null && $student['status'] === 'graduated');
+diff --git a/tests/students_perimetre.php b/tests/students_perimetre.php
+new file mode 100644
+index 0000000..2baca69
+--- /dev/null
++++ b/tests/students_perimetre.php
+@@ -0,0 +1,404 @@
++<?php
++/**
++ * Phase 3 — périmètre de consultation du fichier élèves.
++ *
++ * Ce que ces tests protègent
++ * --------------------------
++ * La permission « student.view » était accordée aux rôles ENSEIGNANT et
++ * PARENT, avec l'intention — écrite en commentaire, jamais codée — de
++ * restreindre la lecture à leurs classes ou à leurs enfants. Faute de
++ * cette couche, tout titulaire d'un compte lisait l'intégralité du
++ * fichier : état civil de mineurs, adresses, téléphones des parents.
++ *
++ * Un test qui vérifie qu'un parent voit ses enfants ne prouve rien.
++ * Ce qu'il faut prouver, c'est qu'il ne voit PAS les autres — par la
++ * liste, par la recherche, et par accès direct à l'identifiant.
++ *
++ * Usage : php tests/students_perimetre.php
++ */
++declare(strict_types=1);
++
++require dirname(__DIR__) . '/app/bootstrap.php';
++require APP_PATH . '/modules/curriculum/services.php';
++require APP_PATH . '/modules/students/services.php';
++
++$pass = 0;
++$fail = 0;
++
++function check(string $label, bool $ok, string $detail = ''): void
++{
++    global $pass, $fail;
++    $ok ? $pass++ : $fail++;
++    printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
++}
++
++/** Ouvre une session de test au nom d'un utilisateur portant un rôle système. */
++function act_as(int $schoolId, string $roleCode): int
++{
++    static $counter = 0;
++    $counter++;
++
++    $userId = db_insert('users', [
++        'uuid'          => str_uuid(),
++        'school_id'     => $schoolId,
++        'username'      => 'perim.' . strtolower($roleCode) . '.' . $counter,
++        'email'         => 'perim' . $counter . '@example.test',
++        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
++        'last_name'     => 'TEST',
++        'first_name'    => ucfirst(strtolower($roleCode)),
++        'status'        => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO user_roles (user_id, role_id)
++         SELECT :user_id, id FROM roles WHERE code = :code AND school_id IS NULL',
++        ['user_id' => $userId, 'code' => $roleCode],
++        true
++    );
++
++    $_SESSION['user_id']   = $userId;
++    $_SESSION['school_id'] = $schoolId;
++
++    // auth_user() met son résultat en cache statique : sans
++    // rafraîchissement, auth_id() renverrait l'utilisateur précédent et
++    // le périmètre serait calculé pour la mauvaise personne.
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++
++    return $userId;
++}
++
++/** École minimale : année, référentiel, programme activé, classe. */
++function build_school(string $code, string $name, int $capacity = 30): array
++{
++    $schoolId = db_insert('schools', [
++        'uuid' => str_uuid(), 'code' => $code, 'slug' => strtolower($code),
++        'name' => $name, 'status' => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO school_cycles (school_id, cycle_id, is_active)
++         SELECT :school_id, id, 1 FROM education_cycles',
++        ['school_id' => $schoolId]
++    );
++
++    tenant_set($schoolId);
++
++    $yearId = tenant_insert('academic_years', [
++        'code' => '2060-2061', 'name' => 'Test périmètre', 'starts_on' => '2060-09-01',
++        'ends_on' => '2061-07-31', 'status' => 'active', 'is_current' => 1,
++    ]);
++
++    curriculum_service_import_national();
++    curriculum_service_create_standard_periods($yearId);
++
++    $levelId = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_5'", [], true);
++    $program = curriculum_service_create_program($yearId, $levelId, null, null);
++    curriculum_service_fill_program((int) $program['id']);
++    curriculum_service_activate((int) $program['id']);
++
++    $classroomId = tenant_insert('classrooms', [
++        'academic_year_id' => $yearId,
++        'curriculum_id'    => (int) $program['id'],
++        'code'             => '5A',
++        'name'             => '5ème primaire A',
++        'capacity'         => $capacity,
++    ]);
++
++    return ['school_id' => $schoolId, 'year_id' => $yearId, 'classroom_id' => $classroomId];
++}
++
++echo "\n  PÉRIMÈTRE DE CONSULTATION DU FICHIER ÉLÈVES\n";
++echo "  ──────────────────────────────────────────────────────\n\n";
++
++$createdSchools = [];
++
++try {
++    // -----------------------------------------------------------------
++    //  Mise en place
++    // -----------------------------------------------------------------
++    $school = build_school('PERIM-A', 'École Périmètre');
++    $createdSchools[] = $school['school_id'];
++
++    act_as($school['school_id'], 'SECRETARIAT');
++    tenant_set($school['school_id']);
++
++    $enfant = students_service_enroll_new([
++        'last_name' => 'KABILA', 'first_name' => 'Grace', 'gender' => 'F',
++    ], $school['year_id'], $school['classroom_id']);
++
++    $autre = students_service_enroll_new([
++        'last_name' => 'MUKENDI', 'first_name' => 'Joseph', 'gender' => 'M',
++    ], $school['year_id'], $school['classroom_id']);
++
++    check('Deux élèves inscrits', $enfant['ok'] && $autre['ok'], $enfant['message'] . $autre['message']);
++
++    $enfantId = (int) $enfant['id'];
++    $autreId  = (int) $autre['id'];
++
++    // Rattachement du tuteur à l'enfant.
++    $attach = students_service_attach_guardian($enfantId, [
++        'last_name'    => 'KABILA', 'first_name' => 'Marie', 'gender' => 'F',
++        'phone'        => '+243810000001', 'relationship' => 'mere',
++    ]);
++
++    check('Tuteur rattaché au premier élève', $attach['ok'], $attach['message']);
++
++    // -----------------------------------------------------------------
++    //  1. Le personnel administratif voit tout l'établissement
++    // -----------------------------------------------------------------
++    $result = students_repo_search([], $school['year_id']);
++    check(
++        'SECRETARIAT (student.view.all) voit les deux élèves',
++        $result['total'] === 2,
++        $result['total'] . ' trouvé(s)'
++    );
++
++    check('SECRETARIAT peut ouvrir chaque fiche',
++        students_can_view($enfantId) && students_can_view($autreId));
++
++    // -----------------------------------------------------------------
++    //  2. Le parent ne voit QUE son enfant
++    // -----------------------------------------------------------------
++    $parentUserId = act_as($school['school_id'], 'PARENT');
++    tenant_set($school['school_id']);
++
++    // Le compte parent est relié à la fiche tuteur.
++    tenant_update('guardians', ['user_id' => $parentUserId],
++        'id = :id', ['id' => (int) $attach['guardian_id']]);
++
++    check('Le parent ne détient pas student.view.all', !perm_has('student.view.all'));
++
++    $result = students_repo_search([], $school['year_id']);
++    check(
++        'Le parent ne voit qu\'un seul élève dans la liste',
++        $result['total'] === 1,
++        $result['total'] . ' trouvé(s)'
++    );
++
++    check(
++        'L\'élève listé est bien son enfant',
++        $result['total'] === 1 && (int) $result['rows'][0]['id'] === $enfantId
++    );
++
++    check('Le parent peut ouvrir la fiche de son enfant', students_can_view($enfantId));
++
++    check(
++        'ACCÈS DIRECT à la fiche d\'un autre élève : refusé',
++        !students_can_view($autreId)
++    );
++
++    // La recherche ne doit pas être une porte dérobée.
++    $search = students_repo_search(['q' => 'MUKENDI'], $school['year_id']);
++    check(
++        'La RECHERCHE ne contourne pas le périmètre',
++        $search['total'] === 0,
++        $search['total'] . ' trouvé(s)'
++    );
++
++    // Ni les filtres.
++    $filtered = students_repo_search(
++        ['classroom_id' => $school['classroom_id']],
++        $school['year_id']
++    );
++    check(
++        'Le FILTRE PAR CLASSE ne contourne pas le périmètre',
++        $filtered['total'] === 1,
++        $filtered['total'] . ' trouvé(s)'
++    );
++
++    // -----------------------------------------------------------------
++    //  3. L'enseignant : refus par défaut tant que la phase 4 n'existe pas
++    // -----------------------------------------------------------------
++    act_as($school['school_id'], 'ENSEIGNANT');
++    tenant_set($school['school_id']);
++
++    $result = students_repo_search([], $school['year_id']);
++    check(
++        'ENSEIGNANT sans périmètre défini : aucun élève (le défaut se ferme)',
++        $result['total'] === 0,
++        $result['total'] . ' trouvé(s)'
++    );
++
++    check('ENSEIGNANT ne peut ouvrir aucune fiche',
++        !students_can_view($enfantId) && !students_can_view($autreId));
++
++    // -----------------------------------------------------------------
++    //  4. Jokers LIKE échappés
++    // -----------------------------------------------------------------
++    act_as($school['school_id'], 'SECRETARIAT');
++    tenant_set($school['school_id']);
++
++    $wildcard = students_repo_search(['q' => '%'], $school['year_id']);
++    check(
++        'Un « % » saisi ne ramène pas tout le fichier',
++        $wildcard['total'] === 0,
++        $wildcard['total'] . ' trouvé(s)'
++    );
++
++    $underscore = students_repo_search(['q' => '_ABILA'], $school['year_id']);
++    check(
++        'Un « _ » saisi ne joue pas le rôle de joker',
++        $underscore['total'] === 0,
++        $underscore['total'] . ' trouvé(s)'
++    );
++
++    // -----------------------------------------------------------------
++    //  5. Affectation : l'inscription doit appartenir à l'élève de l'URL
++    // -----------------------------------------------------------------
++    $enrollmentAutre = students_repo_enrollment($autreId, $school['year_id']);
++
++    $idor = students_service_assign_classroom(
++        $enfantId,                        // élève affiché
++        (int) $enrollmentAutre['id'],     // inscription d'un CAMARADE
++        $school['classroom_id']
++    );
++
++    check(
++        'Affectation avec l\'inscription d\'un autre élève : refusée',
++        !$idor['ok'] && str_contains($idor['message'], 'introuvable pour cet élève'),
++        $idor['message']
++    );
++
++    $legit = students_service_assign_classroom(
++        $autreId,
++        (int) $enrollmentAutre['id'],
++        $school['classroom_id']
++    );
++    check('Affectation avec le bon élève : acceptée', $legit['ok'], $legit['message']);
++
++    // -----------------------------------------------------------------
++    //  6. Année clôturée : plus aucune écriture
++    // -----------------------------------------------------------------
++    tenant_update('academic_years', ['status' => 'closed'],
++        'id = :id', ['id' => $school['year_id']]);
++
++    $closed = students_service_assign_classroom(
++        $autreId,
++        (int) $enrollmentAutre['id'],
++        $school['classroom_id']
++    );
++    check(
++        'Affectation dans une année clôturée : refusée',
++        !$closed['ok'] && str_contains($closed['message'], 'clôturée'),
++        $closed['message']
++    );
++
++    $closedOrient = students_service_orient(
++        $autreId, $school['year_id'], 1, 1
++    );
++    check(
++        'Orientation dans une année clôturée : refusée',
++        !$closedOrient['ok'] && str_contains($closedOrient['message'], 'clôturée'),
++        $closedOrient['message']
++    );
++
++    tenant_update('academic_years', ['status' => 'active'],
++        'id = :id', ['id' => $school['year_id']]);
++
++    // -----------------------------------------------------------------
++    //  7. Inscription annulée : pas de résurrection par l'affectation
++    // -----------------------------------------------------------------
++    tenant_update('enrollments', ['status' => 'cancelled'],
++        'id = :id', ['id' => (int) $enrollmentAutre['id']]);
++
++    $resurrect = students_service_assign_classroom(
++        $autreId,
++        (int) $enrollmentAutre['id'],
++        $school['classroom_id']
++    );
++    check(
++        'Une inscription ANNULÉE n\'est pas réactivée par une affectation',
++        !$resurrect['ok'] && str_contains($resurrect['message'], 'annulée'),
++        $resurrect['message']
++    );
++
++    $state = tenant_find('enrollments', (int) $enrollmentAutre['id']);
++    check(
++        'Le statut « annulée » est resté intact',
++        $state !== null && $state['status'] === 'cancelled',
++        (string) ($state['status'] ?? 'introuvable')
++    );
++
++    tenant_update('enrollments', ['status' => 'enrolled'],
++        'id = :id', ['id' => (int) $enrollmentAutre['id']]);
++
++    // -----------------------------------------------------------------
++    //  8. Tuteurs : téléphone du foyer partagé par deux parents
++    // -----------------------------------------------------------------
++    $pere = students_service_attach_guardian($enfantId, [
++        'last_name'    => 'KABILA', 'first_name' => 'Joseph', 'gender' => 'M',
++        'phone'        => '+243810000001', // MÊME numéro que la mère
++        'relationship' => 'pere',
++    ]);
++
++    check(
++        'Même téléphone, autre nom : une NOUVELLE fiche tuteur est créée',
++        $pere['ok'] && $pere['created'] === true,
++        $pere['message']
++    );
++
++    check(
++        'Le père n\'a pas été confondu avec la mère',
++        $pere['ok'] && (int) $pere['guardian_id'] !== (int) $attach['guardian_id']
++    );
++
++    // Fratrie : même parent, même nom, même téléphone → fiche réutilisée.
++    $frere = students_service_enroll_new([
++        'last_name' => 'KABILA', 'first_name' => 'Emmanuel', 'gender' => 'M',
++    ], $school['year_id'], $school['classroom_id']);
++
++    $memeMere = students_service_attach_guardian((int) $frere['id'], [
++        'last_name'    => 'KABILA', 'first_name' => 'Marie', 'gender' => 'F',
++        'phone'        => '+243810000001',
++        'relationship' => 'mere',
++    ]);
++
++    check(
++        'Fratrie : la fiche de la mère est réutilisée, pas dupliquée',
++        $memeMere['ok'] && $memeMere['created'] === false
++            && (int) $memeMere['guardian_id'] === (int) $attach['guardian_id'],
++        $memeMere['message']
++    );
++
++    // -----------------------------------------------------------------
++    //  9. Dossier supprimé : plus consultable par son identifiant
++    // -----------------------------------------------------------------
++    tenant_update('students', ['deleted_at' => date('Y-m-d H:i:s')],
++        'id = :id', ['id' => (int) $frere['id']]);
++
++    check(
++        'Un dossier supprimé n\'est plus accessible par son identifiant',
++        students_repo_find((int) $frere['id']) === null
++    );
++} finally {
++    // -----------------------------------------------------------------
++    //  Nettoyage
++    // -----------------------------------------------------------------
++    unset($_SESSION['user_id'], $_SESSION['school_id']);
++
++    foreach ($createdSchools as $schoolId) {
++        tenant_set($schoolId);
++
++        foreach ([
++            'student_history', 'orientations', 'student_guardians', 'enrollments',
++            'guardians', 'students', 'student_counters', 'classrooms',
++            'curriculum_subjects', 'curriculums', 'grade_periods', 'subjects',
++            'options', 'sections', 'academic_years', 'audit_logs',
++        ] as $table) {
++            db_query("DELETE FROM {$table} WHERE school_id = :school_id", ['school_id' => $schoolId]);
++        }
++
++        db_query('DELETE FROM user_roles WHERE user_id IN (SELECT id FROM users WHERE school_id = :s)',
++            ['s' => $schoolId], true);
++        db_query('DELETE FROM users WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM school_cycles WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM schools WHERE id = :s', ['s' => $schoolId], true);
++    }
++}
++
++echo "\n  ──────────────────────────────────────────────────\n";
++printf("  %d test(s) réussi(s), %d échec(s)\n\n", $pass, $fail);
++
++exit($fail === 0 ? 0 : 1);
+-- 
+2.43.0
+

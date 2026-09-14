@@ -1,0 +1,2395 @@
+From d67b70a1de64beecc74eff9a46d404359ec6d83f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 00:46:23 +0000
+Subject: [PATCH 5/5] =?UTF-8?q?Phase=204B=20:=20notes=20=E2=80=94=20autori?=
+ =?UTF-8?q?sation=20en=20deux=20temps,=20maxima=20fig=C3=A9s,=20verrouilla?=
+ =?UTF-8?q?ge?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Base de données (migration 007)
+- grades : la cote d'un élève, dans une branche, pour une période.
+  UNIQUE (school_id, enrollment_id, curriculum_subject_id, grade_period_id)
+  rend l'écriture idempotente : INSERT ... ON DUPLICATE KEY UPDATE, sans
+  lecture préalable, donc sans fenêtre de concurrence.
+- La cote est rattachée à l'INSCRIPTION, pas à l'élève : une inscription
+  porte l'élève, l'année et la classe — exactement le périmètre d'un
+  bulletin. Un élève transféré de 5A en 5B en janvier conserve ses cotes.
+- grade_periods gagne locked_at et locked_by : le verrou fige un
+  trimestre entier, c'est un acte de direction, il doit être attribuable.
+
+LA DÉCISION CENTRALE : grades.max_points est FIGÉ à la saisie
+Il n'est jamais recalculé. Sans cela, corriger en mars le maximum de
+mathématiques de 40 à 20 transformerait toutes les cotes déjà posées —
+32/40 devient 32/20 — et les bulletins du premier trimestre, déjà remis
+aux parents, ne seraient plus reproductibles. Même principe que les
+libellés figés des orientations en phase 3 : un document scolaire porte
+les termes en vigueur au moment où il a été établi.
+La clause ON DUPLICATE KEY UPDATE ne touche pas max_points : une cote
+déjà posée conserve son barème d'origine même lors d'une correction.
+
+Autorisation en deux temps
+« grade.enter » dit qu'on a le droit de saisir des notes, pas
+lesquelles. teachers_can_teach() dit dans quelle classe et quelle
+branche. Aucune saisie sans les deux. « grade.validate » ouvre
+l'établissement entier — direction et préfet, pour remplacer un
+enseignant absent.
+
+Autres règles tenues
+- Une absence n'est pas un zéro : colonne distincte, points à NULL.
+  Les confondre fausserait la moyenne et priverait le conseil de classe
+  d'une information dont il a besoin.
+- Décimales conservées en base, arrondi à l'affichage seulement : la
+  cote d'une période est souvent la moyenne d'interrogations et vaut
+  12,5. On stocke ce qui est vrai, on affiche ce qui est réglementaire.
+- Une saisie partiellement fautive enregistre les cotes valides et
+  signale les autres nommément : un rejet global ferait perdre quarante
+  lignes pour une faute de frappe.
+- Liste blanche des inscriptions : un identifiant forgé dans l'envoi ne
+  peut pas noter l'élève d'une autre classe.
+- Période verrouillée : refus, sauf « grade.edit_locked », et chaque
+  exception est journalisée comme telle.
+
+Dette de la phase 4A refermée
+teachers_service_unassign() refuse désormais le retrait d'une
+affectation si des cotes existent — sauf pour la direction. L'auteur
+d'une note doit rester identifiable.
+
+Défaut évité de justesse
+Le champ de cote est désactivé quand « Absent » est coché ; or un champ
+disabled n'est PAS transmis. N'itérer que sur points[] aurait perdu
+exactement les élèves absents. Les deux tableaux sont fusionnés.
+
+Tests : 194 au vert (17 + 25 + 35 + 25 + 51 + 41).
+Vérifié au navigateur : saisie de 4 cotes par un enseignant, dont une
+absence et une décimale ; lecture seule sur une branche non confiée ;
+envoi forgé sur cette branche refusé côté serveur, zéro cote créée.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+---
+ app/config/routes.php                         |  19 +
+ app/modules/grades/controllers.php            | 282 ++++++++
+ app/modules/grades/repositories.php           | 208 ++++++
+ app/modules/grades/services.php               | 366 +++++++++++
+ app/modules/teachers/services.php             |  24 +
+ app/views/grades/classroom.php                | 153 +++++
+ app/views/grades/index.php                    | 214 ++++++
+ app/views/grades/sheet.php                    | 158 +++++
+ .../2026_09_13_007_phase4b_notes.sql          | 141 ++++
+ public/assets/js/app.js                       |  36 ++
+ tests/grades_isolation.php                    | 611 ++++++++++++++++++
+ 11 files changed, 2212 insertions(+)
+ create mode 100644 app/modules/grades/controllers.php
+ create mode 100644 app/modules/grades/repositories.php
+ create mode 100644 app/modules/grades/services.php
+ create mode 100644 app/views/grades/classroom.php
+ create mode 100644 app/views/grades/index.php
+ create mode 100644 app/views/grades/sheet.php
+ create mode 100644 database/migrations/2026_09_13_007_phase4b_notes.sql
+ create mode 100644 tests/grades_isolation.php
+
+diff --git a/app/config/routes.php b/app/config/routes.php
+index 400261a..d1c3158 100644
+--- a/app/config/routes.php
++++ b/app/config/routes.php
+@@ -119,6 +119,25 @@ route('POST', '/classes/{id}/repartition',                  'teachers', 'ctrl_te
+ route('POST', '/classes/{id}/repartition/{assignment_id}/retirer', 'teachers', 'ctrl_teachers_unassign', ['auth', 'school', 'perm:teacher.assign']);
+ route('POST', '/classes/{id}/titulaire',                    'teachers', 'ctrl_teachers_set_main',       ['auth', 'school', 'perm:teacher.assign']);
+ 
++// ---------------------------------------------------------------------
++// Phase 4B — Notes
++//
++// La grille de saisie est adressée par (classe, branche, période) :
++// c'est le geste réel de l'enseignant, qui remplit une colonne entière.
++// Les trois identifiants sont recoupés dans grades_sheet_context() —
++// la branche doit appartenir au programme de la classe, la période à
++// son année.
++//
++// perm:grade.enter ne suffit jamais : teachers_can_teach() décide.
++// ---------------------------------------------------------------------
++route('GET',  '/notes',                'grades', 'ctrl_grades_index',     ['auth', 'school', 'perm:grade.view']);
++route('GET',  '/notes/classe/{id}',    'grades', 'ctrl_grades_classroom', ['auth', 'school', 'perm:grade.view']);
++
++route('GET',  '/notes/classe/{id}/branche/{subject_id}/periode/{period_id}', 'grades', 'ctrl_grades_sheet', ['auth', 'school', 'perm:grade.view']);
++route('POST', '/notes/classe/{id}/branche/{subject_id}/periode/{period_id}', 'grades', 'ctrl_grades_store', ['auth', 'school', 'perm:grade.enter']);
++
++route('POST', '/notes/periodes/{id}/verrou', 'grades', 'ctrl_grades_lock_period', ['auth', 'school', 'perm:grade.validate']);
++
+ // ---------------------------------------------------------------------
+ // Les modules des phases suivantes viendront s'ajouter ici :
+ //
+diff --git a/app/modules/grades/controllers.php b/app/modules/grades/controllers.php
+new file mode 100644
+index 0000000..6e84780
+--- /dev/null
++++ b/app/modules/grades/controllers.php
+@@ -0,0 +1,282 @@
++<?php
++/**
++ * Module GRADES — contrôleurs.
++ */
++
++declare(strict_types=1);
++
++require_once __DIR__ . '/services.php';
++require_once __DIR__ . '/repositories.php';
++require_once __DIR__ . '/../teachers/repositories.php';
++
++/** Année de travail : paramètre d'URL validé, sinon année courante. */
++function grades_current_year(): ?array
++{
++    $requested = input_int('annee');
++
++    if ($requested !== null) {
++        $year = tenant_find('academic_years', $requested);
++
++        if ($year !== null) {
++            return $year;
++        }
++    }
++
++    return tenant_one('academic_years', 'is_current = 1')
++        ?? tenant_one('academic_years', '1 = 1 ORDER BY starts_on DESC');
++}
++
++// ---------------------------------------------------------------------
++//  ACCUEIL DU MODULE
++// ---------------------------------------------------------------------
++
++/**
++ * Point d'entrée.
++ *
++ * Deux publics, deux écrans :
++ *  · l'enseignant voit SON service — ce qu'il a à saisir ;
++ *  · la direction voit les classes de l'établissement.
++ *
++ * Le contenu découle du périmètre, pas d'un choix d'interface.
++ */
++function ctrl_grades_index(): void
++{
++    $year   = grades_current_year();
++    $yearId = $year !== null ? (int) $year['id'] : 0;
++
++    $teacher   = auth_id() !== null ? teachers_repo_find_by_user((int) auth_id()) : null;
++    $isTeacher = $teacher !== null && $teacher['status'] === 'active';
++
++    $workload = ($isTeacher && $yearId > 0)
++        ? grades_repo_teacher_workload((int) $teacher['id'], $yearId)
++        : [];
++
++    // La direction et le préfet voient toutes les classes ; un enseignant
++    // qui est aussi titulaire ne voit que les siennes.
++    $classrooms = [];
++
++    if ($yearId > 0 && perm_has('grade.validate')) {
++        $classrooms = db_all(
++            'SELECT c.id, c.code, c.name, l.short_name AS level_short,
++                    COUNT(e.id) AS student_count
++               FROM classrooms c
++               JOIN curriculums cu     ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
++               JOIN education_levels l ON l.id = cu.education_level_id
++               LEFT JOIN enrollments e ON e.classroom_id = c.id AND e.school_id = c.school_id
++                                      AND e.status <> \'cancelled\'
++              WHERE c.school_id = :school_id AND c.academic_year_id = :year_id
++                AND c.is_active = 1
++              GROUP BY c.id
++              ORDER BY l.order_number, c.order_number, c.code',
++            ['school_id' => tenant_require(), 'year_id' => $yearId]
++        );
++    }
++
++    view('grades/index', [
++        'title'      => 'Notes',
++        'year'       => $year,
++        'years'      => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
++        'periods'    => $yearId > 0
++            ? tenant_all('grade_periods', 'academic_year_id = :y ORDER BY order_number', ['y' => $yearId])
++            : [],
++        'workload'   => $workload,
++        'classrooms' => $classrooms,
++        'isTeacher'  => $isTeacher,
++    ]);
++}
++
++// ---------------------------------------------------------------------
++//  AVANCEMENT D'UNE CLASSE
++// ---------------------------------------------------------------------
++
++function ctrl_grades_classroom(string $id): void
++{
++    $classroomId = (int) $id;
++    $classroom   = tenant_find('classrooms', $classroomId);
++
++    require_once APP_PATH . '/modules/students/repositories.php';
++
++    if ($classroom === null || !students_can_view_classroom($classroomId)) {
++        abort(404, 'Classe introuvable.');
++    }
++
++    $year = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++
++    view('grades/classroom', [
++        'title'     => 'Notes — ' . $classroom['name'],
++        'classroom' => $classroom,
++        'year'      => $year,
++        'rows'      => grades_repo_classroom_progress($classroomId, (int) $classroom['academic_year_id']),
++        'students'  => count(grades_repo_classroom_enrollments($classroomId)),
++    ]);
++}
++
++// ---------------------------------------------------------------------
++//  GRILLE DE SAISIE
++// ---------------------------------------------------------------------
++
++function ctrl_grades_sheet(string $id, string $subjectId, string $periodId): void
++{
++    $classroomId = (int) $id;
++    $subject     = (int) $subjectId;
++    $period      = (int) $periodId;
++
++    $context = grades_sheet_context($classroomId, $subject, $period);
++
++    view('grades/sheet', $context + [
++        'title' => 'Saisie — ' . $context['classroom']['name'],
++        'rows'  => grades_repo_sheet($classroomId, $subject, $period),
++    ]);
++}
++
++function ctrl_grades_store(string $id, string $subjectId, string $periodId): void
++{
++    $classroomId = (int) $id;
++    $subject     = (int) $subjectId;
++    $period      = (int) $periodId;
++
++    $target = '/notes/classe/' . $classroomId . '/branche/' . $subject . '/periode/' . $period;
++
++    $points  = is_array(input('points')) ? input('points') : [];
++    $absents = is_array(input('absent')) ? input('absent') : [];
++
++    if ($points === [] && $absents === []) {
++        flash_error('Aucune cote transmise.');
++        redirect($target);
++    }
++
++    // Les deux tableaux sont fusionnés, et ce n'est pas une précaution
++    // théorique : un champ « disabled » n'est PAS transmis par le
++    // navigateur. Cocher « Absent » désactive la case de la cote, donc
++    // points[42] disparaît de l'envoi. N'itérer que sur $points
++    // perdrait précisément les élèves absents — ceux que l'enseignant
++    // vient de signaler.
++    $entries = [];
++
++    foreach (array_keys($points + $absents) as $key) {
++        $enrollmentId = (int) $key;
++
++        if ($enrollmentId <= 0) {
++            continue;
++        }
++
++        $value = $points[$key] ?? null;
++
++        $entries[$enrollmentId] = [
++            'points'    => is_scalar($value) ? trim((string) $value) : null,
++            'is_absent' => !empty($absents[$key]),
++        ];
++    }
++
++    $outcome = grades_service_save_sheet($classroomId, $subject, $period, $entries);
++
++    if (!$outcome['ok']) {
++        flash_error($outcome['message']);
++        redirect($target);
++    }
++
++    if ($outcome['errors'] !== []) {
++        // Les cotes valides sont enregistrées, les autres signalées
++        // nommément : un rejet global ferait perdre une saisie de
++        // quarante lignes pour une seule faute de frappe.
++        flash_warning(
++            $outcome['saved'] . ' cote(s) enregistrée(s). '
++            . count($outcome['errors']) . ' rejetée(s) : '
++            . implode(' ', array_unique($outcome['errors']))
++        );
++    } else {
++        flash_success($outcome['saved'] . ' cote(s) enregistrée(s).');
++    }
++
++    redirect($target);
++}
++
++// ---------------------------------------------------------------------
++//  VERROUILLAGE
++// ---------------------------------------------------------------------
++
++function ctrl_grades_lock_period(string $id): void
++{
++    $periodId = (int) $id;
++    $locked   = input('action') === 'lock';
++
++    $outcome = grades_service_set_period_lock($periodId, $locked);
++
++    $outcome['ok']
++        ? flash_success($locked ? 'Période verrouillée.' : 'Période déverrouillée.')
++        : flash_error($outcome['message']);
++
++    redirect('/notes' . (input_int('annee') !== null ? '?annee=' . input_int('annee') : ''));
++}
++
++// ---------------------------------------------------------------------
++//  OUTILS INTERNES
++// ---------------------------------------------------------------------
++
++/**
++ * Résout et VÉRIFIE le contexte d'une grille de saisie.
++ *
++ * Les trois identifiants viennent de l'URL. Chacun est contrôlé :
++ * appartenance à l'école, appartenance de la branche au programme de la
++ * classe, appartenance de la période à l'année de la classe. Un seul
++ * manquement ouvrirait la saisie sur une combinaison qui n'existe pas.
++ *
++ * @return array<string, mixed>
++ */
++function grades_sheet_context(int $classroomId, int $curriculumSubjectId, int $periodId): array
++{
++    $classroom = tenant_find('classrooms', $classroomId);
++
++    if ($classroom === null) {
++        abort(404, 'Classe introuvable.');
++    }
++
++    $subject = db_one(
++        'SELECT cs.*, s.name AS subject_name, s.short_name AS subject_short
++           FROM curriculum_subjects cs
++           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
++          WHERE cs.school_id = :school_id AND cs.id = :id AND cs.curriculum_id = :curriculum_id
++          LIMIT 1',
++        [
++            'school_id'     => tenant_require(),
++            'id'            => $curriculumSubjectId,
++            'curriculum_id' => (int) $classroom['curriculum_id'],
++        ]
++    );
++
++    if ($subject === null) {
++        abort(404, 'Cette branche ne figure pas au programme de la classe.');
++    }
++
++    $period = tenant_one(
++        'grade_periods',
++        'id = :id AND academic_year_id = :y',
++        ['id' => $periodId, 'y' => (int) $classroom['academic_year_id']]
++    );
++
++    if ($period === null) {
++        abort(404, 'Cette période n\'appartient pas à l\'année de la classe.');
++    }
++
++    // Autorisation de saisie : la permission ne suffit pas, il faut la
++    // branche. L'écran reste consultable en lecture si l'utilisateur a le
++    // droit de voir les notes.
++    $auth  = grades_service_can_enter($classroomId, $curriculumSubjectId);
++    $year  = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++    $state = grades_service_period_state($period, $year ?? []);
++
++    if (!$auth['ok'] && !perm_has('grade.view')) {
++        abort(403, $auth['message']);
++    }
++
++    return [
++        'classroom' => $classroom,
++        'subject'   => $subject,
++        'period'    => $period,
++        'year'      => $year,
++        'maxPoints' => grades_max_for($subject, $period),
++        'canEnter'  => $auth['ok'] && $state['ok'],
++        'forced'    => $state['forced'],
++        'reason'    => $auth['ok'] ? $state['message'] : $auth['message'],
++    ];
++}
+diff --git a/app/modules/grades/repositories.php b/app/modules/grades/repositories.php
+new file mode 100644
+index 0000000..89b78d8
+--- /dev/null
++++ b/app/modules/grades/repositories.php
+@@ -0,0 +1,208 @@
++<?php
++/**
++ * Module GRADES — dépôts.
++ *
++ * Deux requêtes portent tout le module :
++ *
++ *  · la GRILLE DE SAISIE — les élèves d'une classe et leur cote dans une
++ *    branche pour une période ;
++ *  · le RELEVÉ D'UN ÉLÈVE — toutes ses cotes de l'année, par branche et
++ *    par période, base du futur bulletin.
++ *
++ * Toutes deux doivent tenir en une requête : une classe de 45 élèves et
++ * un programme de 12 branches produiraient sinon des centaines d'appels.
++ */
++
++declare(strict_types=1);
++
++/**
++ * Inscriptions actives d'une classe, dans l'ordre du registre.
++ *
++ * Sert à la fois d'affichage et de LISTE BLANCHE à la saisie : une cote
++ * ne peut être posée que pour une inscription qui figure ici.
++ */
++function grades_repo_classroom_enrollments(int $classroomId): array
++{
++    return db_all(
++        'SELECT e.id, e.student_id,
++                s.matricule, s.last_name, s.post_name, s.first_name, s.gender
++           FROM enrollments e
++           JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
++          WHERE e.school_id = :school_id
++            AND e.classroom_id = :classroom_id
++            AND e.status <> \'cancelled\'
++            AND s.deleted_at IS NULL
++          ORDER BY s.last_name, s.post_name, s.first_name',
++        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
++    );
++}
++
++/**
++ * Grille de saisie : un élève par ligne, sa cote si elle existe.
++ *
++ * Jointure externe sur grades : une case vide est une cote non saisie,
++ * pas une absence de ligne à gérer côté PHP.
++ */
++function grades_repo_sheet(int $classroomId, int $curriculumSubjectId, int $periodId): array
++{
++    return db_all(
++        'SELECT e.id AS enrollment_id, e.student_id,
++                s.matricule, s.last_name, s.post_name, s.first_name, s.gender,
++                g.id AS grade_id, g.points, g.max_points, g.is_absent, g.comment,
++                g.entered_at, g.updated_at
++           FROM enrollments e
++           JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
++           LEFT JOIN grades g ON g.enrollment_id = e.id
++                             AND g.school_id = e.school_id
++                             AND g.curriculum_subject_id = :subject_id
++                             AND g.grade_period_id = :period_id
++          WHERE e.school_id = :school_id
++            AND e.classroom_id = :classroom_id
++            AND e.status <> \'cancelled\'
++            AND s.deleted_at IS NULL
++          ORDER BY s.last_name, s.post_name, s.first_name',
++        [
++            'school_id'    => tenant_require(),
++            'classroom_id' => $classroomId,
++            'subject_id'   => $curriculumSubjectId,
++            'period_id'    => $periodId,
++        ]
++    );
++}
++
++/**
++ * Avancement de la saisie pour une classe : chaque branche, chaque
++ * période, et le nombre de cotes déjà posées.
++ *
++ * C'est le tableau de bord du préfet : il montre d'un coup d'œil ce qui
++ * manque avant de pouvoir éditer les bulletins.
++ */
++function grades_repo_classroom_progress(int $classroomId, int $yearId): array
++{
++    return db_all(
++        'SELECT cs.id AS curriculum_subject_id, s.name AS subject_name,
++                cs.max_points, cs.order_number,
++                gp.id AS period_id, gp.code AS period_code, gp.name AS period_name,
++                gp.period_type, gp.max_multiplier, gp.is_locked, gp.order_number AS period_order,
++                COUNT(g.id) AS entered,
++                t.id AS teacher_id, t.last_name AS teacher_last_name,
++                t.post_name AS teacher_post_name, t.first_name AS teacher_first_name
++           FROM classrooms c
++           JOIN curriculum_subjects cs ON cs.curriculum_id = c.curriculum_id
++                                      AND cs.school_id = c.school_id
++           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
++           JOIN grade_periods gp ON gp.academic_year_id = :year_id
++                                AND gp.school_id = c.school_id
++           LEFT JOIN teacher_subjects ts ON ts.curriculum_subject_id = cs.id
++                                        AND ts.classroom_id = c.id
++                                        AND ts.school_id = c.school_id
++           LEFT JOIN teachers t ON t.id = ts.teacher_id AND t.school_id = ts.school_id
++           LEFT JOIN grades g ON g.curriculum_subject_id = cs.id
++                             AND g.grade_period_id = gp.id
++                             AND g.school_id = c.school_id
++                             AND g.enrollment_id IN (
++                                   SELECT e.id FROM enrollments e
++                                    WHERE e.school_id = c.school_id
++                                      AND e.classroom_id = c.id
++                                      AND e.status <> \'cancelled\')
++          WHERE c.school_id = :school_id AND c.id = :classroom_id
++          GROUP BY cs.id, gp.id
++          ORDER BY cs.order_number, s.name, gp.order_number',
++        [
++            'school_id'    => tenant_require(),
++            'classroom_id' => $classroomId,
++            'year_id'      => $yearId,
++        ]
++    );
++}
++
++/**
++ * Relevé complet d'une inscription : toutes ses cotes de l'année.
++ *
++ * Une ligne par branche et par période. Le maximum retourné est celui
++ * FIGÉ sur la cote lorsqu'elle existe, et seulement à défaut le maximum
++ * courant du programme — de sorte qu'un relevé déjà constitué reste
++ * reproductible même si le programme a changé depuis.
++ */
++function grades_repo_report(int $enrollmentId): array
++{
++    return db_all(
++        'SELECT cs.id AS curriculum_subject_id, s.name AS subject_name,
++                s.short_name AS subject_short, cs.order_number,
++                cs.max_points AS program_max, cs.counts_for_ranking,
++                gp.id AS period_id, gp.code AS period_code, gp.name AS period_name,
++                gp.period_type, gp.semester, gp.max_multiplier,
++                gp.order_number AS period_order,
++                g.points, g.is_absent,
++                COALESCE(g.max_points, cs.max_points * gp.max_multiplier) AS max_points
++           FROM enrollments e
++           JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
++           JOIN curriculum_subjects cs ON cs.curriculum_id = c.curriculum_id
++                                      AND cs.school_id = c.school_id
++           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
++           JOIN grade_periods gp ON gp.academic_year_id = e.academic_year_id
++                                AND gp.school_id = e.school_id
++           LEFT JOIN grades g ON g.enrollment_id = e.id
++                            AND g.curriculum_subject_id = cs.id
++                            AND g.grade_period_id = gp.id
++                            AND g.school_id = e.school_id
++          WHERE e.school_id = :school_id AND e.id = :enrollment_id
++          ORDER BY cs.order_number, s.name, gp.order_number',
++        ['school_id' => tenant_require(), 'enrollment_id' => $enrollmentId]
++    );
++}
++
++/**
++ * Branches qu'un enseignant peut saisir pour une année, avec l'état de
++ * chaque période.
++ *
++ * C'est son écran d'accueil : « qu'ai-je à saisir, et où en suis-je ? »
++ */
++function grades_repo_teacher_workload(int $teacherId, int $yearId): array
++{
++    return db_all(
++        'SELECT ts.classroom_id, ts.curriculum_subject_id,
++                c.code AS classroom_code, c.name AS classroom_name,
++                s.name AS subject_name, cs.max_points,
++                l.short_name AS level_short,
++                (SELECT COUNT(*) FROM enrollments e
++                  WHERE e.school_id = ts.school_id
++                    AND e.classroom_id = ts.classroom_id
++                    AND e.status <> \'cancelled\') AS student_count
++           FROM teacher_subjects ts
++           JOIN classrooms c           ON c.id = ts.classroom_id AND c.school_id = ts.school_id
++           JOIN curriculum_subjects cs ON cs.id = ts.curriculum_subject_id AND cs.school_id = ts.school_id
++           JOIN subjects s             ON s.id = cs.subject_id AND s.school_id = cs.school_id
++           JOIN curriculums cu         ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
++           JOIN education_levels l     ON l.id = cu.education_level_id
++          WHERE ts.school_id = :school_id
++            AND ts.teacher_id = :teacher_id
++            AND ts.academic_year_id = :year_id
++          ORDER BY l.order_number, c.code, cs.order_number, s.name',
++        ['school_id' => tenant_require(), 'teacher_id' => $teacherId, 'year_id' => $yearId]
++    );
++}
++
++/**
++ * Nombre de cotes déjà saisies pour une branche d'une classe, toutes
++ * périodes confondues.
++ *
++ * Sert à refuser le retrait d'une affectation : l'auteur d'une note doit
++ * rester identifiable.
++ */
++function grades_repo_count_for_assignment(int $classroomId, int $curriculumSubjectId): int
++{
++    return (int) db_value(
++        'SELECT COUNT(*)
++           FROM grades g
++           JOIN enrollments e ON e.id = g.enrollment_id AND e.school_id = g.school_id
++          WHERE g.school_id = :school_id
++            AND g.curriculum_subject_id = :subject_id
++            AND e.classroom_id = :classroom_id',
++        [
++            'school_id'    => tenant_require(),
++            'subject_id'   => $curriculumSubjectId,
++            'classroom_id' => $classroomId,
++        ]
++    );
++}
+diff --git a/app/modules/grades/services.php b/app/modules/grades/services.php
+new file mode 100644
+index 0000000..8f4af93
+--- /dev/null
++++ b/app/modules/grades/services.php
+@@ -0,0 +1,366 @@
++<?php
++/**
++ * Module GRADES — règles métier.
++ *
++ * Une cote est la donnée la plus sensible du produit après l'état civil :
++ * elle décide du passage de classe. Trois principes sont tenus ici.
++ *
++ *  1. AUTORISATION EN DEUX TEMPS
++ *     « grade.enter » dit qu'on a le droit de saisir des notes. Il ne dit
++ *     pas lesquelles. Le second temps — teachers_can_teach() — dit dans
++ *     quelle classe et quelle branche. Aucune saisie n'est acceptée sans
++ *     les deux.
++ *
++ *  2. LE MAXIMUM EST FIGÉ
++ *     Il est calculé une fois, à la première saisie, et enregistré sur la
++ *     ligne. Modifier plus tard le programme ne réécrit aucune cote déjà
++ *     posée.
++ *
++ *  3. LE VERROU EST UNE DÉCISION, PAS UN OBSTACLE
++ *     Une période verrouillée refuse la saisie. « grade.edit_locked »
++ *     permet l'exception, et chaque exception est journalisée nommément.
++ */
++
++declare(strict_types=1);
++
++require_once __DIR__ . '/repositories.php';
++require_once __DIR__ . '/../teachers/repositories.php';
++
++// =====================================================================
++//  AUTORISATION
++// =====================================================================
++
++/**
++ * L'utilisateur courant peut-il saisir dans cette branche de cette classe ?
++ *
++ * @return array{ok: bool, message: string}
++ */
++function grades_service_can_enter(int $classroomId, int $curriculumSubjectId): array
++{
++    if (!perm_has('grade.enter')) {
++        return ['ok' => false, 'message' => 'Vous n\'avez pas le droit de saisir des notes.'];
++    }
++
++    // La direction et le préfet valident les notes de l'établissement :
++    // ils saisissent partout, y compris pour remplacer un enseignant
++    // absent. C'est un droit distinct, et il est explicite.
++    if (perm_has('grade.validate')) {
++        return ['ok' => true, 'message' => ''];
++    }
++
++    if (teachers_can_teach($classroomId, $curriculumSubjectId)) {
++        return ['ok' => true, 'message' => ''];
++    }
++
++    return [
++        'ok'      => false,
++        'message' => 'Cette branche ne vous est pas confiée dans cette classe.',
++    ];
++}
++
++/**
++ * L'état d'une période pour la saisie.
++ *
++ * @return array{ok: bool, message: string, forced: bool}
++ */
++function grades_service_period_state(array $period, array $year): array
++{
++    if (in_array($year['status'], ['closed', 'archived'], true)) {
++        return [
++            'ok'      => false,
++            'forced'  => false,
++            'message' => 'Cette année scolaire est clôturée : les notes ne peuvent plus être modifiées.',
++        ];
++    }
++
++    if ((int) $period['is_locked'] === 1) {
++        if (perm_has('grade.edit_locked')) {
++            // Autorisé, mais signalé : l'appelant doit journaliser.
++            return ['ok' => true, 'forced' => true, 'message' => ''];
++        }
++
++        return [
++            'ok'      => false,
++            'forced'  => false,
++            'message' => 'La période « ' . $period['name'] . ' » est verrouillée.',
++        ];
++    }
++
++    return ['ok' => true, 'forced' => false, 'message' => ''];
++}
++
++// =====================================================================
++//  SAISIE
++// =====================================================================
++
++/**
++ * Enregistre les cotes d'une classe pour une branche et une période.
++ *
++ * La saisie est faite en lot : c'est le geste réel de l'enseignant, qui
++ * remplit une colonne entière. Traiter les cotes une par une
++ * multiplierait les contrôles d'autorisation sans rien sécuriser de plus,
++ * et rendrait une correction partielle possible en cas d'erreur.
++ *
++ * @param array<int, array{points: ?float, is_absent: bool}> $entries
++ *        Indexé par enrollment_id.
++ *
++ * @return array{ok: bool, saved: int, message: string, errors: array<int, string>}
++ */
++function grades_service_save_sheet(
++    int $classroomId,
++    int $curriculumSubjectId,
++    int $periodId,
++    array $entries
++): array {
++    $classroom = tenant_find('classrooms', $classroomId);
++
++    if ($classroom === null) {
++        return ['ok' => false, 'saved' => 0, 'message' => 'Classe introuvable.', 'errors' => []];
++    }
++
++    $auth = grades_service_can_enter($classroomId, $curriculumSubjectId);
++
++    if (!$auth['ok']) {
++        return ['ok' => false, 'saved' => 0, 'message' => $auth['message'], 'errors' => []];
++    }
++
++    // La branche doit appartenir au programme de CETTE classe. Contrôler
++    // seulement l'école laisserait passer une branche d'un autre
++    // programme, et la cote atterrirait sur un bulletin qui ne la
++    // comporte pas.
++    $subject = tenant_one(
++        'curriculum_subjects',
++        'id = :id AND curriculum_id = :curriculum_id',
++        ['id' => $curriculumSubjectId, 'curriculum_id' => (int) $classroom['curriculum_id']]
++    );
++
++    if ($subject === null) {
++        return ['ok' => false, 'saved' => 0, 'message' => 'Cette branche ne figure pas au programme de la classe.', 'errors' => []];
++    }
++
++    $period = tenant_one(
++        'grade_periods',
++        'id = :id AND academic_year_id = :y',
++        ['id' => $periodId, 'y' => (int) $classroom['academic_year_id']]
++    );
++
++    if ($period === null) {
++        return ['ok' => false, 'saved' => 0, 'message' => 'Cette période n\'appartient pas à l\'année de la classe.', 'errors' => []];
++    }
++
++    $year  = tenant_find('academic_years', (int) $classroom['academic_year_id']);
++    $state = grades_service_period_state($period, $year ?? []);
++
++    if (!$state['ok']) {
++        return ['ok' => false, 'saved' => 0, 'message' => $state['message'], 'errors' => []];
++    }
++
++    // Le maximum applicable : le maximum de la branche multiplié par le
++    // poids de la période. Calculé une fois, figé sur chaque ligne.
++    $maxPoints = grades_max_for($subject, $period);
++
++    // Les inscriptions réellement présentes dans la classe. Une cote ne
++    // peut être posée que pour un élève de CETTE classe : sans ce
++    // filtrage, un identifiant forgé dans le formulaire noterait
++    // l'élève d'une autre classe, voire d'une autre année.
++    $allowed = [];
++
++    foreach (grades_repo_classroom_enrollments($classroomId) as $row) {
++        $allowed[(int) $row['id']] = $row;
++    }
++
++    $errors = [];
++    $valid  = [];
++
++    foreach ($entries as $enrollmentId => $entry) {
++        $enrollmentId = (int) $enrollmentId;
++
++        if (!isset($allowed[$enrollmentId])) {
++            $errors[$enrollmentId] = 'Élève absent de cette classe.';
++            continue;
++        }
++
++        $isAbsent = !empty($entry['is_absent']);
++        $points   = $entry['points'];
++
++        if ($isAbsent) {
++            // L'absence efface la cote : les deux ne peuvent coexister.
++            $valid[$enrollmentId] = ['points' => null, 'is_absent' => true];
++            continue;
++        }
++
++        if ($points === null || $points === '') {
++            // Case laissée vide : la cote est remise à « non saisie ».
++            $valid[$enrollmentId] = ['points' => null, 'is_absent' => false];
++            continue;
++        }
++
++        if (!is_numeric($points)) {
++            $errors[$enrollmentId] = 'Cote non numérique.';
++            continue;
++        }
++
++        $points = round((float) $points, 2);
++
++        if ($points < 0) {
++            $errors[$enrollmentId] = 'Une cote ne peut pas être négative.';
++            continue;
++        }
++
++        if ($points > $maxPoints) {
++            $errors[$enrollmentId] = 'Cote supérieure au maximum (' . grades_format($maxPoints) . ').';
++            continue;
++        }
++
++        $valid[$enrollmentId] = ['points' => $points, 'is_absent' => false];
++    }
++
++    if ($valid === []) {
++        return [
++            'ok' => false, 'saved' => 0,
++            'message' => 'Aucune cote valide à enregistrer.',
++            'errors' => $errors,
++        ];
++    }
++
++    $saved = db_transaction(static function () use (
++        $valid, $curriculumSubjectId, $periodId, $maxPoints
++    ): int {
++        $count  = 0;
++        $userId = auth_id();
++        $now    = date('Y-m-d H:i:s');
++
++        foreach ($valid as $enrollmentId => $entry) {
++            // INSERT ... ON DUPLICATE KEY UPDATE : l'écriture est
++            // idempotente et sans lecture préalable. Deux enseignants
++            // enregistrant la même grille au même instant ne peuvent pas
++            // créer de doublon — la contrainte uq_grade_slot tranche.
++            //
++            // max_points n'est écrit qu'à la CRÉATION : la clause de mise
++            // à jour ne le touche pas, une cote déjà posée conserve son
++            // barème d'origine.
++            db_query(
++                'INSERT INTO grades
++                    (school_id, enrollment_id, curriculum_subject_id, grade_period_id,
++                     points, max_points, is_absent, entered_by, entered_at, updated_by)
++                 VALUES
++                    (:school_id, :enrollment_id, :subject_id, :period_id,
++                     :points, :max_points, :is_absent, :entered_by, :entered_at, :updated_by)
++                 ON DUPLICATE KEY UPDATE
++                    points     = VALUES(points),
++                    is_absent  = VALUES(is_absent),
++                    updated_by = VALUES(updated_by)',
++                [
++                    'school_id'     => tenant_require(),
++                    'enrollment_id' => $enrollmentId,
++                    'subject_id'    => $curriculumSubjectId,
++                    'period_id'     => $periodId,
++                    'points'        => $entry['points'],
++                    'max_points'    => $maxPoints,
++                    'is_absent'     => $entry['is_absent'] ? 1 : 0,
++                    'entered_by'    => $userId,
++                    'entered_at'    => $now,
++                    'updated_by'    => $userId,
++                ]
++            );
++
++            $count++;
++        }
++
++        return $count;
++    });
++
++    audit_log(
++        'update',
++        'grade_sheet',
++        $classroomId,
++        null,
++        [
++            'subject_id' => $curriculumSubjectId,
++            'period_id'  => $periodId,
++            'count'      => $saved,
++            'forced'     => $state['forced'],
++        ],
++        ($state['forced'] ? 'SAISIE SUR PÉRIODE VERROUILLÉE — ' : '')
++            . 'Enregistrement de ' . $saved . ' cote(s)'
++    );
++
++    return [
++        'ok'      => true,
++        'saved'   => $saved,
++        'message' => $errors === [] ? '' : count($errors) . ' cote(s) rejetée(s).',
++        'errors'  => $errors,
++    ];
++}
++
++/**
++ * Maximum applicable à une branche pour une période.
++ *
++ * Le maximum EST la pondération : pas de coefficient séparé. Une période
++ * d'examen pèse deux fois une période ordinaire par son multiplicateur.
++ */
++function grades_max_for(array $curriculumSubject, array $period): float
++{
++    return round(
++        (float) $curriculumSubject['max_points'] * (float) $period['max_multiplier'],
++        2
++    );
++}
++
++/** Affiche une cote sans décimales inutiles : 40, 12,5. */
++function grades_format(?float $value): string
++{
++    if ($value === null) {
++        return '—';
++    }
++
++    return rtrim(rtrim(number_format($value, 2, ',', ' '), '0'), ',');
++}
++
++// =====================================================================
++//  VERROUILLAGE
++// =====================================================================
++
++/**
++ * Verrouille ou déverrouille une période.
++ *
++ * Le verrou fige les cotes d'un trimestre entier : c'est un acte de
++ * direction, il doit être attribuable. D'où locked_by et locked_at.
++ *
++ * @return array{ok: bool, message: string}
++ */
++function grades_service_set_period_lock(int $periodId, bool $locked): array
++{
++    if (!perm_has('grade.validate')) {
++        return ['ok' => false, 'message' => 'Vous n\'avez pas le droit de verrouiller une période.'];
++    }
++
++    $period = tenant_find('grade_periods', $periodId);
++
++    if ($period === null) {
++        return ['ok' => false, 'message' => 'Période introuvable.'];
++    }
++
++    $year = tenant_find('academic_years', (int) $period['academic_year_id']);
++
++    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
++        return ['ok' => false, 'message' => 'Cette année scolaire est clôturée.'];
++    }
++
++    tenant_update('grade_periods', [
++        'is_locked' => $locked ? 1 : 0,
++        'locked_at' => $locked ? date('Y-m-d H:i:s') : null,
++        'locked_by' => $locked ? auth_id() : null,
++    ], 'id = :id', ['id' => $periodId]);
++
++    audit_log(
++        'update',
++        'grade_period',
++        $periodId,
++        ['is_locked' => (int) $period['is_locked']],
++        ['is_locked' => $locked ? 1 : 0],
++        ($locked ? 'Verrouillage' : 'Déverrouillage') . ' de la période ' . $period['name']
++    );
++
++    return ['ok' => true, 'message' => ''];
++}
+diff --git a/app/modules/teachers/services.php b/app/modules/teachers/services.php
+index 2ee6a61..17f722c 100644
+--- a/app/modules/teachers/services.php
++++ b/app/modules/teachers/services.php
+@@ -408,6 +408,30 @@ function teachers_service_unassign(int $classroomId, int $assignmentId): array
+         return ['ok' => false, 'message' => 'Cette année scolaire est clôturée.'];
+     }
+ 
++    // Des cotes ont-elles déjà été saisies pour cette branche ?
++    //
++    // Retirer l'affectation ne supprimerait pas les notes — elles sont
++    // rattachées à l'inscription, pas à l'enseignant — mais plus rien ne
++    // relierait une note à celui qui l'a posée. L'auteur d'une note doit
++    // rester identifiable, y compris des années plus tard.
++    //
++    // Le changement d'enseignant en cours d'année passe donc par la
++    // direction : c'est une décision, pas un clic.
++    require_once __DIR__ . '/../grades/repositories.php';
++
++    $existingGrades = grades_repo_count_for_assignment(
++        (int) $assignment['classroom_id'],
++        (int) $assignment['curriculum_subject_id']
++    );
++
++    if ($existingGrades > 0 && !perm_has('grade.validate')) {
++        return [
++            'ok'      => false,
++            'message' => $existingGrades . ' cote(s) ont déjà été saisies dans cette branche. '
++                . 'Seule la direction peut retirer cette affectation.',
++        ];
++    }
++
+     tenant_delete('teacher_subjects', 'id = :id', ['id' => $assignmentId]);
+ 
+     audit_log(
+diff --git a/app/views/grades/classroom.php b/app/views/grades/classroom.php
+new file mode 100644
+index 0000000..10fda34
+--- /dev/null
++++ b/app/views/grades/classroom.php
+@@ -0,0 +1,153 @@
++<?php
++/**
++ * Avancement de la saisie pour une classe.
++ *
++ * Tableau de bord du préfet : une ligne par branche, une colonne par
++ * période, et le nombre de cotes déjà posées. Ce qui manque avant de
++ * pouvoir éditer les bulletins se voit d'un coup d'œil.
++ *
++ * @var array      $classroom
++ * @var array|null $year
++ * @var array      $rows
++ * @var int        $students
++ */
++declare(strict_types=1);
++
++set_title('Notes — ' . $classroom['name']);
++
++// Réorganisation en tableau croisé : branches en lignes, périodes en
++// colonnes. Le dépôt renvoie une ligne par couple, une seule requête.
++$subjects = [];
++$periods  = [];
++
++foreach ($rows as $row) {
++    $subjectId = (int) $row['curriculum_subject_id'];
++    $periodId  = (int) $row['period_id'];
++
++    if (!isset($subjects[$subjectId])) {
++        $subjects[$subjectId] = [
++            'name'       => $row['subject_name'],
++            'max'        => (int) $row['max_points'],
++            'teacher'    => $row['teacher_id'] !== null
++                ? full_name($row['teacher_last_name'], $row['teacher_post_name'], $row['teacher_first_name'])
++                : null,
++            'cells'      => [],
++        ];
++    }
++
++    $periods[$periodId] = [
++        'code'   => $row['period_code'],
++        'name'   => $row['period_name'],
++        'locked' => (int) $row['is_locked'] === 1,
++        'order'  => (int) $row['period_order'],
++    ];
++
++    $subjects[$subjectId]['cells'][$periodId] = (int) $row['entered'];
++}
++
++uasort($periods, static fn (array $a, array $b): int => $a['order'] <=> $b['order']);
++
++$missing = 0;
++
++foreach ($subjects as $subject) {
++    foreach ($periods as $periodId => $period) {
++        $missing += max(0, $students - ($subject['cells'][$periodId] ?? 0));
++    }
++}
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title"><?= e($classroom['name']) ?></h1>
++        <p class="page-subtitle">
++            <?= e($classroom['code']) ?>
++            <?php if ($year !== null): ?> · année <?= e($year['code']) ?><?php endif; ?>
++            · <?= $students ?> élève(s)
++            · <?= count($subjects) ?> branche(s)
++        </p>
++    </div>
++
++    <a href="<?= e(url('/notes')) ?>" class="btn btn-outline-secondary">
++        <i class="bi bi-arrow-left me-1"></i> Notes
++    </a>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<?php if ($subjects === []): ?>
++    <div class="alert alert-info">
++        Le programme de cette classe ne comporte aucune branche.
++        Complétez-le depuis <a href="<?= e(url('/referentiel/programmes')) ?>">le référentiel</a>.
++    </div>
++<?php else: ?>
++    <?php if ($missing > 0): ?>
++        <div class="alert alert-warning d-flex align-items-start gap-2">
++            <i class="bi bi-exclamation-triangle"></i>
++            <div>
++                <strong><?= $missing ?></strong> cote(s) manquante(s) sur l'ensemble de l'année.
++                Un bulletin ne peut être établi tant qu'une période reste incomplète.
++            </div>
++        </div>
++    <?php endif; ?>
++
++    <div class="card">
++        <div class="table-responsive">
++            <table class="table table-hover align-middle mb-0">
++                <thead>
++                    <tr>
++                        <th scope="col">Branche</th>
++                        <th scope="col" class="d-none d-lg-table-cell">Enseignant</th>
++                        <?php foreach ($periods as $period): ?>
++                            <th scope="col" class="text-center" title="<?= e($period['name']) ?>">
++                                <?= e($period['code']) ?>
++                                <?php if ($period['locked']): ?>
++                                    <i class="bi bi-lock-fill text-secondary"></i>
++                                <?php endif; ?>
++                            </th>
++                        <?php endforeach; ?>
++                    </tr>
++                </thead>
++                <tbody>
++                    <?php foreach ($subjects as $subjectId => $subject): ?>
++                        <tr>
++                            <td>
++                                <span class="fw-medium"><?= e($subject['name']) ?></span>
++                                <span class="small text-secondary">/ <?= $subject['max'] ?></span>
++                            </td>
++                            <td class="d-none d-lg-table-cell">
++                                <?php if ($subject['teacher'] !== null): ?>
++                                    <span class="small"><?= e($subject['teacher']) ?></span>
++                                <?php else: ?>
++                                    <span class="small text-warning-emphasis">
++                                        <i class="bi bi-exclamation-circle me-1"></i>non pourvue
++                                    </span>
++                                <?php endif; ?>
++                            </td>
++
++                            <?php foreach ($periods as $periodId => $period): ?>
++                                <?php
++                                $done     = $subject['cells'][$periodId] ?? 0;
++                                $complete = $students > 0 && $done >= $students;
++                                ?>
++                                <td class="text-center">
++                                    <a class="btn btn-sm <?= $complete ? 'btn-success' : ($done > 0 ? 'btn-warning' : 'btn-outline-secondary') ?>"
++                                       href="<?= e(url('/notes/classe/' . (int) $classroom['id']
++                                           . '/branche/' . $subjectId
++                                           . '/periode/' . $periodId)) ?>"
++                                       title="<?= e($period['name']) ?> — <?= $done ?>/<?= $students ?>">
++                                        <?= $done ?>/<?= $students ?>
++                                    </a>
++                                </td>
++                            <?php endforeach; ?>
++                        </tr>
++                    <?php endforeach; ?>
++                </tbody>
++            </table>
++        </div>
++    </div>
++
++    <p class="small text-secondary mt-2 mb-0">
++        Chaque case mène à la grille de saisie. Vert : colonne complète.
++        Orange : saisie commencée. Gris : rien de saisi.
++    </p>
++<?php endif; ?>
+diff --git a/app/views/grades/index.php b/app/views/grades/index.php
+new file mode 100644
+index 0000000..11fded0
+--- /dev/null
++++ b/app/views/grades/index.php
+@@ -0,0 +1,214 @@
++<?php
++/**
++ * Accueil du module Notes.
++ *
++ * Deux publics, deux lectures du même écran :
++ *  · l'enseignant voit SON service — ce qu'il a à saisir ;
++ *  · la direction voit les classes et l'état des périodes.
++ *
++ * @var array|null $year
++ * @var array      $years
++ * @var array      $periods
++ * @var array      $workload
++ * @var array      $classrooms
++ * @var bool       $isTeacher
++ */
++declare(strict_types=1);
++
++set_title('Notes');
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title">Notes</h1>
++        <p class="page-subtitle">
++            <?php if ($year !== null): ?>
++                Année <strong><?= e($year['code']) ?></strong>
++                · <?= count($periods) ?> période(s)
++            <?php else: ?>
++                Aucune année scolaire définie.
++            <?php endif; ?>
++        </p>
++    </div>
++
++    <?php if (count($years) > 1 && $year !== null): ?>
++        <form method="get" action="<?= e(url('/notes')) ?>">
++            <select name="annee" class="form-select form-select-sm" data-auto-submit>
++                <?php foreach ($years as $option): ?>
++                    <option value="<?= (int) $option['id'] ?>" <?= (int) $option['id'] === (int) $year['id'] ? 'selected' : '' ?>>
++                        <?= e($option['code']) ?>
++                    </option>
++                <?php endforeach; ?>
++            </select>
++            <button type="submit" class="btn btn-sm btn-outline-secondary ms-1" data-auto-submit-fallback>OK</button>
++        </form>
++    <?php endif; ?>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<?php if ($year === null): ?>
++    <div class="alert alert-info">
++        Créez d'abord une année scolaire et ses périodes depuis
++        <a href="<?= e(url('/referentiel')) ?>">le référentiel</a>.
++    </div>
++<?php else: ?>
++
++    <!-- -----------------------------------------------------------------
++         Mon service — visible dès que l'utilisateur est enseignant
++    ------------------------------------------------------------------ -->
++    <?php if ($isTeacher): ?>
++        <div class="card mb-3">
++            <div class="card-header d-flex justify-content-between align-items-center">
++                <strong>Mon service</strong>
++                <span class="small text-secondary"><?= count($workload) ?> branche(s)</span>
++            </div>
++
++            <?php if ($workload === []): ?>
++                <div class="card-body text-center py-4">
++                    <p class="mb-1">Aucune branche ne vous est confiée pour cette année.</p>
++                    <p class="small text-secondary mb-0">
++                        La répartition est faite par le préfet des études, classe par classe.
++                    </p>
++                </div>
++            <?php else: ?>
++                <div class="table-responsive">
++                    <table class="table table-hover align-middle mb-0">
++                        <thead>
++                            <tr>
++                                <th scope="col">Classe</th>
++                                <th scope="col">Branche</th>
++                                <th scope="col" class="text-center d-none d-sm-table-cell">Élèves</th>
++                                <th scope="col">Périodes</th>
++                            </tr>
++                        </thead>
++                        <tbody>
++                            <?php foreach ($workload as $item): ?>
++                                <tr>
++                                    <td>
++                                        <span class="fw-medium"><?= e($item['classroom_code']) ?></span>
++                                        <div class="small text-secondary d-none d-md-block">
++                                            <?= e($item['classroom_name']) ?>
++                                        </div>
++                                    </td>
++                                    <td>
++                                        <?= e($item['subject_name']) ?>
++                                        <span class="small text-secondary">/ <?= (int) $item['max_points'] ?></span>
++                                    </td>
++                                    <td class="text-center d-none d-sm-table-cell">
++                                        <?= (int) $item['student_count'] ?>
++                                    </td>
++                                    <td>
++                                        <div class="d-flex flex-wrap gap-1">
++                                            <?php foreach ($periods as $p): ?>
++                                                <a class="btn btn-sm <?= (int) $p['is_locked'] === 1 ? 'btn-outline-secondary' : 'btn-outline-primary' ?>"
++                                                   href="<?= e(url('/notes/classe/' . (int) $item['classroom_id']
++                                                       . '/branche/' . (int) $item['curriculum_subject_id']
++                                                       . '/periode/' . (int) $p['id'])) ?>"
++                                                   title="<?= e($p['name']) ?><?= (int) $p['is_locked'] === 1 ? ' (verrouillée)' : '' ?>">
++                                                    <?= e($p['code']) ?>
++                                                    <?php if ((int) $p['is_locked'] === 1): ?>
++                                                        <i class="bi bi-lock-fill ms-1"></i>
++                                                    <?php endif; ?>
++                                                </a>
++                                            <?php endforeach; ?>
++                                        </div>
++                                    </td>
++                                </tr>
++                            <?php endforeach; ?>
++                        </tbody>
++                    </table>
++                </div>
++            <?php endif; ?>
++        </div>
++    <?php endif; ?>
++
++    <!-- -----------------------------------------------------------------
++         Périodes et verrous — direction uniquement
++    ------------------------------------------------------------------ -->
++    <?php if (can('grade.validate')): ?>
++        <div class="card mb-3">
++            <div class="card-header"><strong>Périodes de l'année</strong></div>
++            <div class="table-responsive">
++                <table class="table align-middle mb-0">
++                    <thead>
++                        <tr>
++                            <th scope="col">Période</th>
++                            <th scope="col" class="text-center">Poids</th>
++                            <th scope="col" class="text-center">État</th>
++                            <th scope="col" class="text-end">Action</th>
++                        </tr>
++                    </thead>
++                    <tbody>
++                        <?php foreach ($periods as $p): ?>
++                            <tr>
++                                <td>
++                                    <span class="fw-medium"><?= e($p['name']) ?></span>
++                                    <span class="small text-secondary ms-1"><?= e($p['code']) ?></span>
++                                    <?php if ($p['period_type'] === 'exam'): ?>
++                                        <span class="badge bg-info-subtle text-info-emphasis ms-1">examen</span>
++                                    <?php endif; ?>
++                                </td>
++                                <td class="text-center">× <?= e(grades_format((float) $p['max_multiplier'])) ?></td>
++                                <td class="text-center">
++                                    <?php if ((int) $p['is_locked'] === 1): ?>
++                                        <span class="badge bg-secondary-subtle text-secondary-emphasis">
++                                            <i class="bi bi-lock-fill me-1"></i>verrouillée
++                                        </span>
++                                    <?php else: ?>
++                                        <span class="badge bg-success-subtle text-success-emphasis">ouverte</span>
++                                    <?php endif; ?>
++                                </td>
++                                <td class="text-end">
++                                    <form method="post"
++                                          action="<?= e(url('/notes/periodes/' . (int) $p['id'] . '/verrou')) ?>"
++                                          data-confirm="<?= (int) $p['is_locked'] === 1
++                                              ? 'Rouvrir cette période à la saisie ?'
++                                              : 'Verrouiller cette période ? Les enseignants ne pourront plus modifier leurs cotes.' ?>">
++                                        <?= csrf_field() ?>
++                                        <input type="hidden" name="annee" value="<?= (int) $year['id'] ?>">
++                                        <input type="hidden" name="action"
++                                               value="<?= (int) $p['is_locked'] === 1 ? 'unlock' : 'lock' ?>">
++                                        <button type="submit" class="btn btn-sm btn-outline-secondary">
++                                            <?= (int) $p['is_locked'] === 1 ? 'Déverrouiller' : 'Verrouiller' ?>
++                                        </button>
++                                    </form>
++                                </td>
++                            </tr>
++                        <?php endforeach; ?>
++                    </tbody>
++                </table>
++            </div>
++        </div>
++
++        <div class="card">
++            <div class="card-header"><strong>Classes</strong></div>
++            <?php if ($classrooms === []): ?>
++                <div class="card-body text-secondary">Aucune classe pour cette année.</div>
++            <?php else: ?>
++                <div class="list-group list-group-flush">
++                    <?php foreach ($classrooms as $classroom): ?>
++                        <a href="<?= e(url('/notes/classe/' . (int) $classroom['id'])) ?>"
++                           class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
++                            <span>
++                                <span class="fw-medium"><?= e($classroom['name']) ?></span>
++                                <span class="small text-secondary ms-1"><?= e($classroom['code']) ?></span>
++                            </span>
++                            <span class="small text-secondary">
++                                <?= (int) $classroom['student_count'] ?> élève(s)
++                            </span>
++                        </a>
++                    <?php endforeach; ?>
++                </div>
++            <?php endif; ?>
++        </div>
++    <?php endif; ?>
++
++    <?php if (!$isTeacher && !can('grade.validate')): ?>
++        <div class="alert alert-info">
++            Votre compte n'est rattaché à aucune fiche enseignant.
++            La saisie des notes s'appuie sur cette fiche : demandez au
++            secrétariat de faire le rattachement.
++        </div>
++    <?php endif; ?>
++<?php endif; ?>
+diff --git a/app/views/grades/sheet.php b/app/views/grades/sheet.php
+new file mode 100644
+index 0000000..08b0a79
+--- /dev/null
++++ b/app/views/grades/sheet.php
+@@ -0,0 +1,158 @@
++<?php
++/**
++ * Grille de saisie : une classe, une branche, une période.
++ *
++ * L'écran le plus utilisé du module. Un enseignant y saisit quarante
++ * cotes à la suite : le clavier doit suffire, la souris ne doit jamais
++ * être nécessaire.
++ *
++ * @var array      $classroom
++ * @var array      $subject
++ * @var array      $period
++ * @var array|null $year
++ * @var float      $maxPoints
++ * @var bool       $canEnter
++ * @var bool       $forced
++ * @var string     $reason
++ * @var array      $rows
++ */
++declare(strict_types=1);
++
++set_title('Saisie — ' . $subject['subject_name'] . ' — ' . $classroom['code']);
++
++$entered = 0;
++
++foreach ($rows as $row) {
++    if ($row['points'] !== null || (int) $row['is_absent'] === 1) {
++        $entered++;
++    }
++}
++
++$action = url('/notes/classe/' . (int) $classroom['id']
++    . '/branche/' . (int) $subject['id']
++    . '/periode/' . (int) $period['id']);
++?>
++
++<div class="page-head">
++    <div>
++        <h1 class="page-title"><?= e($subject['subject_name']) ?></h1>
++        <p class="page-subtitle">
++            <strong><?= e($classroom['name']) ?></strong>
++            · <?= e($period['name']) ?>
++            · noté sur <strong><?= e(grades_format($maxPoints)) ?></strong>
++            <?php if ((float) $period['max_multiplier'] !== 1.0): ?>
++                <span class="text-secondary">
++                    (<?= (int) $subject['max_points'] ?> × <?= e(grades_format((float) $period['max_multiplier'])) ?>)
++                </span>
++            <?php endif; ?>
++            · <?= $entered ?> / <?= count($rows) ?> saisie(s)
++        </p>
++    </div>
++
++    <a href="<?= e(url('/notes/classe/' . (int) $classroom['id'])) ?>" class="btn btn-outline-secondary">
++        <i class="bi bi-arrow-left me-1"></i> La classe
++    </a>
++</div>
++
++<?php require APP_PATH . '/views/partials/flash.php'; ?>
++
++<?php if (!$canEnter): ?>
++    <div class="alert alert-secondary d-flex align-items-start gap-2">
++        <i class="bi bi-lock"></i>
++        <div>
++            <strong>Lecture seule.</strong>
++            <?= e($reason !== '' ? $reason : 'La saisie ne vous est pas ouverte pour cette branche.') ?>
++        </div>
++    </div>
++<?php elseif ($forced): ?>
++    <div class="alert alert-warning d-flex align-items-start gap-2">
++        <i class="bi bi-exclamation-triangle"></i>
++        <div>
++            <strong>Période verrouillée.</strong>
++            Vous y accédez au titre d'une permission d'exception.
++            Chaque enregistrement sera journalisé à votre nom.
++        </div>
++    </div>
++<?php endif; ?>
++
++<?php if ($rows === []): ?>
++    <div class="card">
++        <div class="card-body text-center py-5">
++            <i class="bi bi-people display-6 text-secondary d-block mb-2"></i>
++            <p class="mb-1 fw-medium">Aucun élève inscrit dans cette classe.</p>
++            <p class="text-secondary small mb-0">Affectez d'abord les élèves à la classe.</p>
++        </div>
++    </div>
++<?php else: ?>
++    <form method="post" action="<?= e($action) ?>">
++        <?= csrf_field() ?>
++
++        <div class="card">
++            <div class="table-responsive">
++                <table class="table table-hover align-middle mb-0 grade-sheet">
++                    <thead>
++                        <tr>
++                            <th scope="col" style="width:3rem" class="text-center">#</th>
++                            <th scope="col">Élève</th>
++                            <th scope="col" class="d-none d-md-table-cell">Matricule</th>
++                            <th scope="col" style="width:9rem" class="text-center">
++                                Cote / <?= e(grades_format($maxPoints)) ?>
++                            </th>
++                            <th scope="col" style="width:6rem" class="text-center">Absent</th>
++                        </tr>
++                    </thead>
++                    <tbody>
++                        <?php foreach ($rows as $index => $row): ?>
++                            <?php $id = (int) $row['enrollment_id']; ?>
++                            <tr>
++                                <td class="text-center text-secondary"><?= $index + 1 ?></td>
++                                <td>
++                                    <span class="fw-medium">
++                                        <?= e(full_name($row['last_name'], $row['post_name'], $row['first_name'])) ?>
++                                    </span>
++                                    <?php if ($row['gender'] !== null): ?>
++                                        <span class="badge bg-light text-secondary ms-1"><?= e($row['gender']) ?></span>
++                                    <?php endif; ?>
++                                </td>
++                                <td class="d-none d-md-table-cell">
++                                    <span class="small text-secondary"><?= e($row['matricule']) ?></span>
++                                </td>
++                                <td class="text-center">
++                                    <input type="number"
++                                           class="form-control form-control-sm text-center"
++                                           name="points[<?= $id ?>]"
++                                           value="<?= $row['points'] !== null ? e(rtrim(rtrim((string) $row['points'], '0'), '.')) : '' ?>"
++                                           step="0.25" min="0" max="<?= e((string) $maxPoints) ?>"
++                                           inputmode="decimal"
++                                           aria-label="Cote de <?= e(full_name($row['last_name'], $row['post_name'], $row['first_name'])) ?>"
++                                           <?= $canEnter ? '' : 'disabled' ?>
++                                           <?= (int) $row['is_absent'] === 1 ? 'disabled' : '' ?>>
++                                </td>
++                                <td class="text-center">
++                                    <input type="checkbox"
++                                           class="form-check-input"
++                                           name="absent[<?= $id ?>]" value="1"
++                                           data-grade-absent
++                                           aria-label="Absent"
++                                           <?= (int) $row['is_absent'] === 1 ? 'checked' : '' ?>
++                                           <?= $canEnter ? '' : 'disabled' ?>>
++                                </td>
++                            </tr>
++                        <?php endforeach; ?>
++                    </tbody>
++                </table>
++            </div>
++        </div>
++
++        <?php if ($canEnter): ?>
++            <div class="d-flex flex-wrap gap-2 align-items-center mt-3">
++                <button type="submit" class="btn btn-primary">
++                    <i class="bi bi-check-lg me-1"></i> Enregistrer la colonne
++                </button>
++                <span class="small text-secondary">
++                    Une case laissée vide efface la cote. Cocher « Absent » n'équivaut pas à zéro.
++                </span>
++            </div>
++        <?php endif; ?>
++    </form>
++<?php endif; ?>
+diff --git a/database/migrations/2026_09_13_007_phase4b_notes.sql b/database/migrations/2026_09_13_007_phase4b_notes.sql
+new file mode 100644
+index 0000000..ed46111
+--- /dev/null
++++ b/database/migrations/2026_09_13_007_phase4b_notes.sql
+@@ -0,0 +1,141 @@
++-- =====================================================================
++--  MIGRATION — Phase 4B : Notes
++--
++--  Périmètre : la cote d'un élève, dans une branche, pour une période.
++--  C'est la pièce que le bulletin additionne.
++--
++--  Le modèle de notation de la RDC
++--  ------------------------------
++--  Il n'y a pas de coefficient séparé : le MAXIMUM EST la pondération.
++--  Une branche notée sur 40 pèse deux fois une branche notée sur 20.
++--
++--  Le maximum applicable à une période se calcule ainsi :
++--
++--      curriculum_subjects.max_points  ×  grade_periods.max_multiplier
++--
++--  Mathématiques sur 40, première période (×1)  → sur 40
++--  Mathématiques sur 40, examen (×2)            → sur 80
++--
++--  Sur l'année : 40 + 40 + 80 + 40 + 40 + 80 = 320.
++--
++--
++--  LA DÉCISION CENTRALE DE CETTE MIGRATION
++--  ---------------------------------------
++--  `grades.max_points` est FIGÉ à la saisie. Il n'est pas recalculé,
++--  jamais, ni à l'affichage ni à l'édition du bulletin.
++--
++--  Sans cela : une école corrige en mars le maximum de mathématiques,
++--  de 40 à 20. Toutes les cotes déjà saisies — 32/40, 37/40 — deviennent
++--  32/20 et 37/20. Les bulletins du premier trimestre, déjà remis aux
++--  parents et signés, ne sont plus reproductibles.
++--
++--  C'est le même principe que les libellés figés des orientations en
++--  phase 3 : un document scolaire porte les termes en vigueur au moment
++--  où il a été établi. L'historique ne se réécrit jamais.
++--
++--  À appliquer avec : php database/migrate.php
++-- =====================================================================
++
++SET NAMES utf8mb4;
++
++
++CREATE TABLE grades (
++    id                    BIGINT UNSIGNED  NOT NULL AUTO_INCREMENT,
++    school_id             BIGINT UNSIGNED  NOT NULL,
++
++    -- La cote est rattachée à l'INSCRIPTION, pas à l'élève.
++    --
++    -- Une inscription porte à la fois l'élève, l'année et la classe :
++    -- c'est exactement le périmètre d'un bulletin. Rattacher la cote à
++    -- l'élève obligerait à répéter l'année partout, et un élève
++    -- réinscrit hériterait des cotes de l'année précédente.
++    --
++    -- Effet voulu : un élève transféré de 5A en 5B en janvier conserve
++    -- ses cotes, puisque son inscription le suit.
++    enrollment_id         BIGINT UNSIGNED  NOT NULL,
++
++    curriculum_subject_id BIGINT UNSIGNED  NOT NULL,
++    grade_period_id       BIGINT UNSIGNED  NOT NULL,
++
++    -- Décimal, et non entier.
++    --
++    -- Le bulletin officiel affiche des entiers, mais la cote d'une
++    -- période est souvent la moyenne de plusieurs interrogations : elle
++    -- vaut naturellement 12,5. Arrondir à la saisie perdrait
++    -- l'information définitivement ; arrondir à l'affichage la conserve.
++    -- On stocke ce qui est vrai, on affiche ce qui est réglementaire.
++    points                DECIMAL(6,2)     NULL,
++
++    -- FIGÉ à la saisie. Voir l'en-tête de ce fichier.
++    max_points            DECIMAL(6,2)     NOT NULL,
++
++    -- L'absence n'est pas un zéro.
++    --
++    -- Un élève absent à une interrogation n'a pas échoué : il n'a pas
++    -- composé. Les confondre fausse la moyenne et prive le conseil de
++    -- classe d'une information dont il a besoin. Le traitement — zéro,
++    -- rattrapage, exclusion du calcul — relève de la règle de
++    -- l'établissement, pas du stockage.
++    is_absent             TINYINT(1)       NOT NULL DEFAULT 0,
++
++    comment               VARCHAR(255)     NULL,
++
++    entered_by            BIGINT UNSIGNED  NULL,
++    entered_at            DATETIME         NULL,
++    updated_by            BIGINT UNSIGNED  NULL,
++
++    created_at            DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    updated_at            DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++
++    PRIMARY KEY (id),
++
++    -- Une seule cote par élève, par branche, par période. La contrainte
++    -- rend l'écriture idempotente : la saisie utilise
++    -- INSERT ... ON DUPLICATE KEY UPDATE, sans lecture préalable, donc
++    -- sans fenêtre de concurrence entre deux enseignants.
++    UNIQUE KEY uq_grade_slot (school_id, enrollment_id, curriculum_subject_id, grade_period_id),
++
++    -- Index de la grille de saisie : « toutes les cotes de cette branche
++    -- pour cette période ». C'est la requête la plus fréquente du module.
++    KEY idx_grade_sheet (school_id, grade_period_id, curriculum_subject_id),
++
++    -- Index du bulletin : « toutes les cotes de cet élève ».
++    KEY idx_grade_enrollment (school_id, enrollment_id),
++
++    CONSTRAINT fk_grade_school FOREIGN KEY (school_id)
++        REFERENCES schools (id) ON DELETE CASCADE ON UPDATE CASCADE,
++
++    -- CASCADE : annuler une inscription supprime ses cotes. Une cote
++    -- sans inscription n'a aucun sens et fausserait les effectifs.
++    CONSTRAINT fk_grade_enrollment FOREIGN KEY (enrollment_id)
++        REFERENCES enrollments (id) ON DELETE CASCADE ON UPDATE CASCADE,
++
++    -- RESTRICT : retirer une branche d'un programme alors que des cotes
++    -- existent doit être un refus explicite. Supprimer silencieusement
++    -- les notes d'un trimestre serait une perte irréparable.
++    CONSTRAINT fk_grade_subject FOREIGN KEY (curriculum_subject_id)
++        REFERENCES curriculum_subjects (id) ON DELETE RESTRICT ON UPDATE CASCADE,
++
++    CONSTRAINT fk_grade_period FOREIGN KEY (grade_period_id)
++        REFERENCES grade_periods (id) ON DELETE RESTRICT ON UPDATE CASCADE,
++
++    CONSTRAINT fk_grade_entered_by FOREIGN KEY (entered_by)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE,
++    CONSTRAINT fk_grade_updated_by FOREIGN KEY (updated_by)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE
++) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
++  COMMENT='Cote d un élève dans une branche pour une période';
++
++
++-- ---------------------------------------------------------------------
++--  Verrouillage d'une période : qui, quand
++--
++--  grade_periods.is_locked existait déjà. Savoir QUI a verrouillé et
++--  QUAND est indispensable : le verrou fige les cotes d'un trimestre
++--  entier, c'est un acte de direction qui doit être attribuable.
++-- ---------------------------------------------------------------------
++ALTER TABLE grade_periods
++    ADD COLUMN locked_at DATETIME        NULL AFTER is_locked,
++    ADD COLUMN locked_by BIGINT UNSIGNED NULL AFTER locked_at,
++    ADD CONSTRAINT fk_period_locked_by FOREIGN KEY (locked_by)
++        REFERENCES users (id) ON DELETE SET NULL ON UPDATE CASCADE;
+diff --git a/public/assets/js/app.js b/public/assets/js/app.js
+index 6948e7b..59d4831 100644
+--- a/public/assets/js/app.js
++++ b/public/assets/js/app.js
+@@ -132,6 +132,41 @@
+         });
+     }
+ 
++    /* =================================================================
++       Grille de saisie des notes
++       Usage : <input type="checkbox" data-grade-absent>
++
++       Cocher « Absent » vide et désactive la cote de la même ligne.
++       Une absence n'est pas un zéro : laisser les deux saisissables
++       inviterait à écrire « 0 » pour un élève qui n'a pas composé, ce
++       qui fausse la moyenne et prive le conseil de classe d'une
++       information dont il a besoin.
++
++       Le serveur applique la même règle : ceci n'est qu'un confort.
++       ================================================================= */
++
++    function initGradeSheet() {
++        document.querySelectorAll('[data-grade-absent]').forEach((checkbox) => {
++            const row = checkbox.closest('tr');
++            const input = row ? row.querySelector('input[type="number"]') : null;
++
++            if (!input) {
++                return;
++            }
++
++            const sync = () => {
++                input.disabled = checkbox.checked;
++
++                if (checkbox.checked) {
++                    input.value = '';
++                }
++            };
++
++            checkbox.addEventListener('change', sync);
++            sync();
++        });
++    }
++
+     /* =================================================================
+        Confirmation avant action destructive
+        Usage : <button data-confirm="Supprimer cet élève ?">
+@@ -276,6 +311,7 @@
+         initSidebar();
+         initPasswordToggles();
+         initAutoSubmit();
++        initGradeSheet();
+         initConfirmations();
+         initSubmitGuard();
+         initNetworkStatus();
+diff --git a/tests/grades_isolation.php b/tests/grades_isolation.php
+new file mode 100644
+index 0000000..f5d7290
+--- /dev/null
++++ b/tests/grades_isolation.php
+@@ -0,0 +1,611 @@
++<?php
++/**
++ * Phase 4B — notes : autorisation, bornes, verrouillage, maxima figés.
++ *
++ * Ce que ces tests protègent
++ * --------------------------
++ * Une cote décide du passage de classe. Trois choses doivent tenir :
++ *
++ *  · seul l'enseignant de LA branche de LA classe peut saisir ;
++ *  · une cote ne peut pas dépasser son maximum, ni être négative ;
++ *  · le maximum figé à la saisie ne bouge JAMAIS, même si l'école
++ *    modifie ensuite le programme.
++ *
++ * Le troisième point est le plus important et le moins visible : sans
++ * lui, corriger un maximum en mars réécrirait tous les bulletins déjà
++ * remis aux parents.
++ *
++ * Usage : php tests/grades_isolation.php
++ */
++declare(strict_types=1);
++
++require dirname(__DIR__) . '/app/bootstrap.php';
++require APP_PATH . '/modules/curriculum/services.php';
++require APP_PATH . '/modules/students/services.php';
++require APP_PATH . '/modules/teachers/services.php';
++require APP_PATH . '/modules/grades/services.php';
++
++$pass = 0;
++$fail = 0;
++
++function check(string $label, bool $ok, string $detail = ''): void
++{
++    global $pass, $fail;
++    $ok ? $pass++ : $fail++;
++    printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
++}
++
++/** Ouvre une session de test au nom d'un utilisateur portant un rôle système. */
++function act_as(int $schoolId, string $roleCode): int
++{
++    static $counter = 0;
++    $counter++;
++
++    $userId = db_insert('users', [
++        'uuid'          => str_uuid(),
++        'school_id'     => $schoolId,
++        'username'      => 'note.' . strtolower($roleCode) . '.' . $counter,
++        'email'         => 'note' . $counter . '@example.test',
++        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
++        'last_name'     => 'TEST',
++        'first_name'    => ucfirst(strtolower($roleCode)),
++        'status'        => 'active',
++    ], true);
++
++    db_query(
++        'INSERT INTO user_roles (user_id, role_id)
++         SELECT :user_id, id FROM roles WHERE code = :code AND school_id IS NULL',
++        ['user_id' => $userId, 'code' => $roleCode],
++        true
++    );
++
++    $_SESSION['user_id']   = $userId;
++    $_SESSION['school_id'] = $schoolId;
++
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++
++    return $userId;
++}
++
++/** Bascule vers un utilisateur déjà créé. */
++function switch_to(int $userId, int $schoolId): void
++{
++    $_SESSION['user_id']   = $userId;
++    $_SESSION['school_id'] = $schoolId;
++    auth_user(true);
++    perm_all(true);
++    perm_roles(true);
++    tenant_set($schoolId);
++}
++
++echo "\n  NOTES — AUTORISATION, BORNES ET MAXIMA FIGÉS\n";
++echo "  ──────────────────────────────────────────────────────\n\n";
++
++$createdSchools = [];
++
++try {
++    // -----------------------------------------------------------------
++    //  Mise en place
++    // -----------------------------------------------------------------
++    $schoolId = db_insert('schools', [
++        'uuid' => str_uuid(), 'code' => 'NOTE-A', 'slug' => 'note-a',
++        'name' => 'École des Notes', 'status' => 'active',
++    ], true);
++    $createdSchools[] = $schoolId;
++
++    db_query(
++        'INSERT INTO school_cycles (school_id, cycle_id, is_active)
++         SELECT :s, id, 1 FROM education_cycles',
++        ['s' => $schoolId]
++    );
++
++    act_as($schoolId, 'DIRECTION');
++    tenant_set($schoolId);
++
++    $yearId = tenant_insert('academic_years', [
++        'code' => '2080-2081', 'name' => 'Test notes', 'starts_on' => '2080-09-01',
++        'ends_on' => '2081-07-31', 'status' => 'active', 'is_current' => 1,
++    ]);
++
++    curriculum_service_import_national();
++    curriculum_service_create_standard_periods($yearId);
++
++    $levelId = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_5'", [], true);
++    $program = curriculum_service_create_program($yearId, $levelId, null, null);
++    curriculum_service_fill_program((int) $program['id']);
++    curriculum_service_activate((int) $program['id']);
++
++    $classA = tenant_insert('classrooms', [
++        'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
++        'code' => '5A', 'name' => '5ème primaire A', 'capacity' => 40,
++    ]);
++    $classB = tenant_insert('classrooms', [
++        'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
++        'code' => '5B', 'name' => '5ème primaire B', 'capacity' => 40,
++    ]);
++
++    // Deux branches du programme, dont une notée sur 40.
++    $subjects = tenant_all(
++        'curriculum_subjects',
++        'curriculum_id = :c ORDER BY max_points DESC, order_number LIMIT 2',
++        ['c' => (int) $program['id']]
++    );
++    $subjectBig   = (int) $subjects[0]['id'];
++    $subjectOther = (int) $subjects[1]['id'];
++    $bigMax       = (int) $subjects[0]['max_points'];
++
++    $periodP1 = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'P1']);
++    $periodEx = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'EX1']);
++
++    check('Périodes standard créées', $periodP1 !== null && $periodEx !== null);
++
++    // Trois élèves en 5A, un en 5B.
++    $eleves = [];
++
++    foreach ([['KABILA', 'Grace', 'F'], ['MUKENDI', 'Joseph', 'M'], ['ILUNGA', 'Esther', 'F']] as $s) {
++        $r = students_service_enroll_new(
++            ['last_name' => $s[0], 'first_name' => $s[1], 'gender' => $s[2]],
++            $yearId,
++            $classA
++        );
++        $eleves[] = (int) $r['id'];
++    }
++
++    $eleveB = students_service_enroll_new(
++        ['last_name' => 'TSHALA', 'first_name' => 'Bijou', 'gender' => 'F'],
++        $yearId,
++        $classB
++    );
++
++    check('Quatre élèves inscrits', count($eleves) === 3 && $eleveB['ok']);
++
++    $enrollA = [];
++
++    foreach ($eleves as $studentId) {
++        $enrollA[] = (int) students_repo_enrollment($studentId, $yearId)['id'];
++    }
++
++    $enrollB = (int) students_repo_enrollment((int) $eleveB['id'], $yearId)['id'];
++
++    // Un enseignant, affecté à UNE branche de 5A seulement.
++    $teacher = teachers_service_create([
++        'last_name' => 'MULUMBA', 'first_name' => 'Pierre', 'specialty' => 'Mathématiques',
++    ]);
++    $teacherId = (int) $teacher['id'];
++
++    $assign = teachers_service_assign($teacherId, $classA, $subjectBig, 6.0);
++    check('Branche confiée à l\'enseignant', $assign['ok'], $assign['message']);
++
++    $teacherUserId = act_as($schoolId, 'ENSEIGNANT');
++    tenant_set($schoolId);
++    tenant_update('teachers', ['user_id' => $teacherUserId], 'id = :id', ['id' => $teacherId]);
++
++    // =================================================================
++    //  AUTORISATION EN DEUX TEMPS
++    // =================================================================
++    switch_to($teacherUserId, $schoolId);
++
++    check('L\'enseignant détient grade.enter', perm_has('grade.enter'));
++    check('Il ne détient PAS grade.validate', !perm_has('grade.validate'));
++
++    $can = grades_service_can_enter($classA, $subjectBig);
++    check('Saisie autorisée dans SA branche de SA classe', $can['ok'], $can['message']);
++
++    $cannotSubject = grades_service_can_enter($classA, $subjectOther);
++    check(
++        'Saisie REFUSÉE dans une branche qu\'on ne lui a pas confiée',
++        !$cannotSubject['ok'] && str_contains($cannotSubject['message'], 'pas confiée'),
++        $cannotSubject['message']
++    );
++
++    $cannotClass = grades_service_can_enter($classB, $subjectBig);
++    check(
++        'Saisie REFUSÉE dans une classe qui n\'est pas la sienne',
++        !$cannotClass['ok'],
++        $cannotClass['message']
++    );
++
++    // La permission seule ne suffit pas : le service refuse même en
++    // passant directement par l'enregistrement.
++    $forged = grades_service_save_sheet($classB, $subjectBig, (int) $periodP1['id'], [
++        $enrollB => ['points' => 15, 'is_absent' => false],
++    ]);
++    check(
++        'Enregistrement direct dans une autre classe : refusé',
++        !$forged['ok'],
++        $forged['message']
++    );
++
++    // =================================================================
++    //  SAISIE ET BORNES
++    // =================================================================
++    $save = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 32, 'is_absent' => false],
++        $enrollA[1] => ['points' => 0,  'is_absent' => false],
++        $enrollA[2] => ['points' => null, 'is_absent' => true],
++    ]);
++    check('Trois cotes enregistrées', $save['ok'] && $save['saved'] === 3, $save['message']);
++
++    $sheet = grades_repo_sheet($classA, $subjectBig, (int) $periodP1['id']);
++    $byEnrollment = [];
++
++    foreach ($sheet as $row) {
++        $byEnrollment[(int) $row['enrollment_id']] = $row;
++    }
++
++    check(
++        'Le maximum figé vaut le maximum de la branche × le poids de la période',
++        abs((float) $byEnrollment[$enrollA[0]]['max_points'] - (float) $bigMax) < 0.001,
++        $byEnrollment[$enrollA[0]]['max_points'] . ' attendu ' . $bigMax
++    );
++
++    check(
++        'Un zéro est bien enregistré comme un zéro',
++        (float) $byEnrollment[$enrollA[1]]['points'] === 0.0
++            && (int) $byEnrollment[$enrollA[1]]['is_absent'] === 0
++    );
++
++    check(
++        'Une absence n\'est PAS un zéro',
++        $byEnrollment[$enrollA[2]]['points'] === null
++            && (int) $byEnrollment[$enrollA[2]]['is_absent'] === 1
++    );
++
++    // Bornes.
++    $tooHigh = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => $bigMax + 1, 'is_absent' => false],
++    ]);
++    check(
++        'Cote supérieure au maximum : rejetée',
++        !$tooHigh['ok'] && isset($tooHigh['errors'][$enrollA[0]]),
++        $tooHigh['errors'][$enrollA[0]] ?? ''
++    );
++
++    $negative = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => -1, 'is_absent' => false],
++    ]);
++    check(
++        'Cote négative : rejetée',
++        !$negative['ok'] && isset($negative['errors'][$enrollA[0]]),
++        $negative['errors'][$enrollA[0]] ?? ''
++    );
++
++    $notNumeric = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 'douze', 'is_absent' => false],
++    ]);
++    check(
++        'Cote non numérique : rejetée',
++        !$notNumeric['ok'] && isset($notNumeric['errors'][$enrollA[0]]),
++        $notNumeric['errors'][$enrollA[0]] ?? ''
++    );
++
++    // La cote d'origine n'a pas bougé.
++    $after = grades_repo_sheet($classA, $subjectBig, (int) $periodP1['id']);
++    $stillThere = null;
++
++    foreach ($after as $row) {
++        if ((int) $row['enrollment_id'] === $enrollA[0]) {
++            $stillThere = $row;
++        }
++    }
++
++    check(
++        'Une saisie rejetée ne détruit pas la cote déjà posée',
++        $stillThere !== null && (float) $stillThere['points'] === 32.0,
++        (string) ($stillThere['points'] ?? 'null')
++    );
++
++    // Un élève d'une AUTRE classe glissé dans l'envoi.
++    $intruder = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 30, 'is_absent' => false],
++        $enrollB    => ['points' => 18, 'is_absent' => false],
++    ]);
++    check(
++        'Un élève d\'une AUTRE classe glissé dans l\'envoi est rejeté',
++        $intruder['ok'] && isset($intruder['errors'][$enrollB]) && $intruder['saved'] === 1,
++        $intruder['errors'][$enrollB] ?? ''
++    );
++
++    check(
++        'Aucune cote n\'a été posée sur l\'élève de l\'autre classe',
++        grades_repo_sheet($classB, $subjectBig, (int) $periodP1['id'])[0]['points'] === null
++    );
++
++    // Décimales conservées.
++    $decimal = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[1] => ['points' => 12.5, 'is_absent' => false],
++    ]);
++    check('Cote décimale acceptée', $decimal['ok'], $decimal['message']);
++
++    $sheet2 = grades_repo_sheet($classA, $subjectBig, (int) $periodP1['id']);
++    $decimalRow = null;
++
++    foreach ($sheet2 as $row) {
++        if ((int) $row['enrollment_id'] === $enrollA[1]) {
++            $decimalRow = $row;
++        }
++    }
++
++    check(
++        'La décimale est conservée en base, pas arrondie',
++        $decimalRow !== null && abs((float) $decimalRow['points'] - 12.5) < 0.001,
++        (string) ($decimalRow['points'] ?? '')
++    );
++
++    // =================================================================
++    //  LE POIDS DE LA PÉRIODE
++    // =================================================================
++    $examMax = grades_max_for($subjects[0], $periodEx);
++    check(
++        'La période d\'examen double le maximum',
++        abs($examMax - $bigMax * 2.0) < 0.001,
++        $examMax . ' pour un maximum de branche de ' . $bigMax
++    );
++
++    $examSave = grades_service_save_sheet($classA, $subjectBig, (int) $periodEx['id'], [
++        $enrollA[0] => ['points' => $bigMax + 10, 'is_absent' => false],
++    ]);
++    check(
++        'Une cote refusée en période simple passe à l\'examen',
++        $examSave['ok'] && $examSave['saved'] === 1,
++        $examSave['message']
++    );
++
++    // =================================================================
++    //  LE MAXIMUM FIGÉ NE BOUGE PAS
++    //
++    //  C'est la garantie centrale de cette phase : l'école corrige le
++    //  programme en cours d'année, les cotes déjà posées gardent leur
++    //  barème d'origine.
++    // =================================================================
++    act_as($schoolId, 'DIRECTION');
++    tenant_set($schoolId);
++
++    tenant_update('curriculum_subjects', ['max_points' => 10], 'id = :id', ['id' => $subjectBig]);
++
++    $afterChange = grades_repo_sheet($classA, $subjectBig, (int) $periodP1['id']);
++    $frozen = null;
++
++    foreach ($afterChange as $row) {
++        if ((int) $row['enrollment_id'] === $enrollA[0]) {
++            $frozen = $row;
++        }
++    }
++
++    check(
++        'Le maximum de la branche a bien été modifié dans le programme',
++        (int) tenant_find('curriculum_subjects', $subjectBig)['max_points'] === 10
++    );
++
++    check(
++        'La cote déjà posée conserve son maximum d\'origine',
++        $frozen !== null && abs((float) $frozen['max_points'] - (float) $bigMax) < 0.001,
++        $frozen['max_points'] . ' au lieu de ' . $bigMax
++    );
++
++    check(
++        'Et sa valeur n\'a pas changé non plus',
++        $frozen !== null && (float) $frozen['points'] === 30.0,
++        (string) ($frozen['points'] ?? '')
++    );
++
++    // Le relevé retient le maximum figé, pas le courant.
++    $report = grades_repo_report($enrollA[0]);
++    $reportRow = null;
++
++    foreach ($report as $row) {
++        if ((int) $row['curriculum_subject_id'] === $subjectBig
++            && (int) $row['period_id'] === (int) $periodP1['id']) {
++            $reportRow = $row;
++        }
++    }
++
++    check(
++        'Le relevé de l\'élève utilise le maximum figé',
++        $reportRow !== null && abs((float) $reportRow['max_points'] - (float) $bigMax) < 0.001,
++        (string) ($reportRow['max_points'] ?? '')
++    );
++
++    tenant_update('curriculum_subjects', ['max_points' => $bigMax], 'id = :id', ['id' => $subjectBig]);
++
++    // =================================================================
++    //  VERROUILLAGE
++    // =================================================================
++    switch_to($teacherUserId, $schoolId);
++
++    $cannotLock = grades_service_set_period_lock((int) $periodP1['id'], true);
++    check(
++        'Un enseignant ne peut pas verrouiller une période',
++        !$cannotLock['ok'] && str_contains($cannotLock['message'], 'droit'),
++        $cannotLock['message']
++    );
++
++    act_as($schoolId, 'DIRECTION');
++    tenant_set($schoolId);
++
++    $lock = grades_service_set_period_lock((int) $periodP1['id'], true);
++    check('La direction verrouille la période', $lock['ok'], $lock['message']);
++
++    $lockedPeriod = tenant_find('grade_periods', (int) $periodP1['id']);
++    check(
++        'Le verrou est attribuable : qui et quand',
++        (int) $lockedPeriod['is_locked'] === 1
++            && $lockedPeriod['locked_by'] !== null
++            && $lockedPeriod['locked_at'] !== null
++    );
++
++    switch_to($teacherUserId, $schoolId);
++
++    $blocked = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 5, 'is_absent' => false],
++    ]);
++    check(
++        'Période verrouillée : l\'enseignant ne peut plus saisir',
++        !$blocked['ok'] && str_contains($blocked['message'], 'verrouillée'),
++        $blocked['message']
++    );
++
++    $untouched = grades_repo_sheet($classA, $subjectBig, (int) $periodP1['id']);
++    $value = null;
++
++    foreach ($untouched as $row) {
++        if ((int) $row['enrollment_id'] === $enrollA[0]) {
++            $value = (float) $row['points'];
++        }
++    }
++
++    check('La cote n\'a pas été modifiée', $value === 30.0, (string) $value);
++
++    // La direction détient grade.edit_locked.
++    act_as($schoolId, 'DIRECTION');
++    tenant_set($schoolId);
++
++    check('La direction détient grade.edit_locked', perm_has('grade.edit_locked'));
++
++    $forcedSave = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 28, 'is_absent' => false],
++    ]);
++    check(
++        'La direction peut corriger une période verrouillée',
++        $forcedSave['ok'] && $forcedSave['saved'] === 1,
++        $forcedSave['message']
++    );
++
++    $forcedLog = db_one(
++        'SELECT description FROM audit_logs
++          WHERE school_id = :s AND entity_type = :t
++          ORDER BY id DESC LIMIT 1',
++        ['s' => $schoolId, 't' => 'grade_sheet']
++    );
++    check(
++        'La saisie forcée est journalisée comme telle',
++        $forcedLog !== null && str_contains((string) $forcedLog['description'], 'VERROUILLÉE'),
++        (string) ($forcedLog['description'] ?? '')
++    );
++
++    grades_service_set_period_lock((int) $periodP1['id'], false);
++
++    // =================================================================
++    //  ANNÉE CLÔTURÉE
++    // =================================================================
++    tenant_update('academic_years', ['status' => 'closed'], 'id = :id', ['id' => $yearId]);
++
++    $closed = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
++        $enrollA[0] => ['points' => 1, 'is_absent' => false],
++    ]);
++    check(
++        'Année clôturée : plus aucune saisie, même pour la direction',
++        !$closed['ok'] && str_contains($closed['message'], 'clôturée'),
++        $closed['message']
++    );
++
++    tenant_update('academic_years', ['status' => 'active'], 'id = :id', ['id' => $yearId]);
++
++    // =================================================================
++    //  RETRAIT D'AFFECTATION AVEC DES COTES
++    // =================================================================
++    $assignment = tenant_one(
++        'teacher_subjects',
++        'classroom_id = :c AND curriculum_subject_id = :s',
++        ['c' => $classA, 's' => $subjectBig]
++    );
++
++    switch_to($teacherUserId, $schoolId);
++
++    // L'enseignant n'a pas grade.validate : le retrait lui est fermé.
++    $refusedRemoval = teachers_service_unassign($classA, (int) $assignment['id']);
++    check(
++        'Des cotes existent : le retrait d\'affectation est refusé',
++        !$refusedRemoval['ok'] && str_contains($refusedRemoval['message'], 'cote'),
++        $refusedRemoval['message']
++    );
++
++    act_as($schoolId, 'DIRECTION');
++    tenant_set($schoolId);
++
++    $allowedRemoval = teachers_service_unassign($classA, (int) $assignment['id']);
++    check(
++        'La direction peut retirer l\'affectation malgré les cotes',
++        $allowedRemoval['ok'],
++        $allowedRemoval['message']
++    );
++
++    check(
++        'Les cotes survivent au retrait de l\'affectation',
++        grades_repo_count_for_assignment($classA, $subjectBig) > 0
++    );
++
++    // =================================================================
++    //  BRANCHE HORS PROGRAMME
++    // =================================================================
++    $otherProgram = curriculum_service_create_program(
++        $yearId,
++        (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_3'", [], true),
++        null,
++        null
++    );
++    curriculum_service_fill_program((int) $otherProgram['id']);
++
++    $foreignSubject = tenant_one(
++        'curriculum_subjects',
++        'curriculum_id = :c ORDER BY order_number',
++        ['c' => (int) $otherProgram['id']]
++    );
++
++    $wrongSubject = grades_service_save_sheet(
++        $classA,
++        (int) $foreignSubject['id'],
++        (int) $periodP1['id'],
++        [$enrollA[0] => ['points' => 10, 'is_absent' => false]]
++    );
++    check(
++        'Branche absente du programme de la classe : refusée',
++        !$wrongSubject['ok'] && str_contains($wrongSubject['message'], 'ne figure pas au programme'),
++        $wrongSubject['message']
++    );
++
++    // =================================================================
++    //  GARDE-FOU MULTI-ÉCOLE
++    // =================================================================
++    $blockedGuard = false;
++
++    try {
++        db_query('SELECT * FROM grades LIMIT 1');
++    } catch (Throwable) {
++        $blockedGuard = true;
++    }
++
++    check('Garde-fou actif sur « grades »', $blockedGuard);
++} finally {
++    unset($_SESSION['user_id'], $_SESSION['school_id']);
++
++    foreach ($createdSchools as $schoolId) {
++        tenant_set($schoolId);
++
++        db_query('UPDATE classrooms SET main_teacher_id = NULL WHERE school_id = :s', ['s' => $schoolId]);
++
++        foreach ([
++            'grades', 'student_history', 'orientations', 'student_guardians',
++            'enrollments', 'guardians', 'students', 'student_counters',
++            'teacher_subjects', 'teachers', 'classrooms',
++            'curriculum_subjects', 'curriculums', 'grade_periods',
++            'subjects', 'options', 'sections', 'academic_years', 'audit_logs',
++        ] as $table) {
++            db_query("DELETE FROM {$table} WHERE school_id = :school_id", ['school_id' => $schoolId]);
++        }
++
++        db_query('DELETE FROM school_settings WHERE school_id = :s', ['s' => $schoolId]);
++        db_query('DELETE FROM user_roles WHERE user_id IN (SELECT id FROM users WHERE school_id = :s)',
++            ['s' => $schoolId], true);
++        db_query('DELETE FROM users WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM school_cycles WHERE school_id = :s', ['s' => $schoolId], true);
++        db_query('DELETE FROM schools WHERE id = :s', ['s' => $schoolId], true);
++    }
++}
++
++echo "\n  ──────────────────────────────────────────────────\n";
++printf("  %d test(s) réussi(s), %d échec(s)\n\n", $pass, $fail);
++
++exit($fail === 0 ? 0 : 1);
+-- 
+2.43.0
+
