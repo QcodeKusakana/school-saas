@@ -67,9 +67,16 @@ foreach ($subjects as $subject) {
         </p>
     </div>
 
-    <a href="<?= e(url('/notes')) ?>" class="btn btn-outline-secondary">
-        <i class="bi bi-arrow-left me-1"></i> Notes
-    </a>
+    <div class="d-flex gap-2">
+        <?php if (can('bulletin.generate')): ?>
+            <a href="<?= e(url('/bulletins/classe/' . (int) $classroom['id'])) ?>" class="btn btn-primary">
+                <i class="bi bi-file-earmark-text me-1"></i> Bulletins
+            </a>
+        <?php endif; ?>
+        <a href="<?= e(url('/notes')) ?>" class="btn btn-outline-secondary">
+            <i class="bi bi-arrow-left me-1"></i> Notes
+        </a>
+    </div>
 </div>
 
 <?php require APP_PATH . '/views/partials/flash.php'; ?>

@@ -505,6 +505,7 @@ function curriculum_service_update_subjects(int $curriculumId, array $rows): int
 
     return db_transaction(static function () use ($rows, $allowed, $curriculumId, $program): int {
         $updated = 0;
+        $blocked = [];
 
         foreach ($rows as $id => $values) {
             $id = (int) $id;
@@ -517,6 +518,40 @@ function curriculum_service_update_subjects(int $curriculumId, array $rows): int
 
             if ($maxPoints < 1 || $maxPoints > 200) {
                 continue;
+            }
+
+            // Le maximum d'une branche ne change plus dès qu'une cote
+            // existe.
+            //
+            // grades.max_points est figé à la saisie et n'est jamais
+            // recalculé — c'est ce qui rend un bulletin reproductible.
+            // Mais si le programme, lui, continue de bouger, la borne de
+            // saisie et le barème stocké cessent de parler de la même
+            // chose : une branche portée de 40 à 100 laissait enregistrer
+            // 95 sur une ligne figée à 40, soit 237 % du maximum.
+            //
+            // Interdire la modification est la seule correction qui ferme
+            // le problème à sa source. Une école qui veut vraiment
+            // changer un barème en cours d'année doit d'abord assumer la
+            // suppression des cotes concernées : c'est une décision, pas
+            // un effet de bord.
+            $current = tenant_one(
+                'curriculum_subjects',
+                'id = :id AND curriculum_id = :curriculum_id',
+                ['id' => $id, 'curriculum_id' => $curriculumId]
+            );
+
+            if ($current !== null && (int) $current['max_points'] !== $maxPoints) {
+                $existingGrades = (int) db_value(
+                    'SELECT COUNT(*) FROM grades
+                      WHERE school_id = :school_id AND curriculum_subject_id = :id',
+                    ['school_id' => tenant_require(), 'id' => $id]
+                );
+
+                if ($existingGrades > 0) {
+                    $blocked[] = $id;
+                    continue;
+                }
             }
 
             $hours = isset($values['weekly_hours']) && $values['weekly_hours'] !== ''
@@ -535,13 +570,20 @@ function curriculum_service_update_subjects(int $curriculumId, array $rows): int
             ]);
         }
 
+        if ($blocked !== []) {
+            flash_warning(
+                count($blocked) . ' branche(s) n\'ont pas été modifiées : des cotes y sont '
+                . 'déjà saisies, et changer leur maximum fausserait les bulletins déjà établis.'
+            );
+        }
+
         if ($updated > 0) {
             audit_log(
                 'update',
                 'curriculum',
                 $curriculumId,
                 null,
-                ['rows' => $updated],
+                ['rows' => $updated, 'blocked' => count($blocked)],
                 'Modification des maxima du programme ' . $program['name']
             );
         }

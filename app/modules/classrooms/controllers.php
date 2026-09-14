@@ -230,11 +230,18 @@ function ctrl_classrooms_show(string $id): void
     $classroomId = (int) $id;
     $classroom   = tenant_find('classrooms', $classroomId);
 
-    if ($classroom === null) {
+    require_once APP_PATH . '/modules/students/repositories.php';
+
+    // Le périmètre vaut pour la classe entière, pas seulement pour la
+    // liste nominative : l'effectif, le taux de remplissage et le nom du
+    // titulaire sont eux aussi des informations de gestion.
+    //
+    // 404 et non 403 : confirmer l'existence d'une classe qu'on n'a pas
+    // le droit de consulter renseigne déjà sur l'organisation de
+    // l'établissement.
+    if ($classroom === null || !students_can_view_classroom($classroomId)) {
         abort(404, 'Classe introuvable.');
     }
-
-    require_once APP_PATH . '/modules/students/repositories.php';
 
     $details = db_one(
         'SELECT c.*, cu.name AS curriculum_name, l.name AS level_name,

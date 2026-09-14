@@ -379,6 +379,112 @@ try {
     );
 
     // =================================================================
+    //  LA CLASSE EST UNE PORTE, ELLE AUSSI
+    //
+    //  Ces contrôles existent parce qu'une faille réelle leur avait
+    //  échappé : /eleves et /eleves/{id} étaient protégés, mais
+    //  /classes/{id} affichait la liste nominative de N'IMPORTE QUELLE
+    //  classe — matricule, nom, sexe, date de naissance — au moindre
+    //  compte détenant « classroom.view », que le rôle ENSEIGNANT
+    //  possède.
+    //
+    //  Une restriction d'accès ne vaut que si TOUTES les portes la
+    //  portent.
+    // =================================================================
+    // Il avait été fait titulaire de 5B au test précédent : on lui
+    // retire ce titre pour que 5B redevienne une classe étrangère.
+    act_as($a['school_id'], 'DIRECTION');
+    tenant_set($a['school_id']);
+    teachers_service_set_main_teacher($a['classroom_b'], null);
+
+    $_SESSION['user_id'] = $teacherUserId;
+    auth_user(true);
+    perm_all(true);
+    perm_roles(true);
+    tenant_set($a['school_id']);
+
+    check(
+        'La classe qui lui est confiée est consultable',
+        students_can_view_classroom($a['classroom_a'])
+    );
+
+    check(
+        'La liste nominative d\'une AUTRE classe est vide',
+        students_repo_classroom_students($a['classroom_b']) === [],
+        count(students_repo_classroom_students($a['classroom_b'])) . ' élève(s)'
+    );
+
+    check(
+        'L\'écran d\'une autre classe lui est refusé',
+        !students_can_view_classroom($a['classroom_b'])
+    );
+
+    // Le personnel administratif, lui, voit tout.
+    act_as($a['school_id'], 'SECRETARIAT');
+    tenant_set($a['school_id']);
+
+    check(
+        'Le secrétariat voit la liste nominative de chaque classe',
+        students_repo_classroom_students($a['classroom_b']) !== []
+    );
+
+    // =================================================================
+    //  LE PÉRIMÈTRE EST BORNÉ À L'ANNÉE
+    //
+    //  Sans cette borne, les classes s'accumulent d'année en année et un
+    //  professeur conserve à vie l'accès au dossier COURANT de tout
+    //  élève qu'il a eu une seule fois.
+    // =================================================================
+    act_as($a['school_id'], 'DIRECTION');
+    tenant_set($a['school_id']);
+
+    $nextYear = tenant_insert('academic_years', [
+        'code' => '2071-2072', 'name' => 'Année suivante', 'starts_on' => '2071-09-01',
+        'ends_on' => '2072-07-31', 'status' => 'active',
+    ]);
+
+    $nextProgram = curriculum_service_create_program(
+        $nextYear,
+        (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_6'", [], true),
+        null,
+        null
+    );
+    curriculum_service_fill_program((int) $nextProgram['id']);
+    curriculum_service_activate((int) $nextProgram['id']);
+
+    $nextClassroom = tenant_insert('classrooms', [
+        'academic_year_id' => $nextYear, 'curriculum_id' => (int) $nextProgram['id'],
+        'code' => '6A', 'name' => '6ème primaire A', 'capacity' => 40,
+    ]);
+
+    // Le MÊME élève est réinscrit l'année suivante, dans une classe que
+    // l'enseignant n'assure pas.
+    $reEnroll = students_service_re_enroll((int) $eleveA['id'], $nextYear, $nextClassroom);
+    check('L\'élève est réinscrit l\'année suivante', $reEnroll['ok'], $reEnroll['message']);
+
+    $_SESSION['user_id'] = $teacherUserId;
+    auth_user(true);
+    perm_all(true);
+    perm_roles(true);
+    tenant_set($a['school_id']);
+
+    check(
+        'Son périmètre de l\'année passée reste intact',
+        students_repo_search([], $a['year_id'])['total'] > 0
+    );
+
+    check(
+        'Il ne voit AUCUN élève dans l\'année où il n\'enseigne pas',
+        students_repo_search([], $nextYear)['total'] === 0,
+        students_repo_search([], $nextYear)['total'] . ' trouvé(s)'
+    );
+
+    check(
+        'Son ancien élève ne lui est plus accessible sur l\'année en cours',
+        !students_can_view((int) $eleveA['id'], $nextYear)
+    );
+
+    // =================================================================
     //  ANNÉE CLÔTURÉE
     // =================================================================
     act_as($a['school_id'], 'DIRECTION');
@@ -393,14 +499,54 @@ try {
         $closed['message']
     );
 
-    $closedRemove = teachers_service_unassign((int) $assign['id']);
+    $closedRemove = teachers_service_unassign($a['classroom_a'], (int) $assign['id']);
     check(
         'Année clôturée : plus aucun retrait',
         !$closedRemove['ok'] && str_contains($closedRemove['message'], 'clôturée'),
         $closedRemove['message']
     );
 
+    // Masquer le formulaire ne protège rien : l'envoi direct doit être
+    // refusé par le service.
+    $closedMain = teachers_service_set_main_teacher($a['classroom_a'], $teacherA);
+    check(
+        'Année clôturée : le titulaire ne peut plus être changé',
+        !$closedMain['ok'] && str_contains($closedMain['message'], 'clôturée'),
+        $closedMain['message']
+    );
+
     tenant_update('academic_years', ['status' => 'active'], 'id = :id', ['id' => $a['year_id']]);
+
+    // =================================================================
+    //  RETRAIT D'AFFECTATION : LA CLASSE DE L'URL DOIT CORRESPONDRE
+    // =================================================================
+    $wrongClassroom = teachers_service_unassign($a['classroom_b'], (int) $assign['id']);
+    check(
+        'Retrait depuis une AUTRE classe que la sienne : refusé',
+        !$wrongClassroom['ok'] && str_contains($wrongClassroom['message'], 'pour cette classe'),
+        $wrongClassroom['message']
+    );
+
+    // =================================================================
+    //  LE MOTIF DE STATUT N'ÉCRASE PAS LES NOTES DE LA FICHE
+    // =================================================================
+    teachers_service_update($teacherA, ['notes' => 'Responsable du club de mathématiques']);
+    teachers_service_change_status($teacherA, 'suspended', 'Procédure disciplinaire');
+
+    $afterStatus = teachers_repo_find($teacherA);
+    check(
+        'Le motif de suspension n\'écrase pas les notes de la fiche',
+        $afterStatus['notes'] === 'Responsable du club de mathématiques',
+        (string) $afterStatus['notes']
+    );
+
+    check(
+        'Le motif est conservé dans sa propre colonne',
+        $afterStatus['status_reason'] === 'Procédure disciplinaire',
+        (string) $afterStatus['status_reason']
+    );
+
+    teachers_service_change_status($teacherA, 'active');
 
     // =================================================================
     //  COMPTE DE CONNEXION

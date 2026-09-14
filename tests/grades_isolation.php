@@ -24,6 +24,7 @@ require APP_PATH . '/modules/curriculum/services.php';
 require APP_PATH . '/modules/students/services.php';
 require APP_PATH . '/modules/teachers/services.php';
 require APP_PATH . '/modules/grades/services.php';
+require_once APP_PATH . '/modules/students/repositories.php';
 
 $pass = 0;
 $fail = 0;
@@ -219,6 +220,50 @@ try {
     );
 
     // =================================================================
+    //  LA GRILLE EST UNE PORTE, ELLE AUSSI
+    //
+    //  Le contrôle de lecture de la grille était écrit
+    //  « !$auth['ok'] && !perm_has('grade.view') ». La route exigeant
+    //  déjà grade.view, la seconde condition était toujours fausse : le
+    //  refus n'était jamais atteint. Et grade.view était accordée aux
+    //  rôles PARENT et ELEVE.
+    //
+    //  Résultat : un parent lisait noms, matricules et cotes de toute
+    //  classe de l'école.
+    // =================================================================
+    $parentUserId = act_as($schoolId, 'PARENT');
+    tenant_set($schoolId);
+
+    check(
+        'Le rôle PARENT ne détient plus grade.view',
+        !perm_has('grade.view')
+    );
+
+    check(
+        'Un parent n\'a aucune classe dans son périmètre',
+        !students_can_view_classroom($classA) && !students_can_view_classroom($classB)
+    );
+
+    $parentEnter = grades_service_can_enter($classA, $subjectBig);
+    check(
+        'Un parent ne peut évidemment pas saisir',
+        !$parentEnter['ok'],
+        $parentEnter['message']
+    );
+
+    switch_to($teacherUserId, $schoolId);
+
+    check(
+        'L\'enseignant ne voit pas non plus la classe qui n\'est pas la sienne',
+        !students_can_view_classroom($classB)
+    );
+
+    check(
+        'Mais il voit bien la sienne',
+        students_can_view_classroom($classA)
+    );
+
+    // =================================================================
     //  SAISIE ET BORNES
     // =================================================================
     $save = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
@@ -335,6 +380,83 @@ try {
     );
 
     // =================================================================
+    //  UNE CASE VIDE N'EST PAS UNE COTE
+    //
+    //  Ces contrôles existent parce qu'un défaut réel leur avait échappé :
+    //  enregistrer une colonne encore vierge créait une ligne par élève,
+    //  et le tableau de bord du préfet — qui comptait les LIGNES —
+    //  affichait la colonne en vert. Il annonçait « complet » sur une
+    //  classe sans une seule note.
+    // =================================================================
+    // La direction saisit partout : ce bloc porte sur une branche qui
+    // n'est pas confiée à l'enseignant de test.
+    act_as($schoolId, 'DIRECTION');
+    tenant_set($schoolId);
+
+    $emptyPeriod = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'P2']);
+
+    $empty = grades_service_save_sheet($classA, $subjectOther, (int) $emptyPeriod['id'], [
+        $enrollA[0] => ['points' => '', 'is_absent' => false],
+        $enrollA[1] => ['points' => '', 'is_absent' => false],
+        $enrollA[2] => ['points' => '', 'is_absent' => false],
+    ]);
+
+    $emptyRows = (int) db_value(
+        'SELECT COUNT(*) FROM grades
+          WHERE school_id = :s AND curriculum_subject_id = :c AND grade_period_id = :p',
+        ['s' => $schoolId, 'c' => $subjectOther, 'p' => (int) $emptyPeriod['id']]
+    );
+
+    check(
+        'Une colonne entièrement vide ne crée AUCUNE ligne',
+        $emptyRows === 0,
+        $emptyRows . ' ligne(s)'
+    );
+
+    $progress = grades_repo_classroom_progress($classA, $yearId);
+    $emptyCell = null;
+
+    foreach ($progress as $row) {
+        if ((int) $row['curriculum_subject_id'] === $subjectOther
+            && (int) $row['period_id'] === (int) $emptyPeriod['id']) {
+            $emptyCell = (int) $row['entered'];
+        }
+    }
+
+    check(
+        'Le tableau de bord annonce 0 cote saisie, pas « complet »',
+        $emptyCell === 0,
+        $emptyCell . ' comptée(s)'
+    );
+
+    // Effacer une cote existante la fait disparaître du décompte.
+    grades_service_save_sheet($classA, $subjectOther, (int) $emptyPeriod['id'], [
+        $enrollA[0] => ['points' => 15, 'is_absent' => false],
+    ]);
+
+    $before = (int) db_value(
+        'SELECT COUNT(*) FROM grades WHERE school_id = :s AND curriculum_subject_id = :c AND grade_period_id = :p',
+        ['s' => $schoolId, 'c' => $subjectOther, 'p' => (int) $emptyPeriod['id']]
+    );
+
+    grades_service_save_sheet($classA, $subjectOther, (int) $emptyPeriod['id'], [
+        $enrollA[0] => ['points' => '', 'is_absent' => false],
+    ]);
+
+    $afterErase = (int) db_value(
+        'SELECT COUNT(*) FROM grades WHERE school_id = :s AND curriculum_subject_id = :c AND grade_period_id = :p',
+        ['s' => $schoolId, 'c' => $subjectOther, 'p' => (int) $emptyPeriod['id']]
+    );
+
+    check(
+        'Vider une case efface la cote au lieu de la mettre à NULL',
+        $before === 1 && $afterErase === 0,
+        "avant={$before} après={$afterErase}"
+    );
+
+    switch_to($teacherUserId, $schoolId);
+
+    // =================================================================
     //  LE POIDS DE LA PÉRIODE
     // =================================================================
     $examMax = grades_max_for($subjects[0], $periodEx);
@@ -362,6 +484,67 @@ try {
     // =================================================================
     act_as($schoolId, 'DIRECTION');
     tenant_set($schoolId);
+
+    // --- Le barème ne peut PLUS être modifié une fois des cotes posées.
+    //
+    //  C'est la correction à la racine du défaut le plus grave de cette
+    //  phase : la borne de saisie venait du programme COURANT, le
+    //  stockage du barème FIGÉ. Porter une branche de 40 à 100 laissait
+    //  enregistrer 95 sur une ligne figée à 40, soit 237 % du maximum.
+    $blocked = curriculum_service_update_subjects((int) $program['id'], [
+        $subjectBig => ['max_points' => 100, 'order_number' => 1],
+    ]);
+
+    check(
+        'Barème d\'une branche notée : la modification est refusée',
+        (int) tenant_find('curriculum_subjects', $subjectBig)['max_points'] === $bigMax,
+        'max = ' . tenant_find('curriculum_subjects', $subjectBig)['max_points']
+    );
+
+    // Une branche SANS cote reste modifiable.
+    curriculum_service_update_subjects((int) $program['id'], [
+        $subjectOther => ['max_points' => 30, 'order_number' => 2],
+    ]);
+
+    // subjectOther porte une cote depuis le test précédent : il doit
+    // donc être refusé lui aussi. On vérifie sur une troisième branche.
+    $freeSubject = tenant_one(
+        'curriculum_subjects',
+        'curriculum_id = :c AND id NOT IN (:a, :b) ORDER BY order_number',
+        ['c' => (int) $program['id'], 'a' => $subjectBig, 'b' => $subjectOther]
+    );
+
+    $freeMaxBefore = (int) $freeSubject['max_points'];
+    curriculum_service_update_subjects((int) $program['id'], [
+        (int) $freeSubject['id'] => ['max_points' => $freeMaxBefore + 5, 'order_number' => 3],
+    ]);
+
+    check(
+        'Une branche SANS cote reste modifiable',
+        (int) tenant_find('curriculum_subjects', (int) $freeSubject['id'])['max_points'] === $freeMaxBefore + 5
+    );
+
+    // --- Vérification de la ceinture : même si un barème divergeait,
+    //     chaque cote est validée contre SON propre maximum.
+    db_query(
+        'UPDATE curriculum_subjects SET max_points = 100 WHERE school_id = :s AND id = :id',
+        ['s' => $schoolId, 'id' => $subjectBig]
+    );
+
+    $overFrozen = grades_service_save_sheet($classA, $subjectBig, (int) $periodP1['id'], [
+        $enrollA[0] => ['points' => 95, 'is_absent' => false],
+    ]);
+
+    check(
+        'Barème divergent : la cote est bornée par le maximum FIGÉ, pas par le courant',
+        !$overFrozen['ok'] && isset($overFrozen['errors'][$enrollA[0]]),
+        $overFrozen['errors'][$enrollA[0]] ?? ''
+    );
+
+    db_query(
+        'UPDATE curriculum_subjects SET max_points = :m WHERE school_id = :s AND id = :id',
+        ['m' => $bigMax, 's' => $schoolId, 'id' => $subjectBig]
+    );
 
     tenant_update('curriculum_subjects', ['max_points' => 10], 'id = :id', ['id' => $subjectBig]);
 
@@ -512,22 +695,30 @@ try {
         ['c' => $classA, 's' => $subjectBig]
     );
 
-    switch_to($teacherUserId, $schoolId);
-
-    // L'enseignant n'a pas grade.validate : le retrait lui est fermé.
-    $refusedRemoval = teachers_service_unassign($classA, (int) $assignment['id']);
-    check(
-        'Des cotes existent : le retrait d\'affectation est refusé',
-        !$refusedRemoval['ok'] && str_contains($refusedRemoval['message'], 'cote'),
-        $refusedRemoval['message']
-    );
-
     act_as($schoolId, 'DIRECTION');
     tenant_set($schoolId);
 
-    $allowedRemoval = teachers_service_unassign($classA, (int) $assignment['id']);
+    // La garde reposait sur « !perm_has('grade.validate') ». Or les
+    // quatre seuls rôles détenant teacher.assign détiennent tous
+    // grade.validate : elle ne pouvait jamais se déclencher. Elle repose
+    // désormais sur une confirmation explicite, que la DIRECTION doit
+    // fournir comme tout le monde.
+    $refusedRemoval = teachers_service_unassign($classA, (int) $assignment['id']);
     check(
-        'La direction peut retirer l\'affectation malgré les cotes',
+        'Des cotes existent : le retrait exige une confirmation, même pour la direction',
+        !$refusedRemoval['ok'] && ($refusedRemoval['needs_confirmation'] ?? false) === true,
+        $refusedRemoval['message']
+    );
+
+    check(
+        'Le refus annonce le nombre de cotes concernées',
+        ($refusedRemoval['grade_count'] ?? 0) > 0,
+        (string) ($refusedRemoval['grade_count'] ?? 0)
+    );
+
+    $allowedRemoval = teachers_service_unassign($classA, (int) $assignment['id'], true);
+    check(
+        'Confirmé : le retrait est accepté',
         $allowedRemoval['ok'],
         $allowedRemoval['message']
     );

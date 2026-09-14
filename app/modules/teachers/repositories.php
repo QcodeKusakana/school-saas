@@ -337,16 +337,3 @@ function teachers_can_teach(int $classroomId, int $curriculumSubjectId): bool
     );
 }
 
-/** L'utilisateur courant est-il un enseignant en activité ? */
-function teachers_current_is_teacher(): bool
-{
-    $userId = auth_id();
-
-    if ($userId === null) {
-        return false;
-    }
-
-    $teacher = teachers_repo_find_by_user($userId);
-
-    return $teacher !== null && $teacher['status'] === 'active';
-}

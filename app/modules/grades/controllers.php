@@ -259,14 +259,28 @@ function grades_sheet_context(int $classroomId, int $curriculumSubjectId, int $p
     }
 
     // Autorisation de saisie : la permission ne suffit pas, il faut la
-    // branche. L'écran reste consultable en lecture si l'utilisateur a le
-    // droit de voir les notes.
+    // branche.
     $auth  = grades_service_can_enter($classroomId, $curriculumSubjectId);
     $year  = tenant_find('academic_years', (int) $classroom['academic_year_id']);
-    $state = grades_service_period_state($period, $year ?? []);
+    $state = grades_service_period_state($period, $year);
 
-    if (!$auth['ok'] && !perm_has('grade.view')) {
-        abort(403, $auth['message']);
+    // Autorisation de LECTURE : le périmètre de la classe, pas la
+    // permission « grade.view ».
+    //
+    // Le contrôle écrit ici était `!$auth['ok'] && !perm_has('grade.view')`.
+    // Or la route exige déjà grade.view : la seconde condition était
+    // toujours fausse et le refus n'était jamais atteint. Comme
+    // grade.view est accordée aux rôles PARENT et ELEVE, n'importe quel
+    // parent pouvait lire la grille — noms, matricules et cotes — de
+    // TOUTE classe de l'école, les identifiants étant de petits entiers
+    // faciles à énumérer.
+    //
+    // Le bon critère est celui déjà utilisé par le tableau de bord de
+    // classe : appartient-elle au périmètre de l'utilisateur ?
+    require_once APP_PATH . '/modules/students/repositories.php';
+
+    if (!$auth['ok'] && !students_can_view_classroom($classroomId)) {
+        abort(404, 'Classe introuvable.');
     }
 
     return [

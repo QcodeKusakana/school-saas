@@ -38,6 +38,42 @@ function grades_repo_classroom_enrollments(int $classroomId): array
 }
 
 /**
+ * Maxima DÉJÀ FIGÉS sur une colonne, indexés par inscription.
+ *
+ * Sert à valider chaque cote contre son propre barème, et non contre
+ * celui du programme courant — les deux peuvent différer sur une base
+ * antérieure au blocage des modifications de maxima.
+ *
+ * @return array<int, float>
+ */
+function grades_repo_frozen_maxima(int $classroomId, int $curriculumSubjectId, int $periodId): array
+{
+    $rows = db_all(
+        'SELECT g.enrollment_id, g.max_points
+           FROM grades g
+           JOIN enrollments e ON e.id = g.enrollment_id AND e.school_id = g.school_id
+          WHERE g.school_id = :school_id
+            AND e.classroom_id = :classroom_id
+            AND g.curriculum_subject_id = :subject_id
+            AND g.grade_period_id = :period_id',
+        [
+            'school_id'    => tenant_require(),
+            'classroom_id' => $classroomId,
+            'subject_id'   => $curriculumSubjectId,
+            'period_id'    => $periodId,
+        ]
+    );
+
+    $maxima = [];
+
+    foreach ($rows as $row) {
+        $maxima[(int) $row['enrollment_id']] = (float) $row['max_points'];
+    }
+
+    return $maxima;
+}
+
+/**
  * Grille de saisie : un élève par ligne, sa cote si elle existe.
  *
  * Jointure externe sur grades : une case vide est une cote non saisie,
@@ -84,7 +120,12 @@ function grades_repo_classroom_progress(int $classroomId, int $yearId): array
                 cs.max_points, cs.order_number,
                 gp.id AS period_id, gp.code AS period_code, gp.name AS period_name,
                 gp.period_type, gp.max_multiplier, gp.is_locked, gp.order_number AS period_order,
-                COUNT(g.id) AS entered,
+                -- Une ligne dont la cote est NULL et qui n a pas été
+                -- marquée « absent » n est PAS une saisie. Compter les
+                -- lignes affichait une colonne vierge en vert et
+                -- annonçait « complet » sur une classe sans une seule
+                -- note.
+                COUNT(CASE WHEN g.points IS NOT NULL OR g.is_absent = 1 THEN 1 END) AS entered,
                 t.id AS teacher_id, t.last_name AS teacher_last_name,
                 t.post_name AS teacher_post_name, t.first_name AS teacher_first_name
            FROM classrooms c
@@ -97,6 +138,7 @@ function grades_repo_classroom_progress(int $classroomId, int $yearId): array
                                         AND ts.classroom_id = c.id
                                         AND ts.school_id = c.school_id
            LEFT JOIN teachers t ON t.id = ts.teacher_id AND t.school_id = ts.school_id
+                               AND t.deleted_at IS NULL
            LEFT JOIN grades g ON g.curriculum_subject_id = cs.id
                              AND g.grade_period_id = gp.id
                              AND g.school_id = c.school_id

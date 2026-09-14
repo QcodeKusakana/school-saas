@@ -1,0 +1,53 @@
+Phase 4C : bulletins — le rang et le total se figent à la publication
+
+Le bulletin est le document qui décide du passage de classe. Trois règles
+le gouvernent, et chacune est prouvée par un test.
+
+1. LE MAXIMUM VIENT DE LA COTE, JAMAIS DU PROGRAMME
+   grades.max_points est figé à la saisie ; le bulletin l'additionne tel
+   quel. Modifier un barème au programme ne change plus un bulletin déjà
+   calculé.
+
+2. LE RANG SE FIGE À LA PUBLICATION
+   Le rang dépend de toute la classe : une cote ajoutée après coup
+   reclasserait des bulletins déjà imprimés et remis aux familles. Tant
+   que rien n'est publié, tout est recalculé — c'est l'état de travail.
+   Une fois publié, le document ne bouge plus, y compris à la réimpression.
+   Troisième application du principe après les libellés d'orientation
+   (phase 3) et les maxima de cotes (phase 4B).
+
+3. UNE ABSENCE N'EST PAS UN ZÉRO, ET LE TRAITEMENT EST UN CHOIX
+   Exclure du total ou compter zéro : aucun des deux n'est universel en
+   RDC. C'est un paramètre d'établissement (grading.absence_mode), défaut
+   « exclusion », et il change effectivement le résultat.
+
+DEUX POURCENTAGES DISTINCTS, ET C'ÉTAIT UN DÉFAUT
+Le pourcentage archivé était celui du CLASSEMENT (branches comptant pour
+le rang) tandis que le document imprimait celui du TOTAL. Un bulletin
+affichait donc 77,5 % et en archivait 73 %, et enrollments.final_percentage
+recopiait le mauvais. La table porte désormais les deux colonnes :
+percentage (le document, cohérent avec total_points / max_points) et
+ranking_percentage (ce qui produit class_rank, et le justifie dix ans
+plus tard).
+
+PÉRIMÈTRE : LA PERMISSION NE DÉSIGNE JAMAIS LA CLASSE
+Même défaut que l'audit de la phase 4A, sur de nouvelles portes :
+l'écran de classe portait le périmètre, l'action de publication non. Une
+école accordant bulletin.publish à ses titulaires — configuration
+plausible — laissait chacun figer les rangs de toutes les classes de
+l'établissement. Ajouté à bulletins_service_publish() et à
+bulletins_service_set_decision().
+
+AFFICHAGE : UN DOCUMENT PUBLIÉ S'AFFICHE TEL QU'IL A ÉTÉ PUBLIÉ
+Le rang venait du figé, le pourcentage était recalculé : une cote ajoutée
+après la remise faisait cohabiter deux chiffres incohérents sur le même
+document. La vue lit maintenant le bulletin publié quand il existe.
+
+Pas de bibliothèque PDF : Composer n'est pas disponible sur l'hébergement
+mutualisé visé. Mise en page A4 dédiée et impression navigateur.
+
+252 tests verts sur base fraîche (206 avant cette phase, 46 nouveaux).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+

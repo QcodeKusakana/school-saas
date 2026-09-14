@@ -120,6 +120,43 @@ route('POST', '/classes/{id}/repartition/{assignment_id}/retirer', 'teachers', '
 route('POST', '/classes/{id}/titulaire',                    'teachers', 'ctrl_teachers_set_main',       ['auth', 'school', 'perm:teacher.assign']);
 
 // ---------------------------------------------------------------------
+// Phase 4B — Notes
+//
+// La grille de saisie est adressée par (classe, branche, période) :
+// c'est le geste réel de l'enseignant, qui remplit une colonne entière.
+// Les trois identifiants sont recoupés dans grades_sheet_context() —
+// la branche doit appartenir au programme de la classe, la période à
+// son année.
+//
+// perm:grade.enter ne suffit jamais : teachers_can_teach() décide.
+// ---------------------------------------------------------------------
+route('GET',  '/notes',                'grades', 'ctrl_grades_index',     ['auth', 'school', 'perm:grade.view']);
+route('GET',  '/notes/classe/{id}',    'grades', 'ctrl_grades_classroom', ['auth', 'school', 'perm:grade.view']);
+
+route('GET',  '/notes/classe/{id}/branche/{subject_id}/periode/{period_id}', 'grades', 'ctrl_grades_sheet', ['auth', 'school', 'perm:grade.view']);
+route('POST', '/notes/classe/{id}/branche/{subject_id}/periode/{period_id}', 'grades', 'ctrl_grades_store', ['auth', 'school', 'perm:grade.enter']);
+
+route('POST', '/notes/periodes/{id}/verrou', 'grades', 'ctrl_grades_lock_period', ['auth', 'school', 'perm:grade.validate']);
+
+// ---------------------------------------------------------------------
+// Phase 4C — Bulletins
+//
+// Le bulletin d'un élève est adressé par son INSCRIPTION : elle porte à
+// la fois l'élève, l'année et la classe — exactement le périmètre du
+// document. Son accès suit le périmètre de l'ÉLÈVE et non celui de la
+// classe, pour qu'un parent puisse lire le bulletin de son enfant sans
+// voir le reste du groupe.
+// ---------------------------------------------------------------------
+route('GET',  '/bulletins/classe/{id}',         'bulletins', 'ctrl_bulletins_classroom', ['auth', 'school', 'perm:bulletin.generate']);
+route('POST', '/bulletins/classe/{id}/publier', 'bulletins', 'ctrl_bulletins_publish',   ['auth', 'school', 'perm:bulletin.publish']);
+
+route('GET',  '/bulletins/parametres',          'bulletins', 'ctrl_bulletins_settings_form', ['auth', 'school', 'perm:school.edit']);
+route('POST', '/bulletins/parametres',          'bulletins', 'ctrl_bulletins_settings',      ['auth', 'school', 'perm:school.edit']);
+
+route('GET',  '/bulletins/{id}',                'bulletins', 'ctrl_bulletins_show',     ['auth', 'school', 'perm:bulletin.generate']);
+route('POST', '/bulletins/{id}/decision',       'bulletins', 'ctrl_bulletins_decide',   ['auth', 'school', 'perm:bulletin.publish']);
+
+// ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :
 //
 //   Phase 4 — pédagogie     /notes/..., /presences/...

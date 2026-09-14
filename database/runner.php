@@ -112,10 +112,17 @@ function runner_witness(string $basename): ?string
         '001_reference_data.sql'    => 'SELECT COUNT(*) FROM education_cycles',
         '002_roles_permissions.sql' => 'SELECT COUNT(*) FROM permissions',
 
-        // Ce fichier s'appelait seeds/003_referentiel_national.sql. Sans
-        // ce témoin, les bases déjà installées le rejoueraient sous son
-        // nouveau nom et échoueraient sur « Duplicate entry ».
+        // Ce fichier s'appelait seeds/003_referentiel_national.sql et a
+        // été déplacé dans migrations/ : il remplit des tables créées en
+        // phase 2, il ne pouvait donc pas rester un seed.
+        //
+        // Les deux noms portent le même témoin. Sans celui du nouveau
+        // nom, les bases déjà installées rejoueraient le fichier et
+        // échoueraient sur « Duplicate entry » ; sans celui de l'ancien,
+        // un dossier de travail où le fichier d'origine traîne encore
+        // ferait échouer la migration au lieu de l'ignorer.
         '2026_09_13_001b_referentiel_national.sql' => 'SELECT COUNT(*) FROM learning_domains',
+        '003_referentiel_national.sql'             => 'SELECT COUNT(*) FROM learning_domains',
 
         default => null,
     };

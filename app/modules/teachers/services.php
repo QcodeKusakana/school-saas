@@ -47,7 +47,8 @@ function teachers_service_create(array $data): array
         return ['ok' => false, 'id' => null, 'message' => $matriculeCheck['message']];
     }
 
-    $teacherId = db_transaction(static function () use ($data): int {
+    try {
+        $teacherId = db_transaction(static function () use ($data): int {
         $id = tenant_insert('teachers', [
             'uuid'            => str_uuid(),
             'user_id'         => $data['user_id'] ?? null,
@@ -80,7 +81,20 @@ function teachers_service_create(array $data): array
         );
 
         return $id;
-    });
+        });
+    } catch (PDOException $e) {
+        // Matricule ou compte attribué entre la vérification et
+        // l'écriture : la contrainte d'unicité tranche, le message reste
+        // compréhensible.
+        if ($e->getCode() === '23000') {
+            return [
+                'ok' => false, 'id' => null,
+                'message' => 'Ce matricule ou ce compte vient d\'être attribué à un autre enseignant.',
+            ];
+        }
+
+        throw $e;
+    }
 
     return ['ok' => true, 'id' => $teacherId, 'message' => ''];
 }
@@ -214,14 +228,14 @@ function teachers_service_change_status(int $teacherId, string $status, string $
         return ['ok' => false, 'message' => 'Enseignant introuvable.'];
     }
 
+    // Le motif va dans status_reason, jamais dans notes : notes est le
+    // champ libre de la fiche, saisi par le secrétariat. L'y écrire
+    // effaçait son contenu sans retour possible.
     $changes = [
-        'status'  => $status,
-        'left_on' => $status === 'left' ? date('Y-m-d') : null,
+        'status'        => $status,
+        'left_on'       => $status === 'left' ? date('Y-m-d') : null,
+        'status_reason' => $reason !== '' ? mb_substr($reason, 0, 255) : null,
     ];
-
-    if ($reason !== '') {
-        $changes['notes'] = mb_substr($reason, 0, 255);
-    }
 
     tenant_update('teachers', $changes, 'id = :id', ['id' => $teacherId]);
 
@@ -229,8 +243,8 @@ function teachers_service_change_status(int $teacherId, string $status, string $
         'update',
         'teacher',
         $teacherId,
-        ['status' => $teacher['status']],
-        ['status' => $status],
+        ['status' => $teacher['status'], 'status_reason' => $teacher['status_reason'] ?? null],
+        ['status' => $status, 'status_reason' => $changes['status_reason']],
         TEACHER_STATUSES[$status] . ($reason !== '' ? ' — ' . $reason : '')
     );
 
@@ -325,7 +339,13 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
         ];
     }
 
-    $assignmentId = db_transaction(static function () use ($teacherId, $classroom, $classroomId, $curriculumSubjectId, $weeklyHours, $teacher): int {
+    // Les contrôles ci-dessus donnent un message clair dans le cas
+    // courant. Ils ne suffisent pas : entre la lecture et l'écriture,
+    // un autre préfet peut avoir attribué la même branche. C'est alors
+    // la contrainte uq_assignment_slot qui tranche — il faut traduire sa
+    // violation en message, et non laisser remonter une page d'erreur.
+    try {
+        $assignmentId = db_transaction(static function () use ($teacherId, $classroom, $classroomId, $curriculumSubjectId, $weeklyHours, $teacher): int {
         $id = tenant_insert('teacher_subjects', [
             'teacher_id'            => $teacherId,
             'academic_year_id'      => (int) $classroom['academic_year_id'],
@@ -347,7 +367,17 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
         );
 
         return $id;
-    });
+        });
+    } catch (PDOException $e) {
+        if ($e->getCode() === '23000') {
+            return [
+                'ok' => false, 'id' => null,
+                'message' => 'Cette branche vient d\'être attribuée par un autre utilisateur. Rechargez la page.',
+            ];
+        }
+
+        throw $e;
+    }
 
     return ['ok' => true, 'id' => $assignmentId, 'message' => ''];
 }
@@ -359,18 +389,61 @@ function teachers_service_assign(int $teacherId, int $classroomId, int $curricul
  * déjà été saisies pour cette branche : l'auteur d'une note doit rester
  * identifiable. Le point est signalé ici pour ne pas être oublié.
  */
-function teachers_service_unassign(int $assignmentId): array
+function teachers_service_unassign(int $classroomId, int $assignmentId, bool $confirmed = false): array
 {
     $assignment = tenant_find('teacher_subjects', $assignmentId);
 
-    if ($assignment === null) {
-        return ['ok' => false, 'message' => 'Affectation introuvable.'];
+    // L'affectation doit appartenir à la classe de l'URL. Sans ce
+    // recoupement, un envoi sur /classes/12/repartition/999/retirer
+    // retirait l'affectation 999 même si elle relevait de la classe 40,
+    // et le journal d'audit désignait la mauvaise classe. Même motif
+    // d'IDOR que celui corrigé sur l'affectation des élèves en phase 3.
+    if ($assignment === null || (int) $assignment['classroom_id'] !== $classroomId) {
+        return ['ok' => false, 'message' => 'Affectation introuvable pour cette classe.'];
     }
 
     $year = tenant_find('academic_years', (int) $assignment['academic_year_id']);
 
     if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
         return ['ok' => false, 'message' => 'Cette année scolaire est clôturée.'];
+    }
+
+    // Des cotes ont-elles déjà été saisies pour cette branche ?
+    //
+    // Retirer l'affectation ne supprimerait pas les notes — elles sont
+    // rattachées à l'inscription, pas à l'enseignant — mais plus rien ne
+    // relierait une note à celui qui l'a posée. L'auteur d'une note doit
+    // rester identifiable, y compris des années plus tard.
+    //
+    // Le changement d'enseignant en cours d'année passe donc par la
+    // direction : c'est une décision, pas un clic.
+    require_once __DIR__ . '/../grades/repositories.php';
+
+    $existingGrades = grades_repo_count_for_assignment(
+        (int) $assignment['classroom_id'],
+        (int) $assignment['curriculum_subject_id']
+    );
+
+    // La garde repose sur une CONFIRMATION EXPLICITE, pas sur une
+    // permission.
+    //
+    // Elle était écrite « && !perm_has('grade.validate') ». Or les quatre
+    // seuls rôles détenant teacher.assign — SUPER_ADMIN, SCHOOL_ADMIN,
+    // DIRECTION, PREFET — détiennent tous grade.validate : la condition
+    // était structurellement toujours fausse, et la protection annoncée
+    // n'existait dans aucun cas.
+    //
+    // Une protection qui ne peut jamais se déclencher est pire qu'aucune
+    // protection : elle donne l'illusion d'une garantie.
+    if ($existingGrades > 0 && !$confirmed) {
+        return [
+            'ok'      => false,
+            'needs_confirmation' => true,
+            'grade_count'        => $existingGrades,
+            'message' => $existingGrades . ' cote(s) ont déjà été saisies dans cette branche. '
+                . 'Les notes seront conservées, mais plus rien ne reliera '
+                . 'l\'enseignant à ce qu\'il a corrigé. Confirmez pour retirer l\'affectation.',
+        ];
     }
 
     tenant_delete('teacher_subjects', 'id = :id', ['id' => $assignmentId]);
@@ -400,6 +473,18 @@ function teachers_service_set_main_teacher(int $classroomId, ?int $teacherId): a
 
     if ($classroom === null) {
         return ['ok' => false, 'message' => 'Classe introuvable.'];
+    }
+
+    // Masquer le formulaire dans la vue ne protège rien : un envoi direct
+    // sur /classes/{id}/titulaire réécrirait le titulaire d'une année
+    // archivée, donc le nom porté par des bulletins déjà produits.
+    $year = tenant_find('academic_years', (int) $classroom['academic_year_id']);
+
+    if ($year === null || in_array($year['status'], ['closed', 'archived'], true)) {
+        return [
+            'ok'      => false,
+            'message' => 'Cette année scolaire est clôturée : le titulaire ne peut plus être modifié.',
+        ];
     }
 
     if ($teacherId !== null) {

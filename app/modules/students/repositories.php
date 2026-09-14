@@ -55,7 +55,7 @@ require_once __DIR__ . '/../teachers/repositories.php';
  *
  * @return array{0: string, 1: array<string, mixed>}
  */
-function students_scope_clause(): array
+function students_scope_clause(?int $yearId = null): array
 {
     if (perm_has('student.view.all')) {
         return ['1 = 1', []];
@@ -97,7 +97,18 @@ function students_scope_clause(): array
     // classrooms.main_teacher_id, via le module enseignants qui en est
     // la source unique. Refaire la requête ici créerait deux définitions
     // du périmètre, qui finiraient par diverger.
-    $classroomIds = teachers_scope_classroom_ids();
+    //
+    // Le périmètre est BORNÉ À L'ANNÉE consultée. Sans cette borne, les
+    // classes s'accumulent d'année en année : un professeur conservait
+    // l'accès au dossier COURANT — adresse, tuteurs, téléphones — de
+    // tout élève qu'il avait eu une seule fois. Sur une carrière, son
+    // périmètre finissait par couvrir l'établissement entier.
+    //
+    // Consulter l'historique d'un ancien élève reste possible en
+    // changeant d'année : il a bien enseigné à cet élève cette
+    // année-là. Ce qui n'est plus possible, c'est d'y accéder depuis
+    // l'année en cours.
+    $classroomIds = teachers_scope_classroom_ids($yearId);
 
     if ($classroomIds !== []) {
         // Les identifiants viennent de la base, jamais de l'utilisateur,
@@ -127,9 +138,9 @@ function students_scope_clause(): array
  * restriction de la liste ne protège rien si l'accès direct par
  * identifiant reste ouvert.
  */
-function students_can_view(int $studentId): bool
+function students_can_view(int $studentId, ?int $yearId = null): bool
 {
-    [$clause, $params] = students_scope_clause();
+    [$clause, $params] = students_scope_clause($yearId);
 
     if ($clause === '1 = 1') {
         return true;
@@ -172,7 +183,7 @@ function students_repo_search(array $filters, int $academicYearId, int $page = 1
     // Périmètre d'abord : aucune autre condition ne doit pouvoir
     // l'élargir. Un parent ne voit ses enfants quels que soient les
     // filtres saisis dans l'interface.
-    [$scopeClause, $scopeParams] = students_scope_clause();
+    [$scopeClause, $scopeParams] = students_scope_clause($academicYearId);
     $where[] = $scopeClause;
     $params += $scopeParams;
 
@@ -372,15 +383,47 @@ function students_repo_year_stats(int $academicYearId): array
 /** Élèves d'une classe. */
 function students_repo_classroom_students(int $classroomId): array
 {
+    // Le périmètre s'applique ICI AUSSI.
+    //
+    // Protéger /eleves et /eleves/{id} ne sert à rien si la liste
+    // nominative d'une classe reste ouverte par ailleurs : le rôle
+    // ENSEIGNANT détient « classroom.view », et cette fonction alimente
+    // l'écran d'une classe. Sans cette clause, il suffisait d'ouvrir
+    // /classes/{id} d'une classe voisine pour lire matricules, noms,
+    // sexes et dates de naissance de ses élèves.
+    //
+    // Une restriction d'accès ne vaut que si TOUTES les portes la
+    // portent. C'est la deuxième fois que ce défaut apparaît dans ce
+    // projet, sous une forme différente.
+    [$scope, $scopeParams] = students_scope_clause();
+
     return db_all(
         'SELECT s.*, e.id AS enrollment_id, e.status AS enrollment_status, e.decision
            FROM enrollments e
            JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
           WHERE e.school_id = :school_id AND e.classroom_id = :classroom_id
             AND e.status <> \'cancelled\' AND s.deleted_at IS NULL
+            AND ' . $scope . '
           ORDER BY s.last_name, s.post_name, s.first_name',
-        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
+        $scopeParams + ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
     );
+}
+
+/**
+ * L'utilisateur courant peut-il consulter CETTE classe ?
+ *
+ * Le périmètre de l'enseignant porte sur des classes : il est donc
+ * calculable directement, sans passer par les élèves. Masquer la liste
+ * nominative ne suffirait pas — l'effectif, le taux de remplissage et le
+ * nom du titulaire restent des informations de gestion.
+ */
+function students_can_view_classroom(int $classroomId): bool
+{
+    if (perm_has('student.view.all') || perm_has('classroom.manage')) {
+        return true;
+    }
+
+    return in_array($classroomId, teachers_scope_classroom_ids(), true);
 }
 
 // =====================================================================

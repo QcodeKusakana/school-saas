@@ -63,8 +63,15 @@ function grades_service_can_enter(int $classroomId, int $curriculumSubjectId): a
  *
  * @return array{ok: bool, message: string, forced: bool}
  */
-function grades_service_period_state(array $period, array $year): array
+function grades_service_period_state(array $period, ?array $year): array
 {
+    // Le paramètre était typé array et appelé avec « $year ?? [] » : sur
+    // un tableau vide, l'accès à la clé absente produisait une erreur
+    // 500 au lieu d'un refus. Le cas est traité ici, explicitement.
+    if ($year === null) {
+        return ['ok' => false, 'forced' => false, 'message' => 'Année scolaire introuvable.'];
+    }
+
     if (in_array($year['status'], ['closed', 'archived'], true)) {
         return [
             'ok'      => false,
@@ -149,7 +156,7 @@ function grades_service_save_sheet(
     }
 
     $year  = tenant_find('academic_years', (int) $classroom['academic_year_id']);
-    $state = grades_service_period_state($period, $year ?? []);
+    $state = grades_service_period_state($period, $year);
 
     if (!$state['ok']) {
         return ['ok' => false, 'saved' => 0, 'message' => $state['message'], 'errors' => []];
@@ -169,8 +176,22 @@ function grades_service_save_sheet(
         $allowed[(int) $row['id']] = $row;
     }
 
+    // Barèmes DÉJÀ FIGÉS sur cette colonne, s'il en existe.
+    //
+    // Le maximum calculé ci-dessus vient du programme COURANT ; celui
+    // d'une ligne existante a été figé à sa première saisie. Valider
+    // contre le premier alors qu'on stocke sur le second laissait
+    // enregistrer 95 sur une ligne figée à 40 — soit 237 % du maximum.
+    //
+    // Le changement de barème est désormais bloqué à sa source (voir
+    // curriculum_service_update_subjects), mais les bases déjà
+    // divergentes existent : chaque cote est donc validée contre SON
+    // propre maximum.
+    $frozen = grades_repo_frozen_maxima($classroomId, $curriculumSubjectId, $periodId);
+
     $errors = [];
     $valid  = [];
+    $erase  = [];
 
     foreach ($entries as $enrollmentId => $entry) {
         $enrollmentId = (int) $enrollmentId;
@@ -190,8 +211,21 @@ function grades_service_save_sheet(
         }
 
         if ($points === null || $points === '') {
-            // Case laissée vide : la cote est remise à « non saisie ».
-            $valid[$enrollmentId] = ['points' => null, 'is_absent' => false];
+            // Case laissée vide.
+            //
+            // Une case vide n'est PAS une cote : elle ne doit créer
+            // aucune ligne. Auparavant, enregistrer une colonne encore
+            // vierge créait une ligne par élève — et le tableau de bord
+            // du préfet, qui comptait les lignes, affichait la colonne
+            // en vert. Il annonçait « complet » sur une classe sans une
+            // seule note.
+            //
+            // Si une cote existait, elle est effacée ; sinon on ne fait
+            // rien.
+            if (isset($frozen[$enrollmentId])) {
+                $erase[] = $enrollmentId;
+            }
+
             continue;
         }
 
@@ -207,28 +241,51 @@ function grades_service_save_sheet(
             continue;
         }
 
-        if ($points > $maxPoints) {
-            $errors[$enrollmentId] = 'Cote supérieure au maximum (' . grades_format($maxPoints) . ').';
+        $rowMax = $frozen[$enrollmentId] ?? $maxPoints;
+
+        if ($points > $rowMax) {
+            $errors[$enrollmentId] = 'Cote supérieure au maximum (' . grades_format($rowMax) . ').';
             continue;
         }
 
         $valid[$enrollmentId] = ['points' => $points, 'is_absent' => false];
     }
 
-    if ($valid === []) {
+    if ($valid === [] && $erase === []) {
         return [
             'ok' => false, 'saved' => 0,
-            'message' => 'Aucune cote valide à enregistrer.',
+            'message' => $errors === []
+                ? 'Aucune cote à enregistrer.'
+                : 'Aucune cote valide à enregistrer.',
             'errors' => $errors,
         ];
     }
 
     $saved = db_transaction(static function () use (
-        $valid, $curriculumSubjectId, $periodId, $maxPoints
+        $valid, $erase, $curriculumSubjectId, $periodId, $maxPoints
     ): int {
         $count  = 0;
         $userId = auth_id();
         $now    = date('Y-m-d H:i:s');
+
+        // Cases vidées : la ligne disparaît, elle ne devient pas une cote
+        // « nulle ». Une cote effacée doit redevenir « non saisie » dans
+        // le décompte d'avancement.
+        foreach ($erase as $enrollmentId) {
+            db_query(
+                'DELETE FROM grades
+                  WHERE school_id = :school_id
+                    AND enrollment_id = :enrollment_id
+                    AND curriculum_subject_id = :subject_id
+                    AND grade_period_id = :period_id',
+                [
+                    'school_id'     => tenant_require(),
+                    'enrollment_id' => $enrollmentId,
+                    'subject_id'    => $curriculumSubjectId,
+                    'period_id'     => $periodId,
+                ]
+            );
+        }
 
         foreach ($valid as $enrollmentId => $entry) {
             // INSERT ... ON DUPLICATE KEY UPDATE : l'écriture est

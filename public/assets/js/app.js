@@ -133,6 +133,54 @@
     }
 
     /* =================================================================
+       Grille de saisie des notes
+       Usage : <input type="checkbox" data-grade-absent>
+
+       Cocher « Absent » vide et désactive la cote de la même ligne.
+       Une absence n'est pas un zéro : laisser les deux saisissables
+       inviterait à écrire « 0 » pour un élève qui n'a pas composé, ce
+       qui fausse la moyenne et prive le conseil de classe d'une
+       information dont il a besoin.
+
+       Le serveur applique la même règle : ceci n'est qu'un confort.
+       ================================================================= */
+
+    function initGradeSheet() {
+        document.querySelectorAll('[data-grade-absent]').forEach((checkbox) => {
+            const row = checkbox.closest('tr');
+            const input = row ? row.querySelector('input[type="number"]') : null;
+
+            if (!input) {
+                return;
+            }
+
+            const sync = () => {
+                input.disabled = checkbox.checked;
+
+                if (checkbox.checked) {
+                    input.value = '';
+                }
+            };
+
+            checkbox.addEventListener('change', sync);
+            sync();
+        });
+    }
+
+    /* =================================================================
+       Bouton d'impression
+       Usage : <button data-print>
+
+       La CSP interdit onclick="window.print()" : le comportement vit ici.
+       ================================================================= */
+
+    function initPrint() {
+        document.querySelectorAll('[data-print]').forEach((button) => {
+            button.addEventListener('click', () => window.print());
+        });
+    }
+
+    /* =================================================================
        Confirmation avant action destructive
        Usage : <button data-confirm="Supprimer cet élève ?">
        ================================================================= */
@@ -276,6 +324,8 @@
         initSidebar();
         initPasswordToggles();
         initAutoSubmit();
+        initGradeSheet();
+        initPrint();
         initConfirmations();
         initSubmitGuard();
         initNetworkStatus();

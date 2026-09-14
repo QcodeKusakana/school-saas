@@ -80,7 +80,11 @@ function ctrl_teachers_show(string $id): void
         'weeklyLoad'     => $yearId > 0 ? teachers_repo_weekly_load($teacherId, $yearId) : 0.0,
         'statuses'       => TEACHER_STATUSES,
         'employmentTypes' => TEACHER_EMPLOYMENT_TYPES,
-        'availableUsers' => teachers_repo_available_users($teacherId),
+        // La liste des comptes n'est rendue que sous teacher.manage :
+        // inutile de l'interroger pour un consultant en lecture seule.
+        'availableUsers' => can('teacher.manage')
+            ? teachers_repo_available_users($teacherId)
+            : [],
     ]);
 }
 
@@ -228,7 +232,11 @@ function ctrl_teachers_unassign(string $id, string $assignmentId): void
 {
     $classroomId = (int) $id;
 
-    $outcome = teachers_service_unassign((int) $assignmentId);
+    $outcome = teachers_service_unassign(
+        $classroomId,
+        (int) $assignmentId,
+        input('confirm') === 'oui'
+    );
 
     $outcome['ok']
         ? flash_success('Affectation retirée.')

@@ -181,8 +181,9 @@ $editable = can('teacher.assign')
                                 <?php if ($row['assignment_id'] !== null): ?>
                                     <form method="post"
                                           action="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition/' . (int) $row['assignment_id'] . '/retirer')) ?>"
-                                          data-confirm="Retirer cette branche à l'enseignant ?">
+                                          data-confirm="Retirer cette branche à l'enseignant ? Si des cotes ont été saisies, plus rien ne le reliera à ce qu'il a corrigé.">
                                         <?= csrf_field() ?>
+                                        <input type="hidden" name="confirm" value="oui">
                                         <button type="submit" class="btn btn-sm btn-outline-danger">
                                             <i class="bi bi-x-lg"></i>
                                             <span class="d-none d-md-inline ms-1">Retirer</span>

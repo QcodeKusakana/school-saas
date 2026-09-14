@@ -63,6 +63,9 @@ const TENANT_TABLES = [
     'orientations',
     'student_history',
 
+    // Résultats figés des bulletins (phase 4C).
+    'bulletins',
+
     // Journal d'audit : school_id vaut NULL pour les actions de la
     // plateforme, et l'identifiant de l'école pour toutes les autres.
     // Il est soumis au garde-fou : une future page « historique des
