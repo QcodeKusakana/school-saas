@@ -48,19 +48,23 @@ function students_service_next_matricule(int $entryYear): string
     $schoolId = tenant_require();
     $format   = (string) school_setting('student.matricule_format', STUDENT_MATRICULE_DEFAULT_FORMAT);
 
-    // La clé du compteur : une séquence par année d'entrée si le format
-    // contient l'année, une séquence unique sinon.
-    $usesYear   = str_contains($format, '{YY}') || str_contains($format, '{YYYY}');
-    $counterKey = $usesYear ? (string) $entryYear : 'GLOBAL';
+    $counterKey = students_counter_key($entryYear);
 
-    // Crée la ligne si elle n'existe pas encore. INSERT IGNORE évite
-    // une condition de concurrence entre deux premières inscriptions.
-    db_query(
-        'INSERT IGNORE INTO student_counters (school_id, counter_key, last_number)
-         VALUES (:school_id, :key, 0)',
-        ['school_id' => $schoolId, 'key' => $counterKey]
-    );
-
+    // La ligne du compteur existe déjà : students_ensure_counter() l'a
+    // créée AVANT l'ouverture de la transaction.
+    //
+    // Elle était créée ici, juste avant le SELECT … FOR UPDATE. Quand
+    // elle existe déjà, InnoDB pose un verrou PARTAGÉ pour vérifier le
+    // doublon, et le SELECT … FOR UPDATE qui suit en réclame un
+    // EXCLUSIF : deux inscriptions simultanées détenaient chacune le
+    // verrou partagé et attendaient l'exclusif de l'autre —
+    // INTERBLOCAGE, et l'une des deux inscriptions perdue.
+    //
+    // Le défaut a été trouvé sur le compteur de reçus (audit 5B) en
+    // lançant quatre guichets en parallèle ; ce compteur-ci portait le
+    // même motif depuis la phase 3, sans avoir jamais été exercé sous
+    // concurrence.
+    //
     // Verrou exclusif sur la ligne, jusqu'à la fin de la transaction.
     $current = (int) db_value(
         'SELECT last_number FROM student_counters
@@ -78,6 +82,39 @@ function students_service_next_matricule(int $entryYear): string
     );
 
     return students_service_format_matricule($format, $entryYear, $next);
+}
+
+/**
+ * Crée la ligne du compteur si elle n'existe pas — HORS TRANSACTION.
+ *
+ * Appelée avant d'ouvrir la transaction, elle valide immédiatement et
+ * libère son verrou partagé. Il ne reste ensuite qu'une seule prise de
+ * verrou exclusif, qui se met simplement en file d'attente au lieu de
+ * provoquer un interblocage.
+ */
+function students_ensure_counter(int $entryYear): void
+{
+    db_query(
+        'INSERT IGNORE INTO student_counters (school_id, counter_key, last_number)
+         VALUES (:school_id, :key, 0)',
+        ['school_id' => tenant_require(), 'key' => students_counter_key($entryYear)]
+    );
+}
+
+/**
+ * Clé de la séquence des matricules.
+ *
+ * Une séquence par année d'entrée si le format contient l'année, une
+ * séquence unique sinon. Extraite pour que l'appelant puisse créer la
+ * ligne du compteur avant d'ouvrir sa transaction.
+ */
+function students_counter_key(int $entryYear): string
+{
+    $format = (string) school_setting('student.matricule_format', STUDENT_MATRICULE_DEFAULT_FORMAT);
+
+    return str_contains($format, '{YY}') || str_contains($format, '{YYYY}')
+        ? (string) $entryYear
+        : 'GLOBAL';
 }
 
 /** Applique le modèle de matricule. */
@@ -155,6 +192,11 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
     }
 
     $entryYear = (int) date('Y', (int) strtotime((string) $year['starts_on']));
+
+    // Hors transaction, et volontairement : à l'intérieur, le verrou
+    // partagé de cet INSERT IGNORE provoquerait un interblocage avec le
+    // SELECT … FOR UPDATE d'une inscription simultanée.
+    students_ensure_counter($entryYear);
 
     try {
         return db_transaction(static function () use ($data, $yearId, $classroomId, $entryYear, $year): array {

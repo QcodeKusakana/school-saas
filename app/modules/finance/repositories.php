@@ -583,21 +583,35 @@ function finance_repo_paid_on_fee(int $studentFeeId): float
     );
 }
 
-/** Journal de caisse d'une journée — ce que le caissier remet le soir. */
+/**
+ * Journal de caisse d'une journée — ce que le caissier remet le soir.
+ *
+ * LE PÉRIMÈTRE EST DANS LA REQUÊTE, PAS DANS UNE BOUCLE.
+ * Le contrôleur filtrait ligne à ligne en appelant
+ * finance_can_view_enrollment() : une journée de 200 reçus déclenchait
+ * 200 requêtes supplémentaires. La condition de périmètre est la même
+ * (students_scope_clause, source unique du projet), mais appliquée une
+ * seule fois, par la base.
+ */
 function finance_repo_cashbook(string $date): array
 {
+    [$scope, $scopeParams] = students_scope_clause();
+
     return db_all(
         'SELECT p.*,
-                st.matricule, st.last_name, st.post_name, st.first_name,
+                s.matricule, s.last_name, s.post_name, s.first_name,
                 c.name AS classroom_name,
                 u.last_name AS cashier_last_name, u.first_name AS cashier_first_name
            FROM payments p
            JOIN enrollments e ON e.id = p.enrollment_id AND e.school_id = p.school_id
-           JOIN students st ON st.id = e.student_id AND st.school_id = e.school_id
+           JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
       LEFT JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
       LEFT JOIN users u ON u.id = p.received_by
-          WHERE p.school_id = :school_id AND p.paid_on = :date
+          WHERE p.school_id = :school_id
+            AND p.paid_on = :date
+            AND s.deleted_at IS NULL
+            AND ' . $scope . '
           ORDER BY p.receipt_seq',
-        ['school_id' => tenant_require(), 'date' => $date]
+        $scopeParams + ['school_id' => tenant_require(), 'date' => $date]
     );
 }

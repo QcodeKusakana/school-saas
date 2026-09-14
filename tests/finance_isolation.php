@@ -735,6 +735,34 @@ try {
         ])['ok']
     );
 
+    // ----- DEUX GUICHETS SIMULTANÉS ----------------------------------
+    //
+    //  L'INSERT IGNORE du compteur vivait DANS la transaction, juste
+    //  avant le SELECT … FOR UPDATE. Quand la ligne existe déjà, InnoDB
+    //  pose un verrou PARTAGÉ pour vérifier le doublon, puis le
+    //  SELECT … FOR UPDATE en réclame un EXCLUSIF : deux caissiers
+    //  simultanés s'attendaient mutuellement — INTERBLOCAGE, et l'un
+    //  des deux paiements perdu sur une page d'erreur.
+    //
+    //  Ce test ne rejoue pas la concurrence (un test à un seul
+    //  processus ne le peut pas) : il vérifie que la préparation du
+    //  compteur est bien SORTIE de la transaction, ce qui est la
+    //  correction, et que db_transaction sait rejouer un interblocage.
+    check(
+        'La ligne du compteur de reçus se prépare hors transaction',
+        function_exists('finance_ensure_receipt_counter')
+    );
+
+    check(
+        'Celle des matricules aussi — même motif depuis la phase 3',
+        function_exists('students_ensure_counter')
+    );
+
+    check(
+        'Un interblocage est reconnu comme rejouable, pas comme une erreur',
+        db_is_deadlock(new PDOException('Deadlock', 40001))
+    );
+
     check(
         'Un montant tapé à la française est lu correctement',
         abs(finance_parse_amount('1 250,50') - 1250.50) < 0.001
@@ -915,6 +943,11 @@ try {
     check(
         'Ni annuler un de ses reçus',
         !finance_service_cancel_payment((int) $pay['id'], 'Tentative depuis une autre ecole')['ok']
+    );
+
+    check(
+        'Ni lire son journal de caisse',
+        finance_repo_cashbook($today) === []
     );
 } finally {
     foreach ($createdSchools as $id) {

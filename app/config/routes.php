@@ -196,7 +196,11 @@ route('POST', '/finances/ligne/{id}/retablir',  'finance', 'ctrl_finance_restore
 //  accordée qu'à la DIRECTION. Celui qui encaisse n'annule pas son
 //  propre reçu.
 // ---------------------------------------------------------------------
-route('GET',  '/finances/journal',              'finance', 'ctrl_finance_cashbook',        ['auth', 'school', 'perm:payment.view']);
+// Le journal de caisse est un document INTERNE : report.financial, que
+// PARENT ne détient pas. Avec payment.view, un tuteur y accédait et y
+// lisait « à compter dans la caisse » sur les seuls reçus de son enfant
+// — un total juste sur un écran qui ment.
+route('GET',  '/finances/journal',              'finance', 'ctrl_finance_cashbook',        ['auth', 'school', 'perm:report.financial']);
 route('GET',  '/finances/eleve/{id}/encaisser', 'finance', 'ctrl_finance_pay_form',        ['auth', 'school', 'perm:payment.record']);
 route('POST', '/finances/eleve/{id}/encaisser', 'finance', 'ctrl_finance_pay',             ['auth', 'school', 'perm:payment.record']);
 route('GET',  '/finances/recu/{id}',            'finance', 'ctrl_finance_receipt',         ['auth', 'school', 'perm:payment.view']);

@@ -211,31 +211,89 @@ function db_delete(string $table, string $where, array $params = [], bool $skipT
  *       db_insert('enrollments', ['student_id' => $id, ...]);
  *       return $id;
  *   });
+ *
+ * UN INTERBLOCAGE N'EST PAS UNE ERREUR APPLICATIVE
+ * ------------------------------------------------
+ * InnoDB détecte les interblocages et sacrifie l'une des deux
+ * transactions, qu'il annule INTÉGRALEMENT. Ce n'est pas un défaut du
+ * code appelant : c'est le comportement normal d'une base sous
+ * concurrence, et la réponse attendue est de rejouer.
+ *
+ * Sans ce rejeu, deux caissiers qui encaissaient à la même seconde
+ * voyaient l'un des deux tomber sur une page d'erreur, son paiement
+ * perdu, avec une file d'attente devant lui — constaté en exécutant
+ * quatre guichets en parallèle lors de l'audit de la phase 5B.
+ *
+ * Le rejeu est SÛR parce que la transaction annulée n'a rien laissé
+ * derrière elle : on repart d'un état identique à celui du départ. Une
+ * courte attente aléatoire évite que les deux perdants se retrouvent
+ * aussitôt face à face.
  */
-function db_transaction(callable $callback): mixed
+function db_transaction(callable $callback, int $attempts = 3): mixed
 {
     $pdo = db();
 
     // Les transactions imbriquées ne sont pas gérées par MySQL sans
     // SAVEPOINT : on se contente de participer à celle déjà ouverte.
+    // Le rejeu appartient alors à la transaction englobante — le faire
+    // ici rejouerait une partie du travail sur un état déjà modifié.
     if ($pdo->inTransaction()) {
         return $callback();
     }
 
-    $pdo->beginTransaction();
+    for ($attempt = 1; ; $attempt++) {
+        $pdo->beginTransaction();
 
-    try {
-        $result = $callback();
-        $pdo->commit();
+        try {
+            $result = $callback();
+            $pdo->commit();
 
-        return $result;
-    } catch (Throwable $e) {
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
+            return $result;
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+
+            if ($attempt < $attempts && db_is_deadlock($e)) {
+                log_warning('Interblocage : transaction rejouée', [
+                    'tentative' => $attempt,
+                    'error'     => $e->getMessage(),
+                ]);
+
+                // 10 à 60 ms : assez pour que les deux transactions ne
+                // repartent pas exactement en même temps.
+                usleep(random_int(10000, 60000));
+
+                continue;
+            }
+
+            log_error('Transaction annulée', ['error' => $e->getMessage()]);
+            throw $e;
         }
-        log_error('Transaction annulée', ['error' => $e->getMessage()]);
-        throw $e;
     }
+}
+
+/**
+ * L'exception est-elle un interblocage ou une attente de verrou
+ * expirée — donc une situation qui se résout en rejouant ?
+ */
+function db_is_deadlock(Throwable $e): bool
+{
+    if (!$e instanceof PDOException) {
+        return false;
+    }
+
+    // 40001 : échec de sérialisation (interblocage).
+    // 1213 : deadlock ; 1205 : lock wait timeout.
+    $code = (string) $e->getCode();
+
+    if ($code === '40001') {
+        return true;
+    }
+
+    $driverCode = (int) ($e->errorInfo[1] ?? 0);
+
+    return $driverCode === 1213 || $driverCode === 1205;
 }
 
 /**

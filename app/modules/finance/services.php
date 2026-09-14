@@ -815,13 +815,44 @@ function finance_default_rate(): float
 }
 
 /**
+ * Crée la ligne du compteur si elle n'existe pas — HORS TRANSACTION.
+ *
+ * POURQUOI CETTE FONCTION EST SÉPARÉE
+ * -----------------------------------
+ * Cet INSERT IGNORE vivait à l'intérieur de la transaction, juste avant
+ * le SELECT … FOR UPDATE. Quand la ligne existe déjà, InnoDB pose un
+ * verrou PARTAGÉ pour vérifier le doublon ; le SELECT … FOR UPDATE qui
+ * suit en réclame un EXCLUSIF. Deux caissiers simultanés détenaient
+ * donc chacun un verrou partagé et attendaient l'exclusif de l'autre :
+ * INTERBLOCAGE.
+ *
+ * Constaté en exécutant quatre guichets en parallèle pendant l'audit de
+ * la phase 5B — deux des quatre tombaient sur une erreur fatale, leur
+ * paiement perdu.
+ *
+ * Appelée hors transaction, elle valide immédiatement et libère son
+ * verrou partagé avant que la transaction ne commence. Il ne reste
+ * alors qu'une seule prise de verrou exclusif, qui se met simplement en
+ * file d'attente.
+ */
+function finance_ensure_receipt_counter(string $yearCode): void
+{
+    db_query(
+        'INSERT IGNORE INTO receipt_counters (school_id, counter_key, last_number)
+         VALUES (:school_id, :key, 0)',
+        ['school_id' => tenant_require(), 'key' => $yearCode]
+    );
+}
+
+/**
  * Numéro de reçu suivant — sans trou ni doublon.
  *
  * Le compteur est verrouillé par SELECT … FOR UPDATE : deux caissiers
  * qui encaissent à la même seconde obtiennent deux numéros distincts et
- * consécutifs. Même mécanique que les matricules (phase 3).
+ * consécutifs.
  *
- * À n'appeler QUE dans une transaction déjà ouverte.
+ * À n'appeler QUE dans une transaction déjà ouverte, et APRÈS
+ * finance_ensure_receipt_counter() — voir la raison ci-dessus.
  *
  * @return array{0: string, 1: int}
  */
@@ -829,12 +860,6 @@ function finance_next_receipt(string $yearCode): array
 {
     $schoolId = tenant_require();
     $prefix   = (string) school_setting('finance.receipt_prefix', 'REC');
-
-    db_query(
-        'INSERT IGNORE INTO receipt_counters (school_id, counter_key, last_number)
-         VALUES (:school_id, :key, 0)',
-        ['school_id' => $schoolId, 'key' => $yearCode]
-    );
 
     $current = (int) db_value(
         'SELECT last_number FROM receipt_counters
@@ -958,6 +983,11 @@ function finance_service_record_payment(int $enrollmentId, array $input, array $
     }
 
     $outcome = ['unallocated' => 0.0];
+
+    // La ligne du compteur est créée AVANT d'ouvrir la transaction :
+    // dedans, son verrou partagé provoquerait un interblocage avec le
+    // SELECT … FOR UPDATE d'un autre guichet.
+    finance_ensure_receipt_counter((string) $year['code']);
 
     db_transaction(static function () use (
         $schoolId, $enrollmentId, $year, $input, $method, $paidOn,

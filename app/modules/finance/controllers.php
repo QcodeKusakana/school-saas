@@ -449,15 +449,12 @@ function ctrl_finance_cashbook(): void
         $date = date('Y-m-d');
     }
 
-    $payments = [];
-
-    // Le périmètre vaut ici comme ailleurs : un tuteur qui atteindrait
-    // cette route ne doit voir que les reçus de ses enfants.
-    foreach (finance_repo_cashbook($date) as $row) {
-        if (finance_can_view_enrollment((int) $row['enrollment_id'])) {
-            $payments[] = $row;
-        }
-    }
+    // Le périmètre est appliqué DANS la requête : filtrer ligne à ligne
+    // déclenchait une requête par reçu, soit deux cents sur une journée
+    // chargée. La route exige par ailleurs report.financial, que le
+    // rôle PARENT ne détient pas : ce journal est un document interne,
+    // et un tuteur n'a rien à y lire.
+    $payments = finance_repo_cashbook($date);
 
     $totals = [];
 
