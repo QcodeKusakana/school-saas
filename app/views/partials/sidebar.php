@@ -93,6 +93,11 @@ $isPlatform = $user['school_id'] === null;
                 <a class="nav-item <?= nav_active('/finances') ?>" href="<?= e(url('/finances')) ?>">
                     <i class="bi bi-cash-coin"></i><span>Frais et paiements</span>
                 </a>
+                <?php if (can('fee.manage') && route_exists('/finances/frais')): ?>
+                    <a class="nav-item <?= nav_active('/finances/frais') ?>" href="<?= e(url('/finances/frais')) ?>">
+                        <i class="bi bi-list-columns"></i><span>Grille tarifaire</span>
+                    </a>
+                <?php endif; ?>
             <?php endif; ?>
 
             <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view'])): ?>

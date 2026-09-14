@@ -157,10 +157,41 @@ route('GET',  '/bulletins/{id}',                'bulletins', 'ctrl_bulletins_sho
 route('POST', '/bulletins/{id}/decision',       'bulletins', 'ctrl_bulletins_decide',   ['auth', 'school', 'perm:bulletin.publish']);
 
 // ---------------------------------------------------------------------
+//  PRÉSENCES — phase 4D
+//
+//  attendance.view est accordée à PARENT et ELEVE depuis la phase 1.
+//  La permission ouvre donc la porte ; c'est le PÉRIMÈTRE, appliqué dans
+//  chaque contrôleur, qui décide de ce qu'on y voit.
+// ---------------------------------------------------------------------
+route('GET',  '/presences',                     'attendance', 'ctrl_attendance_index',    ['auth', 'school', 'perm:attendance.view']);
+route('GET',  '/presences/classe/{id}',         'attendance', 'ctrl_attendance_register', ['auth', 'school', 'perm:attendance.view']);
+route('POST', '/presences/classe/{id}',         'attendance', 'ctrl_attendance_save',     ['auth', 'school', 'perm:attendance.record']);
+route('POST', '/presences/absence/{id}',        'attendance', 'ctrl_attendance_justify',  ['auth', 'school', 'perm:attendance.justify']);
+route('POST', '/presences/registre/{id}/verrou', 'attendance', 'ctrl_attendance_lock',    ['auth', 'school', 'perm:attendance.justify']);
+
+// ---------------------------------------------------------------------
+//  FINANCES — phase 5A : grille tarifaire et dettes
+//
+//  finance.view est accordée à PARENT depuis la phase 1 : la permission
+//  ouvre la porte, le PÉRIMÈTRE appliqué dans chaque contrôleur décide
+//  du dossier. La consultation et l'écriture sont séparées — le
+//  comptable détient fee.manage, le parent jamais.
+// ---------------------------------------------------------------------
+route('GET',  '/finances',                      'finance', 'ctrl_finance_index',       ['auth', 'school', 'perm:finance.view']);
+route('GET',  '/finances/frais',                'finance', 'ctrl_finance_fees',        ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/frais',                'finance', 'ctrl_finance_fee_save',    ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/frais/{id}/realigner', 'finance', 'ctrl_finance_fee_resync',  ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/affecter',             'finance', 'ctrl_finance_assign',      ['auth', 'school', 'perm:fee.manage']);
+route('GET',  '/finances/classe/{id}',          'finance', 'ctrl_finance_classroom',   ['auth', 'school', 'perm:finance.view']);
+route('GET',  '/finances/eleve/{id}',           'finance', 'ctrl_finance_student',     ['auth', 'school', 'perm:finance.view']);
+route('POST', '/finances/ligne/{id}/remise',    'finance', 'ctrl_finance_discount',    ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/ligne/{id}/annuler',   'finance', 'ctrl_finance_cancel_line', ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/ligne/{id}/retablir',  'finance', 'ctrl_finance_restore_line', ['auth', 'school', 'perm:fee.manage']);
+
+// ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :
 //
-//   Phase 4 — pédagogie     /notes/..., /presences/...
-//   Phase 5 — finances      /finances/...
+//   Phase 5B — encaissements /finances/caisse/...
 //   Phase 6 — portails      /parent/..., /eleve/...
 //   Phase 7 — plateforme    /plateforme/...
 // ---------------------------------------------------------------------

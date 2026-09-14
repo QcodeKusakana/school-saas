@@ -132,8 +132,23 @@ function grades_repo_classroom_progress(int $classroomId, int $yearId): array
            JOIN curriculum_subjects cs ON cs.curriculum_id = c.curriculum_id
                                       AND cs.school_id = c.school_id
            JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
+           -- Uniquement les périodes du CYCLE de la classe. Le primaire
+           -- compte trois trimestres, les humanités deux semestres ; sans
+           -- ce filtre, une école qui dispense les deux afficherait
+           -- quinze colonnes à toutes ses classes.
+           -- cycle_id NULL : jeu hérité, antérieur à la migration 011.
+           JOIN curriculums cu_p ON cu_p.id = c.curriculum_id AND cu_p.school_id = c.school_id
+           JOIN education_levels lv_p ON lv_p.id = cu_p.education_level_id
            JOIN grade_periods gp ON gp.academic_year_id = :year_id
                                 AND gp.school_id = c.school_id
+                                AND (
+                                     gp.cycle_id = lv_p.cycle_id
+                                     OR (gp.cycle_id IS NULL AND NOT EXISTS (
+                                           SELECT 1 FROM grade_periods gpc
+                                            WHERE gpc.school_id = gp.school_id
+                                              AND gpc.academic_year_id = gp.academic_year_id
+                                              AND gpc.cycle_id = lv_p.cycle_id))
+                                 )
            LEFT JOIN teacher_subjects ts ON ts.curriculum_subject_id = cs.id
                                         AND ts.classroom_id = c.id
                                         AND ts.school_id = c.school_id
@@ -172,6 +187,17 @@ function grades_repo_report(int $enrollmentId): array
         'SELECT cs.id AS curriculum_subject_id, s.name AS subject_name,
                 s.short_name AS subject_short, cs.order_number,
                 cs.max_points AS program_max, cs.counts_for_ranking,
+                -- Domaine EFFECTIF : celui du programme quand il déroge,
+                -- celui de la matière sinon. La religion relève de
+                -- l univers social au CTEB et du développement personnel
+                -- au primaire : un seul rattachement ne peut pas être
+                -- juste pour les deux.
+                COALESCE(cs.domain_id, s.domain_id) AS domain_id,
+                d.code AS domain_code, d.name AS domain_name,
+                d.short_name AS domain_short, d.order_number AS domain_order,
+                -- Sous-domaine EFFECTIF, même règle que le domaine.
+                sd.code AS subdomain_code, sd.name AS subdomain_name,
+                sd.short_name AS subdomain_short, sd.order_number AS subdomain_order,
                 gp.id AS period_id, gp.code AS period_code, gp.name AS period_name,
                 gp.period_type, gp.semester, gp.max_multiplier,
                 gp.order_number AS period_order,
@@ -182,8 +208,34 @@ function grades_repo_report(int $enrollmentId): array
            JOIN curriculum_subjects cs ON cs.curriculum_id = c.curriculum_id
                                       AND cs.school_id = c.school_id
            JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
+           LEFT JOIN learning_domains d ON d.id = COALESCE(cs.domain_id, s.domain_id)
+           -- LE SOUS-DOMAINE DOIT APPARTENIR AU DOMAINE EFFECTIF.
+           --
+           -- Un programme peut déroger au domaine d une branche sans
+           -- toucher à son sous-domaine. Sans cette seconde condition,
+           -- le bulletin aurait niché un sous-domaine des arts sous
+           -- l en-tête du développement personnel, sans la moindre
+           -- erreur pour le signaler. La jointure rend l incohérence
+           -- IMPOSSIBLE : un sous-domaine qui ne relève pas du domaine
+           -- retenu ne s applique simplement pas, et la branche reste
+           -- directement sous son domaine.
+           LEFT JOIN learning_subdomains sd
+                  ON sd.id = COALESCE(cs.subdomain_id, s.subdomain_id)
+                 AND sd.domain_id = COALESCE(cs.domain_id, s.domain_id)
+           -- Mêmes raisons que dans la grille de saisie : le relevé
+           -- porte uniquement les périodes du cycle de la classe.
+           JOIN curriculums cu_r ON cu_r.id = c.curriculum_id AND cu_r.school_id = c.school_id
+           JOIN education_levels lv_r ON lv_r.id = cu_r.education_level_id
            JOIN grade_periods gp ON gp.academic_year_id = e.academic_year_id
                                 AND gp.school_id = e.school_id
+                                AND (
+                                     gp.cycle_id = lv_r.cycle_id
+                                     OR (gp.cycle_id IS NULL AND NOT EXISTS (
+                                           SELECT 1 FROM grade_periods gpc
+                                            WHERE gpc.school_id = gp.school_id
+                                              AND gpc.academic_year_id = gp.academic_year_id
+                                              AND gpc.cycle_id = lv_r.cycle_id))
+                                 )
            LEFT JOIN grades g ON g.enrollment_id = e.id
                             AND g.curriculum_subject_id = cs.id
                             AND g.grade_period_id = gp.id

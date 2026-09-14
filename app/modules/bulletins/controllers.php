@@ -15,11 +15,11 @@ require_once __DIR__ . '/../students/repositories.php';
  * Une clé venue de l'URL ne doit jamais atteindre une requête sans
  * avoir été reconnue : BULLETIN_GROUPS fait office de liste blanche.
  */
-function bulletins_requested_group(): string
+function bulletins_requested_group(array $groups): string
 {
     $key = strtoupper((string) input('periode', 'ANNUAL'));
 
-    return isset(BULLETIN_GROUPS[$key]) ? $key : 'ANNUAL';
+    return isset($groups[$key]) ? $key : 'ANNUAL';
 }
 
 // ---------------------------------------------------------------------
@@ -35,7 +35,8 @@ function ctrl_bulletins_classroom(string $id): void
         abort(404, 'Classe introuvable.');
     }
 
-    $periodKey = bulletins_requested_group();
+    $groups    = bulletins_classroom_groups($classroomId);
+    $periodKey = bulletins_requested_group($groups);
     $year      = tenant_find('academic_years', (int) $classroom['academic_year_id']);
     $published = bulletins_repo_classroom($classroomId, $periodKey);
 
@@ -51,7 +52,7 @@ function ctrl_bulletins_classroom(string $id): void
         'classroom'  => $classroom,
         'year'       => $year,
         'periodKey'  => $periodKey,
-        'groups'     => BULLETIN_GROUPS,
+        'groups'     => $groups,
         'published'  => $published,
         'live'       => $live,
         'status'     => bulletins_repo_classroom_status($classroomId),
@@ -64,7 +65,7 @@ function ctrl_bulletins_classroom(string $id): void
 function ctrl_bulletins_publish(string $id): void
 {
     $classroomId = (int) $id;
-    $periodKey   = bulletins_requested_group();
+    $periodKey   = bulletins_requested_group(bulletins_classroom_groups($classroomId));
 
     $outcome = bulletins_service_publish($classroomId, $periodKey);
 
@@ -123,7 +124,9 @@ function ctrl_bulletins_show(string $id): void
         'header'    => $header,
         'report'    => bulletins_service_compute($enrollmentId),
         'published' => bulletins_repo_for_enrollment($enrollmentId),
-        'groups'    => BULLETIN_GROUPS,
+        'groups'    => bulletins_classroom_groups((int) $header['classroom_id']),
+        // Famille de mise en page : par domaines ou par blocs de maxima.
+        'model'     => bulletins_model_for_classroom((int) $header['classroom_id']),
         'threshold' => bulletins_passing_threshold_safe(),
         'decisions' => BULLETIN_DECISIONS,
         'canDecide' => can('bulletin.publish'),

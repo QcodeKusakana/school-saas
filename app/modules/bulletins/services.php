@@ -32,11 +32,173 @@ require_once __DIR__ . '/../students/repositories.php';
  * Les clés des semestres et de l'année ne sont pas des périodes : ce
  * sont des totaux, calculés à partir des périodes qu'elles listent.
  */
+/**
+ * Regroupements par défaut — deux semestres.
+ *
+ * Conservé comme repli pour les jeux de périodes hérités, antérieurs à
+ * la migration 011, et comme liste blanche minimale. Les regroupements
+ * réels se DÉDUISENT des périodes : voir bulletins_groups().
+ */
 const BULLETIN_GROUPS = [
     'S1'     => ['label' => 'Premier semestre', 'periods' => ['P1', 'P2', 'EX1']],
     'S2'     => ['label' => 'Second semestre',  'periods' => ['P3', 'P4', 'EX2']],
     'ANNUAL' => ['label' => 'Total général',    'periods' => ['P1', 'P2', 'EX1', 'P3', 'P4', 'EX2']],
 ];
+
+/** Libellés des regroupements, par structure et par rang. */
+const BULLETIN_GROUP_LABELS = [
+    'semestre'  => ['Premier semestre', 'Second semestre'],
+    'trimestre' => ['Premier trimestre', 'Deuxième trimestre', 'Troisième trimestre'],
+];
+
+/**
+ * Regroupements DÉDUITS des périodes réelles de la classe.
+ *
+ * Le primaire est en trois trimestres, le CTEB et les humanités en deux
+ * semestres. Écrire « S1, S2, ANNUAL » en dur excluait purement et
+ * simplement le troisième trimestre du primaire : les cotes de P5, P6 et
+ * EX3 n'entraient dans aucun total.
+ *
+ * La structure n'est pas devinée par un calcul : elle vient de la
+ * colonne `semester` des périodes, qui porte le numéro du regroupement.
+ * Deux regroupements donnent S1/S2, trois donnent T1/T2/T3.
+ *
+ * @param array $periods Périodes indexées par code, avec « semester ».
+ * @return array<string, array{label: string, periods: array<string>}>
+ */
+function bulletins_groups(array $periods): array
+{
+    if ($periods === []) {
+        return BULLETIN_GROUPS;
+    }
+
+    $byGroup = [];
+
+    foreach ($periods as $code => $period) {
+        $byGroup[(int) $period['semester']][] = (string) $code;
+    }
+
+    ksort($byGroup);
+
+    $structure = count($byGroup) === 3 ? 'trimestre' : 'semestre';
+    $prefix    = $structure === 'trimestre' ? 'T' : 'S';
+    $labels    = BULLETIN_GROUP_LABELS[$structure];
+
+    $groups = [];
+    $all    = [];
+    $rank   = 0;
+
+    foreach ($byGroup as $number => $codes) {
+        $groups[$prefix . $number] = [
+            'label'   => $labels[$rank] ?? ($prefix . $number),
+            'periods' => $codes,
+        ];
+
+        $all = array_merge($all, $codes);
+        $rank++;
+    }
+
+    $groups['ANNUAL'] = ['label' => 'Total général', 'periods' => $all];
+
+    return $groups;
+}
+
+/**
+ * Regroupements applicables à une classe, d'après son cycle.
+ *
+ * Utilisé par les chemins qui n'ont pas encore calculé de bulletin :
+ * publication, classement, liste blanche des contrôleurs.
+ */
+function bulletins_classroom_groups(int $classroomId): array
+{
+    $rows = db_all(
+        'SELECT gp.code, gp.semester, gp.order_number
+           FROM classrooms c
+           JOIN curriculums cu ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
+           JOIN education_levels l ON l.id = cu.education_level_id
+           JOIN grade_periods gp ON gp.academic_year_id = c.academic_year_id
+                                AND gp.school_id = c.school_id
+                                AND (
+                                     gp.cycle_id = l.cycle_id
+                                     OR (gp.cycle_id IS NULL AND NOT EXISTS (
+                                           SELECT 1 FROM grade_periods gpc
+                                            WHERE gpc.school_id = gp.school_id
+                                              AND gpc.academic_year_id = gp.academic_year_id
+                                              AND gpc.cycle_id = l.cycle_id))
+                                )
+          WHERE c.school_id = :school_id AND c.id = :classroom_id
+          ORDER BY gp.order_number',
+        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
+    );
+
+    $periods = [];
+
+    foreach ($rows as $row) {
+        $periods[(string) $row['code']] = ['semester' => (int) $row['semester']];
+    }
+
+    return bulletins_groups($periods);
+}
+
+/**
+ * Mises en page disponibles.
+ *
+ *   domaines — branches rangées sous les cinq en-têtes officiels, chacun
+ *              portant une ligne SOUS-TOTAL. Primaire, CTEB, humanités
+ *              générales et scientifiques.
+ *   maxima   — aucun domaine : les branches sont regroupées par maximum,
+ *              chaque bloc ouvert par une ligne MAXIMA. Humanités
+ *              techniques.
+ */
+const BULLETIN_MODELS = [
+    'domaines' => 'Par domaines d\'apprentissage',
+    'maxima'   => 'Par blocs de maxima',
+];
+
+const BULLETIN_MODEL_DEFAULT = 'domaines';
+
+/**
+ * Sections dont les bulletins officiels se passent de domaines.
+ *
+ * Constaté sur trois modèles : construction et mécanique générale
+ * (industrielle), secrétariat et administration (commerciale). Les
+ * humanités scientifiques, elles, ont bien des domaines — ce n'est donc
+ * pas « humanités » qui décide, mais le caractère technique.
+ */
+const BULLETIN_TECHNICAL_SECTIONS = ['COMMERCIALE', 'INDUSTRIELLE', 'SOCIALE', 'AGRICOLE'];
+
+/**
+ * Modèle de bulletin applicable à une classe.
+ *
+ * Le programme peut l'imposer ; à défaut il se déduit de la section.
+ * La déduction reste le comportement normal : la colonne n'existe que
+ * pour pouvoir la contredire, sans livraison logicielle.
+ */
+function bulletins_model_for_classroom(int $classroomId): string
+{
+    $row = db_one(
+        'SELECT cu.bulletin_model, sec.code AS section_code
+           FROM classrooms c
+           JOIN curriculums cu ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
+           LEFT JOIN sections sec ON sec.id = cu.section_id AND sec.school_id = cu.school_id
+          WHERE c.school_id = :school_id AND c.id = :classroom_id',
+        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
+    );
+
+    if ($row === null) {
+        return BULLETIN_MODEL_DEFAULT;
+    }
+
+    $explicit = $row['bulletin_model'];
+
+    if ($explicit !== null && isset(BULLETIN_MODELS[$explicit])) {
+        return (string) $explicit;
+    }
+
+    return in_array((string) $row['section_code'], BULLETIN_TECHNICAL_SECTIONS, true)
+        ? 'maxima'
+        : BULLETIN_MODEL_DEFAULT;
+}
 
 /** Traitement des absences, par défaut. */
 const BULLETIN_ABSENCE_DEFAULT = 'excluded';
@@ -87,9 +249,16 @@ function bulletins_service_compute(int $enrollmentId): array
     $rows = grades_repo_report($enrollmentId);
 
     if ($rows === []) {
+        // MÊME FORME QU'UN RELEVÉ NORMAL, MÊME VIDE.
+        //
+        // Ce retour omettait « blocks », « domains » et « groups » : tout
+        // appelant les lisant sur une classe sans programme tombait sur
+        // une clé absente. Une structure de retour à géométrie variable
+        // est un piège qui n'attend que le premier cas limite.
         return [
-            'subjects' => [], 'periods' => [], 'totals' => [],
-            'missing'  => 0,  'absent'  => 0, 'mode' => bulletins_absence_mode(),
+            'subjects' => [], 'periods' => [], 'totals'  => [],
+            'blocks'   => [], 'domains' => [], 'groups'  => BULLETIN_GROUPS,
+            'missing'  => 0,  'absent'  => 0,  'mode'    => bulletins_absence_mode(),
         ];
     }
 
@@ -119,6 +288,17 @@ function bulletins_service_compute(int $enrollmentId): array
                 'short'    => $row['subject_short'],
                 'order'    => (int) $row['order_number'],
                 'ranking'  => (int) $row['counts_for_ranking'] === 1,
+                // Domaine EFFECTIF, celui du programme quand il déroge.
+                'domain'       => $row['domain_code'] !== null ? (string) $row['domain_code'] : null,
+                'domain_name'  => $row['domain_name'] !== null ? (string) $row['domain_name'] : null,
+                'domain_order' => (int) ($row['domain_order'] ?? 99),
+                'subdomain'       => $row['subdomain_code'] !== null ? (string) $row['subdomain_code'] : null,
+                'subdomain_name'  => $row['subdomain_short'] ?? $row['subdomain_name'] ?? null,
+                'subdomain_order' => (int) ($row['subdomain_order'] ?? 99),
+                // Maximum UNITAIRE du programme : celui d'une période
+                // simple, avant multiplicateur. C'est lui qui regroupe les
+                // branches en blocs sur le bulletin officiel.
+                'max_unit' => (float) $row['program_max'],
                 'cells'    => [],
                 'groups'   => [],
             ];
@@ -149,19 +329,43 @@ function bulletins_service_compute(int $enrollmentId): array
     uasort($subjects, static fn (array $a, array $b): int => [$a['order'], $a['name']] <=> [$b['order'], $b['name']]);
 
     // --- Totaux par branche et par regroupement -----------------------
+    //
+    // Les regroupements sont DÉDUITS des périodes de cette classe : deux
+    // semestres au CTEB et aux humanités, trois trimestres au primaire.
+    $groups = bulletins_groups($periods);
     $totals = [];
 
-    foreach (BULLETIN_GROUPS as $key => $group) {
-        $totals[$key] = ['points' => 0.0, 'max' => 0.0, 'ranking_points' => 0.0, 'ranking_max' => 0.0];
+    foreach ($groups as $key => $group) {
+        $totals[$key] = [
+            'points' => 0.0, 'max' => 0.0,
+            'ranking_points' => 0.0, 'ranking_max' => 0.0,
+            'missing' => 0, 'absent' => 0,
+        ];
     }
 
     foreach ($subjects as $subjectId => $subject) {
-        foreach (BULLETIN_GROUPS as $key => $group) {
+        foreach ($groups as $key => $group) {
             $sum = 0.0;
             $max = 0.0;
 
             foreach ($group['periods'] as $code) {
                 $cell = $subject['cells'][$code] ?? null;
+
+                // LE MANQUE SE COMPTE PAR REGROUPEMENT, PAS SUR L'ANNÉE.
+                //
+                // Un décompte global affichait sur un bulletin de premier
+                // semestre les cotes de P3, P4 et EX2 — des périodes qui
+                // n'ont pas encore eu lieu. Chaque élève portait donc dès
+                // septembre un avertissement « 180 cotes manquantes », ce
+                // qui rendait l'alerte inutilisable : elle était vraie pour
+                // tout le monde, tout le temps, et donc ignorée.
+                if ($cell !== null) {
+                    if ($cell['is_absent']) {
+                        $totals[$key]['absent']++;
+                    } elseif ($cell['points'] === null) {
+                        $totals[$key]['missing']++;
+                    }
+                }
 
                 if ($cell === null || !$cell['counted']) {
                     continue;
@@ -171,9 +375,31 @@ function bulletins_service_compute(int $enrollmentId): array
                 $max += $cell['max'];
             }
 
+            // DEUX MAXIMA, ET ILS NE SE CONFONDENT PAS.
+            //
+            //   max   — le maximum RETENU : seules les cellules qui
+            //           entrent au total. C'est le dénominateur du
+            //           pourcentage, et lui seul.
+            //   scale — le BARÈME : ce que la branche vaut, cotée ou non.
+            //           C'est ce que le formulaire officiel imprime.
+            //
+            // Les confondre faisait disparaître le barème des branches
+            // non encore corrigées : la colonne du regroupement restait
+            // vide, comme si la branche n'existait pas au programme.
+            $scale = 0.0;
+
+            foreach ($group['periods'] as $code) {
+                $cell = $subject['cells'][$code] ?? null;
+
+                if ($cell !== null) {
+                    $scale += $cell['max'];
+                }
+            }
+
             $subjects[$subjectId]['groups'][$key] = [
                 'points'     => $sum,
                 'max'        => $max,
+                'scale'      => $scale,
                 'percentage' => $max > 0 ? round($sum / $max * 100, 2) : null,
             ];
 
@@ -208,17 +434,280 @@ function bulletins_service_compute(int $enrollmentId): array
             ? round($rankingPoints / $rankingMax * 100, 2)
             : null;
 
-        $totals[$key]['label'] = BULLETIN_GROUPS[$key]['label'];
+        $totals[$key]['label'] = $groups[$key]['label'];
     }
 
     return [
         'subjects' => $subjects,
         'periods'  => $periods,
         'totals'   => $totals,
+        'blocks'   => bulletins_maxima_blocks($subjects, $periods, $groups),
+        'domains'  => bulletins_domain_totals($subjects, $periods, $groups),
+        'groups'   => $groups,
         'missing'  => $missing,
         'absent'   => $absent,
         'mode'     => $mode,
     ];
+}
+
+/**
+ * Regroupe les branches en BLOCS DE MAXIMA, comme le bulletin officiel.
+ *
+ * Le document du ministère n'aligne pas les branches à la suite : il les
+ * regroupe par maximum et ouvre chaque bloc par une ligne « MAXIMA » qui
+ * donne, pour ce bloc, le maximum d'une période, celui de l'examen, celui
+ * du semestre et celui de l'année. Ainsi, sur un bulletin de 1ère
+ * construction :
+ *
+ *     MAXIMA            10  10  20  40 …      Religion, ECM, Éducation à la vie
+ *     MAXIMA            20  20  40  80 …      Anglais, Chimie, Histoire, …
+ *     MAXIMA            50  50 100 200 …      Français, Mathématiques, Dessin
+ *     MAXIMA           100 100   —  200 …     Pratique professionnelle
+ *
+ * Les blocs sont classés par maximum croissant — c'est l'ordre constaté
+ * sur les six modèles officiels fournis.
+ *
+ * Le maximum d'une cellule du bloc vaut : maximum unitaire × multiplicateur
+ * de la période. C'est exactement la règle EPST, où le maximum EST la
+ * pondération.
+ *
+ * @return array<string, array{unit: float, periods: array<string,float>,
+ *                             groups: array<string,float>, subjects: array<int>}>
+ */
+function bulletins_maxima_blocks(array $subjects, array $periods, ?array $groups = null): array
+{
+    $groups ??= bulletins_groups($periods);
+
+    $blocks = [];
+
+    foreach ($subjects as $subjectId => $subject) {
+        $unit = (float) $subject['max_unit'];
+
+        if ($unit <= 0) {
+            continue;
+        }
+
+        // Clé textuelle : un maximum de 7,5 et un de 7 ne doivent pas se
+        // confondre dans un index de tableau.
+        $key = number_format($unit, 2, '.', '');
+
+        if (!isset($blocks[$key])) {
+            $periodMaxima = [];
+
+            foreach ($periods as $code => $period) {
+                $periodMaxima[$code] = $unit * (float) $period['multiplier'];
+            }
+
+            $groupMaxima = [];
+
+            foreach ($groups as $groupKey => $group) {
+                $sum = 0.0;
+
+                foreach ($group['periods'] as $code) {
+                    $sum += $periodMaxima[$code] ?? 0.0;
+                }
+
+                $groupMaxima[$groupKey] = $sum;
+            }
+
+            $blocks[$key] = [
+                'unit'     => $unit,
+                'periods'  => $periodMaxima,
+                'groups'   => $groupMaxima,
+                'subjects' => [],
+            ];
+        }
+
+        $blocks[$key]['subjects'][] = $subjectId;
+    }
+
+    uasort($blocks, static fn (array $a, array $b): int => $a['unit'] <=> $b['unit']);
+
+    return $blocks;
+}
+
+/**
+ * Regroupement par DOMAINE D'APPRENTISSAGE, avec ses sous-totaux.
+ *
+ * C'est l'ossature des bulletins du primaire, du CTEB et des humanités
+ * générales : les branches y sont rangées sous cinq en-têtes officiels —
+ * langues, mathématiques-sciences-technologie, univers social et
+ * environnement, arts, développement personnel — et chaque domaine porte
+ * une ligne SOUS-TOTAL.
+ *
+ * Le sous-total suit exactement la règle du total général : seules les
+ * cellules RETENUES y entrent, de sorte qu'une branche non encore cotée
+ * ne pèse pas comme un échec. Vérifié sur le bulletin rempli de 3e
+ * humanités scientifiques, où le sous-total du premier bloc vaut 10 et
+ * non 30 — deux de ses trois branches n'étant pas dispensées.
+ *
+ * Les branches sans domaine sont rassemblées sous la clé « AUTRES » :
+ * les taire ferait disparaître des cotes du document.
+ *
+ * @return array<string, array{name: string, order: int, subjects: array<int>,
+ *                             periods: array<string, array{points: float, max: float}>,
+ *                             groups: array<string, array{points: float, max: float, percentage: float|null}>}>
+ */
+function bulletins_domain_totals(array $subjects, array $periods, array $groups): array
+{
+    $domains = [];
+
+    foreach ($subjects as $subjectId => $subject) {
+        $key = $subject['domain'] ?? 'AUTRES';
+
+        if (!isset($domains[$key])) {
+            $domains[$key] = [
+                'name'     => $subject['domain_name'] ?? 'Autres branches',
+                'order'    => $subject['domain_order'] ?? 99,
+                'subjects'   => [],
+                'subdomains' => [],
+                'periods'    => [],
+                'groups'     => [],
+            ];
+
+            foreach (array_keys($periods) as $code) {
+                $domains[$key]['periods'][$code] = ['points' => 0.0, 'max' => 0.0, 'scale' => 0.0];
+            }
+
+            foreach (array_keys($groups) as $groupKey) {
+                $domains[$key]['groups'][$groupKey] = ['points' => 0.0, 'max' => 0.0, 'scale' => 0.0];
+            }
+        }
+
+        $domains[$key]['subjects'][] = $subjectId;
+
+        // STRATE INTERMÉDIAIRE, QUAND LE DOCUMENT L'IMPRIME.
+        //
+        // Les bulletins du CTEB et des humanités scientifiques rangent
+        // les sciences sous trois sous-domaines, chacun portant son
+        // propre sous-total. Une branche sans sous-domaine reste
+        // directement sous son domaine : le gabarit affiche les deux.
+        $subKey = $subject['subdomain'] ?? null;
+
+        if ($subKey !== null) {
+            if (!isset($domains[$key]['subdomains'][$subKey])) {
+                $domains[$key]['subdomains'][$subKey] = [
+                    'name'     => $subject['subdomain_name'] ?? $subKey,
+                    'order'    => $subject['subdomain_order'] ?? 99,
+                    'subjects' => [],
+                    'periods'  => [],
+                    'groups'   => [],
+                ];
+
+                foreach (array_keys($periods) as $code) {
+                    $domains[$key]['subdomains'][$subKey]['periods'][$code] =
+                        ['points' => 0.0, 'max' => 0.0, 'scale' => 0.0];
+                }
+
+                foreach (array_keys($groups) as $groupKey) {
+                    $domains[$key]['subdomains'][$subKey]['groups'][$groupKey] =
+                        ['points' => 0.0, 'max' => 0.0, 'scale' => 0.0];
+                }
+            }
+
+            $domains[$key]['subdomains'][$subKey]['subjects'][] = $subjectId;
+        }
+
+        foreach ($periods as $code => $period) {
+            $cell = $subject['cells'][$code] ?? null;
+
+            if ($cell === null) {
+                continue;
+            }
+
+            // Le barème s'additionne toujours ; le maximum retenu ne
+            // s'additionne que pour les cellules qui comptent.
+            $domains[$key]['periods'][$code]['scale'] += $cell['max'];
+
+            if ($subKey !== null) {
+                $domains[$key]['subdomains'][$subKey]['periods'][$code]['scale'] += $cell['max'];
+            }
+
+            if (!$cell['counted']) {
+                continue;
+            }
+
+            $domains[$key]['periods'][$code]['points'] += $cell['points'] ?? 0.0;
+            $domains[$key]['periods'][$code]['max']    += $cell['max'];
+
+            if ($subKey !== null) {
+                $domains[$key]['subdomains'][$subKey]['periods'][$code]['points'] += $cell['points'] ?? 0.0;
+                $domains[$key]['subdomains'][$subKey]['periods'][$code]['max']    += $cell['max'];
+            }
+        }
+
+        foreach ($groups as $groupKey => $group) {
+            $totals = $subject['groups'][$groupKey] ?? null;
+
+            if ($totals === null) {
+                continue;
+            }
+
+            $domains[$key]['groups'][$groupKey]['points'] += $totals['points'];
+            $domains[$key]['groups'][$groupKey]['max']    += $totals['max'];
+            $domains[$key]['groups'][$groupKey]['scale']  += $totals['scale'] ?? 0.0;
+
+            if ($subKey !== null) {
+                $domains[$key]['subdomains'][$subKey]['groups'][$groupKey]['points'] += $totals['points'];
+                $domains[$key]['subdomains'][$subKey]['groups'][$groupKey]['max']    += $totals['max'];
+                $domains[$key]['subdomains'][$subKey]['groups'][$groupKey]['scale']  += $totals['scale'] ?? 0.0;
+            }
+        }
+    }
+
+    foreach ($domains as $key => $domain) {
+        foreach ($domain['groups'] as $groupKey => $totals) {
+            $domains[$key]['groups'][$groupKey]['percentage'] = $totals['max'] > 0
+                ? round($totals['points'] / $totals['max'] * 100, 2)
+                : null;
+        }
+
+        uasort(
+            $domains[$key]['subdomains'],
+            static fn (array $a, array $b): int => $a['order'] <=> $b['order']
+        );
+    }
+
+    uasort($domains, static fn (array $a, array $b): int => $a['order'] <=> $b['order']);
+
+    return $domains;
+}
+
+/**
+ * MAXIMA GÉNÉRAUX : le maximum théorique du PROGRAMME.
+ *
+ * À ne pas confondre avec le dénominateur du pourcentage.
+ *
+ * Sur le document officiel, les deux coïncident parce qu'en fin d'année
+ * tout est coté. En cours d'année, le dénominateur du pourcentage ne
+ * retient que les cotes réellement disponibles — sans quoi une branche non
+ * encore corrigée pèserait comme un échec. La ligne MAXIMA GÉNÉRAUX, elle,
+ * annonce ce que vaut le programme complet : c'est une donnée de
+ * référence, pas un calcul sur l'élève.
+ *
+ * @return array<string, float> Indexé par regroupement (S1, S2, ANNUAL).
+ */
+function bulletins_general_maxima(array $blocks): array
+{
+    $totals = [];
+
+    // Les clés viennent des blocs eux-mêmes : ils portent déjà les
+    // regroupements de la classe, semestres ou trimestres.
+    foreach ($blocks as $block) {
+        foreach (array_keys($block['groups']) as $groupKey) {
+            $totals[$groupKey] = 0.0;
+        }
+    }
+
+    foreach ($blocks as $block) {
+        $count = count($block['subjects']);
+
+        foreach ($block['groups'] as $groupKey => $max) {
+            $totals[$groupKey] += $max * $count;
+        }
+    }
+
+    return $totals;
 }
 
 /**
@@ -257,7 +746,9 @@ function bulletins_cell_counts(?float $points, bool $isAbsent, string $mode): bo
  */
 function bulletins_service_rank_classroom(int $classroomId, string $periodKey): array
 {
-    if (!isset(BULLETIN_GROUPS[$periodKey])) {
+    // La liste blanche vient du CYCLE de la classe : « T3 » est valide
+    // au primaire et n'existe pas aux humanités.
+    if (!isset(bulletins_classroom_groups($classroomId)[$periodKey])) {
         return [];
     }
 
@@ -279,8 +770,11 @@ function bulletins_service_rank_classroom(int $classroomId, string $periodKey): 
             'ranking_percentage' => $total['ranking_percentage'] ?? null,
             'points'             => $total['points'] ?? 0.0,
             'max'                => $total['max'] ?? 0.0,
-            'missing'            => $computed['missing'],
-            'absent'             => $computed['absent'],
+            // Le manque et les absences RETENUS sont ceux du regroupement
+            // publié : un bulletin de premier semestre ne signale pas les
+            // cotes du second, qui n'existent pas encore.
+            'missing'            => $total['missing'] ?? 0,
+            'absent'             => $total['absent'] ?? 0,
             'student'            => $enrollment,
         ];
     }
@@ -335,7 +829,9 @@ function bulletins_service_publish(int $classroomId, string $periodKey): array
         return ['ok' => false, 'published' => 0, 'message' => 'Vous n\'avez pas le droit de publier les bulletins.', 'warnings' => []];
     }
 
-    if (!isset(BULLETIN_GROUPS[$periodKey])) {
+    $groups = bulletins_classroom_groups($classroomId);
+
+    if (!isset($groups[$periodKey])) {
         return ['ok' => false, 'published' => 0, 'message' => 'Regroupement inconnu.', 'warnings' => []];
     }
 
@@ -451,7 +947,7 @@ function bulletins_service_publish(int $classroomId, string $periodKey): array
         $classroomId,
         null,
         ['period_key' => $periodKey, 'count' => $published, 'missing' => $totalMissing],
-        'Publication des bulletins — ' . BULLETIN_GROUPS[$periodKey]['label']
+        'Publication des bulletins — ' . $groups[$periodKey]['label']
     );
 
     return ['ok' => true, 'published' => $published, 'message' => '', 'warnings' => $warnings];

@@ -145,14 +145,34 @@ function grades_service_save_sheet(
         return ['ok' => false, 'saved' => 0, 'message' => 'Cette branche ne figure pas au programme de la classe.', 'errors' => []];
     }
 
+    // LA PÉRIODE DOIT RELEVER DU CYCLE DE LA CLASSE, PAS SEULEMENT DE SON
+    // ANNÉE.
+    //
+    // Depuis que le primaire est en trimestres et les humanités en
+    // semestres, une même année porte plusieurs jeux de périodes. Ne
+    // contrôler que l'année laissait poser une cote de 4e primaire sur le
+    // « P1 » des humanités : elle était ACCEPTÉE, enregistrée en base, et
+    // n'apparaissait sur AUCUN bulletin — les dépôts ne lisant que les
+    // périodes du cycle. Le professeur croyait avoir saisi, le document
+    // n'en portait rien. Une perte de notes silencieuse.
+    //
+    // cycle_id NULL : jeu hérité, applicable à tous les cycles.
+    require_once APP_PATH . '/modules/curriculum/services.php';
+
+    $classroomCycleId = curriculum_classroom_cycle_id($classroomId);
+
     $period = tenant_one(
         'grade_periods',
-        'id = :id AND academic_year_id = :y',
-        ['id' => $periodId, 'y' => (int) $classroom['academic_year_id']]
+        'id = :id AND academic_year_id = :y AND (cycle_id IS NULL OR cycle_id = :cycle_id)',
+        [
+            'id'       => $periodId,
+            'y'        => (int) $classroom['academic_year_id'],
+            'cycle_id' => $classroomCycleId,
+        ]
     );
 
     if ($period === null) {
-        return ['ok' => false, 'saved' => 0, 'message' => 'Cette période n\'appartient pas à l\'année de la classe.', 'errors' => []];
+        return ['ok' => false, 'saved' => 0, 'message' => 'Cette période n\'appartient pas à l\'année ni au cycle de la classe.', 'errors' => []];
     }
 
     $year  = tenant_find('academic_years', (int) $classroom['academic_year_id']);

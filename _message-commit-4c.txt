@@ -1,3 +1,44 @@
+Recette 4C : jeu de démonstration et décompte des cotes manquantes par semestre
+
+OUTIL — database/seed_demo.php
+Les tests automatisés nettoient tout derrière eux : après les avoir lancés,
+la base est vide et il n'y a rien à regarder dans le navigateur. Recréer à
+la main une année, un programme, une classe, huit élèves et trois périodes
+de cotes prenait une demi-heure, à refaire à chaque phase.
+
+Le script produit une école complète en une commande, et il est idempotent.
+Il n'invente aucune donnée : il passe par les mêmes services que
+l'application (inscription, programme, saisie, publication), donc une
+régression dans un service le fait échouer — c'est voulu.
+
+Données volontairement contrastées : huit élèves échelonnés de 42 % à 91 %,
+dont un sous le seuil de réussite et un absent à une évaluation, de sorte
+que le classement, le seuil et le traitement des absences soient observables
+à l'écran plutôt que théoriques.
+
+Trois garde-fous : ligne de commande uniquement, refus si app.debug est à
+false, et confirmation explicite avant --reset. À supprimer avant la mise en
+production (ajouté à la liste de la phase 10).
+
+DÉFAUT TROUVÉ PAR CETTE RECETTE
+Le décompte des cotes manquantes portait sur l'ANNÉE ENTIÈRE. En septembre,
+un bulletin de premier semestre annonçait donc « 180 cotes manquantes » en
+comptant P3, P4 et EX2 — des périodes qui n'ont pas encore eu lieu. Vrai
+pour tous les élèves, toute l'année : l'avertissement ne pouvait qu'être
+ignoré, ce qui revenait à ne pas en avoir.
+
+Le manque et les absences se comptent désormais PAR REGROUPEMENT. Un
+bulletin de premier semestre signale ce qui manque au premier semestre ;
+chaque carte de synthèse porte son propre décompte. Vérifié à l'écran :
+S1 = 81, S2 = 99, ANNUAL = 180.
+
+255 tests verts sur base fraîche (252 avant, 3 nouveaux).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
+
+===============================================================
+
 Phase 4C : bulletins — le rang et le total se figent à la publication
 
 Le bulletin est le document qui décide du passage de classe. Trois règles
@@ -51,3 +92,4 @@ mutualisé visé. Mise en page A4 dédiée et impression navigateur.
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01QHAz71Av2b1ofSCMzkXi6j
 
+===============================================================

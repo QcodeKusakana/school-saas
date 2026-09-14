@@ -19,6 +19,11 @@ require_once __DIR__ . '/repositories.php';
  *
  * C'est exactement la structure du bulletin officiel EPST.
  */
+/**
+ * Découpage en DEUX SEMESTRES — CTEB et humanités.
+ *
+ * `semester` porte le numéro du regroupement, 1 ou 2.
+ */
 const CURRICULUM_STANDARD_PERIODS = [
     ['code' => 'P1',  'name' => 'Première période',      'type' => 'period', 'semester' => 1, 'multiplier' => 1.0],
     ['code' => 'P2',  'name' => 'Deuxième période',      'type' => 'period', 'semester' => 1, 'multiplier' => 1.0],
@@ -27,6 +32,39 @@ const CURRICULUM_STANDARD_PERIODS = [
     ['code' => 'P4',  'name' => 'Quatrième période',     'type' => 'period', 'semester' => 2, 'multiplier' => 1.0],
     ['code' => 'EX2', 'name' => 'Examen 2nd semestre',   'type' => 'exam',   'semester' => 2, 'multiplier' => 2.0],
 ];
+
+/**
+ * Découpage en TROIS TRIMESTRES — primaire.
+ *
+ * Neuf périodes : deux périodes et un examen par trimestre. Vérifié sur
+ * le bulletin du degré moyen, où MAX per vaut 300, MAX EX 600 et
+ * MAX TRIM 1200 — soit 300 + 300 + 600 par trimestre, et 3 600 à l'année.
+ * Le multiplicateur d'examen reste 2 : seul le découpage change.
+ *
+ * La colonne `semester` porte ici le numéro du TRIMESTRE, 1 à 3. Elle
+ * n'a pas été renommée : elle désigne le regroupement, quel que soit son
+ * nom sur le document, et la renommer toucherait une dizaine de requêtes
+ * sans rien apporter.
+ */
+const CURRICULUM_TRIMESTER_PERIODS = [
+    ['code' => 'P1',  'name' => 'Première période',       'type' => 'period', 'semester' => 1, 'multiplier' => 1.0],
+    ['code' => 'P2',  'name' => 'Deuxième période',       'type' => 'period', 'semester' => 1, 'multiplier' => 1.0],
+    ['code' => 'EX1', 'name' => 'Examen 1er trimestre',   'type' => 'exam',   'semester' => 1, 'multiplier' => 2.0],
+    ['code' => 'P3',  'name' => 'Troisième période',      'type' => 'period', 'semester' => 2, 'multiplier' => 1.0],
+    ['code' => 'P4',  'name' => 'Quatrième période',      'type' => 'period', 'semester' => 2, 'multiplier' => 1.0],
+    ['code' => 'EX2', 'name' => 'Examen 2e trimestre',    'type' => 'exam',   'semester' => 2, 'multiplier' => 2.0],
+    ['code' => 'P5',  'name' => 'Cinquième période',      'type' => 'period', 'semester' => 3, 'multiplier' => 1.0],
+    ['code' => 'P6',  'name' => 'Sixième période',        'type' => 'period', 'semester' => 3, 'multiplier' => 1.0],
+    ['code' => 'EX3', 'name' => 'Examen 3e trimestre',    'type' => 'exam',   'semester' => 3, 'multiplier' => 2.0],
+];
+
+/** Jeu de périodes correspondant à une structure de cycle. */
+function curriculum_period_set(string $structure): array
+{
+    return $structure === 'trimestre'
+        ? CURRICULUM_TRIMESTER_PERIODS
+        : CURRICULUM_STANDARD_PERIODS;
+}
 
 /**
  * Maximum de points proposé par défaut, selon le cycle et la branche.
@@ -43,6 +81,46 @@ const CURRICULUM_DEFAULT_MAX = [
 
 /** Branches qui, par convention, ne comptent pas dans le classement. */
 const CURRICULUM_NON_RANKING = ['CONDUITE', 'RELIGION'];
+
+/**
+ * Rattachements de domaine propres à un cycle.
+ *
+ * Le domaine d'une matière n'est pas universel : les bulletins officiels
+ * placent la religion dans l'univers social au CTEB et dans le
+ * développement personnel au primaire. La matière porte le cas général,
+ * le programme porte la dérogation.
+ *
+ * Un seul écart y figure, parce qu'un seul est ÉTABLI par les dix
+ * modèles fournis. Ne rien ajouter ici sans un bulletin à l'appui.
+ *
+ *   cycle => [ code de branche => code de domaine ]
+ */
+const CURRICULUM_CYCLE_DOMAINS = [
+    'PRIMAIRE' => ['RELIGION' => 'DEV_PERS'],
+];
+
+/**
+ * Domaine applicable à une branche DANS UN PROGRAMME donné.
+ *
+ * Renvoie NULL quand le domaine de la matière convient : la colonne
+ * `curriculum_subjects.domain_id` est une dérogation, pas une copie.
+ */
+function curriculum_domain_override(string $cycleCode, string $subjectCode): ?int
+{
+    $domainCode = CURRICULUM_CYCLE_DOMAINS[$cycleCode][$subjectCode] ?? null;
+
+    if ($domainCode === null) {
+        return null;
+    }
+
+    $id = db_value(
+        'SELECT id FROM learning_domains WHERE code = :code',
+        ['code' => $domainCode],
+        true
+    );
+
+    return $id !== null ? (int) $id : null;
+}
 
 // =====================================================================
 //  IMPORT DU RÉFÉRENTIEL NATIONAL
@@ -137,6 +215,12 @@ function curriculum_service_import_national(): array
 
             tenant_insert('subjects', [
                 'domain_id'            => $reference['domain_id'] !== null ? (int) $reference['domain_id'] : null,
+                // Le sous-domaine suit la matière de référence : sans
+                // cette ligne, une école importée après la migration 014
+                // recevait des branches détachées de toute strate
+                // intermédiaire, et son bulletin n'affichait aucun
+                // sous-total de sous-domaine.
+                'subdomain_id'         => $reference['subdomain_id'] !== null ? (int) $reference['subdomain_id'] : null,
                 'reference_subject_id' => (int) $reference['id'],
                 'code'                 => $reference['code'],
                 'name'                 => $reference['name'],
@@ -170,10 +254,6 @@ function curriculum_service_import_national(): array
  */
 function curriculum_service_create_standard_periods(int $academicYearId): int
 {
-    if (curriculum_repo_count_periods($academicYearId) > 0) {
-        return 0;
-    }
-
     // L'année doit appartenir à l'école courante : sans ce contrôle, un
     // identifiant forgé dans le formulaire créerait des périodes chez
     // une autre école.
@@ -183,33 +263,160 @@ function curriculum_service_create_standard_periods(int $academicYearId): int
         abort(404, 'Année scolaire introuvable.');
     }
 
-    return db_transaction(static function () use ($academicYearId, $year): int {
+    // UN JEU PAR CYCLE DISPENSÉ, ET NON UN JEU POUR L'ÉCOLE.
+    //
+    // Le primaire est en trois trimestres, le CTEB et les humanités en
+    // deux semestres. Une école qui dispense les deux a besoin des deux
+    // jeux dans la même année. Le découpage est lu sur le cycle, jamais
+    // écrit dans ce code : une réforme se règle par un UPDATE.
+    $cycles = db_all(
+        'SELECT c.id, c.code, c.name, c.period_structure
+           FROM school_cycles sc
+           JOIN education_cycles c ON c.id = sc.cycle_id
+          WHERE sc.school_id = :school_id AND sc.is_active = 1
+          ORDER BY c.id',
+        ['school_id' => tenant_require()]
+    );
+
+    if ($cycles === []) {
+        return 0;
+    }
+
+    return db_transaction(static function () use ($academicYearId, $year, $cycles): int {
         $created = 0;
 
-        foreach (CURRICULUM_STANDARD_PERIODS as $index => $period) {
-            tenant_insert('grade_periods', [
-                'academic_year_id' => $academicYearId,
-                'code'             => $period['code'],
-                'name'             => $period['name'],
-                'period_type'      => $period['type'],
-                'semester'         => $period['semester'],
-                'order_number'     => $index + 1,
-                'max_multiplier'   => $period['multiplier'],
-            ]);
-            $created++;
+        // Structure du jeu HÉRITÉ, s'il en existe un : nombre de
+        // regroupements distincts, 2 pour des semestres, 3 pour des
+        // trimestres.
+        $legacyGroups = (int) db_value(
+            'SELECT COUNT(DISTINCT semester) FROM grade_periods
+              WHERE school_id = :school_id
+                AND academic_year_id = :year_id
+                AND cycle_id IS NULL',
+            ['school_id' => tenant_require(), 'year_id' => $academicYearId]
+        );
+
+        $legacyStructure = match ($legacyGroups) {
+            0       => null,
+            3       => 'trimestre',
+            default => 'semestre',
+        };
+
+        foreach ($cycles as $cycle) {
+            $cycleId   = (int) $cycle['id'];
+            $structure = (string) $cycle['period_structure'];
+
+            // Le cycle a déjà SON jeu : on ne touche à rien.
+            $own = (int) db_value(
+                'SELECT COUNT(*) FROM grade_periods
+                  WHERE school_id = :school_id
+                    AND academic_year_id = :year_id
+                    AND cycle_id = :cycle_id',
+                ['school_id' => tenant_require(), 'year_id' => $academicYearId, 'cycle_id' => $cycleId]
+            );
+
+            if ($own > 0) {
+                continue;
+            }
+
+            // UN JEU HÉRITÉ NE DISPENSE PAS DE CRÉER CELUI DU CYCLE.
+            //
+            // Le contrôle portait auparavant sur « cycle_id = X OU
+            // cycle_id IS NULL » : sur toute base antérieure à la
+            // migration 011 — y compris celles déjà installées — aucun
+            // jeu par cycle n'était jamais créé, et le primaire restait
+            // en deux semestres pour toujours.
+            //
+            // Le jeu hérité suffit tant que sa STRUCTURE convient au
+            // cycle. Elle ne convient plus dès qu'elles diffèrent : un
+            // cycle en trimestres ne peut pas se contenter de six
+            // périodes semestrielles.
+            if ($legacyStructure !== null && $legacyStructure === $structure) {
+                continue;
+            }
+
+            // CRÉER LE JEU DU CYCLE MASQUERAIT DES COTES DÉJÀ SAISIES.
+            //
+            // Les dépôts privilégient le jeu du cycle dès qu'il existe.
+            // Des cotes posées sur le jeu hérité pour une classe de ce
+            // cycle disparaîtraient donc des bulletins. On refuse, et on
+            // le dit : masquer des notes sans avertir serait pire que
+            // laisser la structure imparfaite.
+            if ($legacyStructure !== null) {
+                $atRisk = (int) db_value(
+                    'SELECT COUNT(*)
+                       FROM grades g
+                       JOIN grade_periods gp ON gp.id = g.grade_period_id AND gp.school_id = g.school_id
+                       JOIN enrollments e ON e.id = g.enrollment_id AND e.school_id = g.school_id
+                       JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
+                       JOIN curriculums cu ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
+                       JOIN education_levels l ON l.id = cu.education_level_id
+                      WHERE g.school_id = :school_id
+                        AND gp.academic_year_id = :year_id
+                        AND gp.cycle_id IS NULL
+                        AND l.cycle_id = :cycle_id',
+                    ['school_id' => tenant_require(), 'year_id' => $academicYearId, 'cycle_id' => $cycleId]
+                );
+
+                if ($atRisk > 0) {
+                    log_warning(
+                        'Périodes non créées pour le cycle ' . $cycle['code']
+                        . ' : ' . $atRisk . ' cote(s) déjà saisies sur le jeu hérité seraient masquées.'
+                    );
+
+                    continue;
+                }
+            }
+
+            foreach (curriculum_period_set($structure) as $index => $period) {
+                tenant_insert('grade_periods', [
+                    'academic_year_id' => $academicYearId,
+                    'cycle_id'         => $cycleId,
+                    'code'             => $period['code'],
+                    'name'             => $period['name'],
+                    'period_type'      => $period['type'],
+                    'semester'         => $period['semester'],
+                    'order_number'     => $index + 1,
+                    'max_multiplier'   => $period['multiplier'],
+                ]);
+                $created++;
+            }
         }
 
-        audit_log(
-            'create',
-            'grade_periods',
-            $academicYearId,
-            null,
-            ['count' => $created],
-            'Création des périodes pour l\'année ' . $year['code']
-        );
+        if ($created > 0) {
+            audit_log(
+                'create',
+                'grade_periods',
+                $academicYearId,
+                null,
+                ['count' => $created, 'cycles' => count($cycles)],
+                'Création des périodes pour l\'année ' . $year['code']
+            );
+        }
 
         return $created;
     });
+}
+
+/**
+ * Cycle d'une classe, par son programme et son niveau.
+ *
+ * Sert à ne retenir que les périodes qui la concernent : une classe de
+ * 5e primaire ne doit jamais voir les six périodes des humanités, ni
+ * l'inverse.
+ */
+function curriculum_classroom_cycle_id(int $classroomId): ?int
+{
+    $id = db_value(
+        'SELECT l.cycle_id
+           FROM classrooms c
+           JOIN curriculums cu ON cu.id = c.curriculum_id AND cu.school_id = c.school_id
+           JOIN education_levels l ON l.id = cu.education_level_id
+          WHERE c.school_id = :school_id AND c.id = :classroom_id',
+        ['school_id' => tenant_require(), 'classroom_id' => $classroomId]
+    );
+
+    return $id !== null ? (int) $id : null;
 }
 
 // =====================================================================
@@ -459,6 +666,12 @@ function curriculum_service_fill_program(int $curriculumId): int
             tenant_insert('curriculum_subjects', [
                 'curriculum_id'      => $curriculumId,
                 'subject_id'         => (int) $subject['id'],
+                // Dérogation de domaine propre au cycle, le cas échéant.
+                // NULL laisse la branche suivre le domaine de sa matière.
+                'domain_id'          => curriculum_domain_override(
+                    (string) $program['cycle_code'],
+                    (string) $subject['code']
+                ),
                 'max_points'         => $defaults[$subject['code']] ?? $defaults['default'],
                 'counts_for_ranking' => in_array($subject['code'], CURRICULUM_NON_RANKING, true) ? 0 : 1,
                 'order_number'       => $order,

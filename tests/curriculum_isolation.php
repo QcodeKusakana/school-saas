@@ -101,16 +101,169 @@ check('Un renommage chez A laisse B intact', $stillB['name'] === 'Mathématiques
 // --- 5. Périodes ------------------------------------------------------
 tenant_set($schoolA);
 $createdA = curriculum_service_create_standard_periods($yearA);
-check('Six périodes créées (4 périodes + 2 examens)', $createdA === 6, (string) $createdA);
 
-$multiplier = 0.0;
-foreach (curriculum_repo_periods($yearA) as $period) {
-    $multiplier += (float) $period['max_multiplier'];
+// UN JEU DE PÉRIODES PAR CYCLE DISPENSÉ.
+//
+// Les dix bulletins officiels montrent deux découpages : trois
+// trimestres au primaire (neuf périodes), deux semestres au CTEB et aux
+// humanités (six périodes). Une école qui dispense les deux a besoin des
+// deux jeux dans la même année.
+$byCycle = [];
+
+foreach (db_all(
+    'SELECT c.code, c.period_structure, gp.code AS period_code, gp.semester, gp.max_multiplier
+       FROM grade_periods gp
+       JOIN education_cycles c ON c.id = gp.cycle_id
+      WHERE gp.school_id = :s AND gp.academic_year_id = :y
+      ORDER BY c.id, gp.order_number',
+    ['s' => $schoolA, 'y' => $yearA]
+) as $row) {
+    $byCycle[$row['code']][] = $row;
 }
-check('Multiplicateur annuel cumulé = 8', abs($multiplier - 8.0) < 0.001, (string) $multiplier);
+
+check(
+    'Un jeu de périodes par cycle dispensé',
+    count($byCycle) >= 2,
+    implode(', ', array_keys($byCycle))
+);
+
+check(
+    'Le primaire reçoit NEUF périodes — trois trimestres',
+    isset($byCycle['PRIMAIRE']) && count($byCycle['PRIMAIRE']) === 9,
+    isset($byCycle['PRIMAIRE']) ? count($byCycle['PRIMAIRE']) . ' périodes' : 'aucune'
+);
+
+check(
+    'Réparties en trois regroupements',
+    isset($byCycle['PRIMAIRE'])
+        && count(array_unique(array_column($byCycle['PRIMAIRE'], 'semester'))) === 3
+);
+
+check(
+    'Les humanités reçoivent SIX périodes — deux semestres',
+    isset($byCycle['HUMANITES']) && count($byCycle['HUMANITES']) === 6,
+    isset($byCycle['HUMANITES']) ? count($byCycle['HUMANITES']) . ' périodes' : 'aucune'
+);
+
+// Le multiplicateur cumulé donne le rapport entre le maximum d'une
+// branche et son total annuel. Vérifié sur le bulletin du degré moyen :
+// MAX per 300, TOTAL 3600, soit exactement douze fois.
+$sum = static fn (array $rows): float => array_sum(array_map(
+    static fn (array $r): float => (float) $r['max_multiplier'],
+    $rows
+));
+
+check(
+    'Primaire : multiplicateur annuel cumulé = 12 (3 × [1 + 1 + 2])',
+    isset($byCycle['PRIMAIRE']) && abs($sum($byCycle['PRIMAIRE']) - 12.0) < 0.001,
+    isset($byCycle['PRIMAIRE']) ? (string) $sum($byCycle['PRIMAIRE']) : '—'
+);
+
+check(
+    'Humanités : multiplicateur annuel cumulé = 8 (2 × [1 + 1 + 2])',
+    isset($byCycle['HUMANITES']) && abs($sum($byCycle['HUMANITES']) - 8.0) < 0.001,
+    isset($byCycle['HUMANITES']) ? (string) $sum($byCycle['HUMANITES']) : '—'
+);
+
+// Les regroupements déduits doivent suivre la structure du cycle.
+require_once APP_PATH . '/modules/bulletins/services.php';
+
+$indexed = static function (array $rows): array {
+    $out = [];
+
+    foreach ($rows as $r) {
+        $out[$r['period_code']] = ['semester' => (int) $r['semester']];
+    }
+
+    return $out;
+};
+
+check(
+    'Le primaire produit T1, T2, T3 et le total général',
+    array_keys(bulletins_groups($indexed($byCycle['PRIMAIRE'] ?? []))) === ['T1', 'T2', 'T3', 'ANNUAL'],
+    implode(', ', array_keys(bulletins_groups($indexed($byCycle['PRIMAIRE'] ?? []))))
+);
+
+check(
+    'Les humanités produisent S1, S2 et le total général',
+    array_keys(bulletins_groups($indexed($byCycle['HUMANITES'] ?? []))) === ['S1', 'S2', 'ANNUAL'],
+    implode(', ', array_keys(bulletins_groups($indexed($byCycle['HUMANITES'] ?? []))))
+);
 
 $again = curriculum_service_create_standard_periods($yearA);
 check('Création rejouée : aucune période en double', $again === 0);
+
+// =====================================================================
+//  CHEMIN DE MISE À JOUR — UNE BASE ANTÉRIEURE À LA MIGRATION 011
+//
+//  Ces bases portent un jeu HÉRITÉ, sans cycle. Le service refusait
+//  alors de créer quoi que ce soit : leur primaire serait resté en DEUX
+//  SEMESTRES pour toujours, et le troisième trimestre n'aurait jamais
+//  existé. C'est le cas de toute installation déjà en service.
+// =====================================================================
+tenant_set($schoolB);
+
+foreach ([['P1', 1, 1, 1.0], ['P2', 1, 2, 1.0], ['EX1', 1, 3, 2.0],
+          ['P3', 2, 4, 1.0], ['P4', 2, 5, 1.0], ['EX2', 2, 6, 2.0]] as $legacy) {
+    db_query(
+        'INSERT INTO grade_periods
+            (school_id, academic_year_id, cycle_id, code, name,
+             period_type, semester, order_number, max_multiplier)
+         VALUES (:s, :y, NULL, :code, :label, :t, :sem, :o, :m)',
+        [
+            's'   => $schoolB, 'y' => $yearB,
+            // Deux paramètres distincts pour la même valeur : avec
+            // ATTR_EMULATE_PREPARES = false, réutiliser « :c » lève
+            // HY093. C'est la quatrième fois que ce piège se referme
+            // dans ce projet.
+            'code' => $legacy[0], 'label' => $legacy[0],
+            't'   => str_starts_with($legacy[0], 'EX') ? 'exam' : 'period',
+            'sem' => $legacy[1], 'o' => $legacy[2], 'm' => $legacy[3],
+        ],
+        true
+    );
+}
+
+$upgraded = curriculum_service_create_standard_periods($yearB);
+
+check(
+    'Un jeu hérité n\'empêche plus la création du jeu du primaire',
+    $upgraded === 9,
+    $upgraded . ' période(s) créée(s)'
+);
+
+$primaryB = db_all(
+    'SELECT gp.code, gp.semester FROM grade_periods gp
+       JOIN education_cycles c ON c.id = gp.cycle_id
+      WHERE gp.school_id = :s AND gp.academic_year_id = :y AND c.code = \'PRIMAIRE\'
+      ORDER BY gp.order_number',
+    ['s' => $schoolB, 'y' => $yearB],
+    true
+);
+
+check(
+    'Le primaire obtient ses NEUF périodes trimestrielles',
+    count($primaryB) === 9,
+    count($primaryB) . ' période(s)'
+);
+
+// Le jeu hérité est en semestres : il convient déjà au CTEB et aux
+// humanités. En recréer un pour eux ferait doublon.
+$othersB = (int) db_value(
+    'SELECT COUNT(*) FROM grade_periods gp
+       JOIN education_cycles c ON c.id = gp.cycle_id
+      WHERE gp.school_id = :s AND gp.academic_year_id = :y AND c.code <> \'PRIMAIRE\'',
+    ['s' => $schoolB, 'y' => $yearB],
+    true
+);
+
+check(
+    'Les cycles déjà servis par le jeu hérité n\'en reçoivent pas un second',
+    $othersB === 0,
+    $othersB . ' période(s) en trop'
+);
+
+tenant_set($schoolA);
 
 // --- 6. Programme : règles métier --------------------------------------
 $level5 = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_5'", [], true);
@@ -227,6 +380,83 @@ foreach (['subjects', 'sections', 'options', 'curriculums', 'curriculum_subjects
 
     check("Garde-fou actif sur « {$table} »", $blocked);
 }
+
+// --- 14. Référentiel officiel des domaines d'apprentissage -------------
+//
+// Le projet a longtemps porté HUIT domaines inventés. Les six bulletins
+// officiels du ministère en comptent CINQ, et « Conduite » n'y est pas un
+// domaine mais une ligne d'appréciation en bas de page. Ces contrôles
+// empêchent la réapparition de la taxonomie inventée.
+$domains = db_all('SELECT id, code, name FROM learning_domains ORDER BY order_number', [], true);
+
+check(
+    'Cinq domaines d\'apprentissage, ni plus ni moins',
+    count($domains) === 5,
+    count($domains) . ' domaine(s)'
+);
+
+check(
+    'Ce sont les cinq domaines officiels',
+    array_column($domains, 'code') === ['LANGUES', 'SCIENCES', 'UNIVERS', 'ARTS', 'DEV_PERS'],
+    implode(', ', array_column($domains, 'code'))
+);
+
+check(
+    '« Conduite » n\'est plus un domaine',
+    !in_array('CONDUITE', array_column($domains, 'code'), true)
+);
+
+// Le rerattachement ne devait perdre aucune matière : une migration qui
+// déplace des lignes de référence doit se vérifier par le nombre.
+check(
+    'Aucune matière de référence n\'est orpheline après rerattachement',
+    (int) db_value(
+        'SELECT COUNT(*) FROM reference_subjects rs
+           LEFT JOIN learning_domains d ON d.id = rs.domain_id
+          WHERE d.id IS NULL',
+        [],
+        true
+    ) === 0
+);
+
+check(
+    'Aucune matière d\'école n\'est orpheline non plus',
+    (int) db_value(
+        'SELECT COUNT(*) FROM subjects s
+           LEFT JOIN learning_domains d ON d.id = s.domain_id
+          WHERE s.domain_id IS NOT NULL AND d.id IS NULL',
+        [],
+        true
+    ) === 0
+);
+
+// Contrôles ponctuels tirés des modèles officiels.
+$domainOf = static function (string $code): ?string {
+    return db_value(
+        'SELECT d.code FROM reference_subjects rs
+           JOIN learning_domains d ON d.id = rs.domain_id
+          WHERE rs.code = :c',
+        ['c' => $code],
+        true
+    );
+};
+
+check(
+    'Technologie et TIC relèvent du domaine des sciences (modèle 7e CTEB)',
+    $domainOf('TECHNOLOGIE') === 'SCIENCES' && $domainOf('TIC') === 'SCIENCES'
+);
+
+check(
+    'Religion, ECM et Éducation à la vie relèvent de l\'univers social (modèles 7e et 8e CTEB)',
+    $domainOf('RELIGION') === 'UNIVERS'
+        && $domainOf('EDUC_CIVIQUE') === 'UNIVERS'
+        && $domainOf('EDUC_VIE') === 'UNIVERS'
+);
+
+check(
+    'Travaux pratiques et EPS relèvent du développement personnel (modèle degré élémentaire)',
+    $domainOf('TRAV_PRAT') === 'DEV_PERS' && $domainOf('EPS') === 'DEV_PERS'
+);
 
 // --- Nettoyage ---------------------------------------------------------
 db_query("DELETE FROM schools WHERE code LIKE 'CUR-%'", [], true);

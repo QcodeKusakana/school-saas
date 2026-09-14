@@ -137,8 +137,21 @@ try {
     $subjectOther = (int) $subjects[1]['id'];
     $bigMax       = (int) $subjects[0]['max_points'];
 
-    $periodP1 = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'P1']);
-    $periodEx = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'EX1']);
+    // Le code d'une période n'est plus unique dans l'année : depuis la
+    // migration 011, chaque cycle porte son propre jeu et le primaire a
+    // son « P1 » comme les humanités ont le leur. La recherche se
+    // qualifie donc par le cycle de la classe.
+    $cycleId  = curriculum_classroom_cycle_id($classA);
+    $periodP1 = tenant_one(
+        'grade_periods',
+        'academic_year_id = :y AND code = :c AND cycle_id = :cy',
+        ['y' => $yearId, 'c' => 'P1', 'cy' => $cycleId]
+    );
+    $periodEx = tenant_one(
+        'grade_periods',
+        'academic_year_id = :y AND code = :c AND cycle_id = :cy',
+        ['y' => $yearId, 'c' => 'EX1', 'cy' => $cycleId]
+    );
 
     check('Périodes standard créées', $periodP1 !== null && $periodEx !== null);
 
@@ -393,7 +406,55 @@ try {
     act_as($schoolId, 'DIRECTION');
     tenant_set($schoolId);
 
-    $emptyPeriod = tenant_one('grade_periods', 'academic_year_id = :y AND code = :c', ['y' => $yearId, 'c' => 'P2']);
+    // =================================================================
+    //  UNE PÉRIODE D'UN AUTRE CYCLE EST REFUSÉE
+    //
+    //  Depuis que le primaire est en trimestres et les humanités en
+    //  semestres, une même année porte plusieurs jeux de périodes. Ne
+    //  contrôler que l'année laissait poser une cote de primaire sur le
+    //  « P1 » des humanités : ACCEPTÉE, enregistrée, et invisible sur tous
+    //  les bulletins. Le professeur croyait avoir saisi, le document n'en
+    //  portait rien.
+    // =================================================================
+    $otherCycleId = (int) db_value(
+        'SELECT id FROM education_cycles WHERE id <> :own ORDER BY id LIMIT 1',
+        ['own' => $cycleId],
+        true
+    );
+
+    $foreignPeriod = tenant_one(
+        'grade_periods',
+        'academic_year_id = :y AND cycle_id = :cy ORDER BY order_number',
+        ['y' => $yearId, 'cy' => $otherCycleId]
+    );
+
+    check('Une période existe bien pour un autre cycle', $foreignPeriod !== null);
+
+    $before = (int) db_value('SELECT COUNT(*) FROM grades WHERE school_id = :s', ['s' => $schoolId], true);
+
+    $foreign = grades_service_save_sheet(
+        $classA,
+        $subjectBig,
+        (int) $foreignPeriod['id'],
+        [$enrollA[0] => ['points' => 5, 'is_absent' => false]]
+    );
+
+    check(
+        'Une cote posée sur la période d\'un AUTRE cycle est refusée',
+        !$foreign['ok'] && str_contains($foreign['message'], 'cycle'),
+        $foreign['message']
+    );
+
+    check(
+        'Et rien n\'est écrit en base',
+        (int) db_value('SELECT COUNT(*) FROM grades WHERE school_id = :s', ['s' => $schoolId], true) === $before
+    );
+
+    $emptyPeriod = tenant_one(
+        'grade_periods',
+        'academic_year_id = :y AND code = :c AND cycle_id = :cy',
+        ['y' => $yearId, 'c' => 'P2', 'cy' => $cycleId]
+    );
 
     $empty = grades_service_save_sheet($classA, $subjectOther, (int) $emptyPeriod['id'], [
         $enrollA[0] => ['points' => '', 'is_absent' => false],

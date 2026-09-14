@@ -94,6 +94,12 @@ const TENANT_TABLES = [
     'messages',
     'disciplinary_records',
     'rewards',
+
+    // Phase 4D — présences. Déclarées dès la création des tables : la
+    // table `bulletins` avait été oubliée en phase 4C et n'a été
+    // rattrapée que par un contrôle manuel.
+    'attendance_sessions',
+    'attendance_records',
 ];
 
 /**
@@ -107,6 +113,7 @@ const GLOBAL_TABLES = [
     'education_cycles',
     'education_levels',
     'learning_domains',      // modèle national, phase 2
+    'learning_subdomains',   // strate intercalaire, phase 4C
     'reference_sections',
     'reference_options',
     'reference_subjects',

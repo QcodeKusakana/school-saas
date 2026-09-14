@@ -101,6 +101,17 @@ function errors_render(Throwable $e): void
         ob_end_clean();
     }
 
+    // EN LIGNE DE COMMANDE, UNE ERREUR EST UN TEXTE, PAS UNE PAGE WEB.
+    //
+    // Sans cette branche, `php database/migrate.php` qui échoue déversait
+    // dans le terminal une page HTML complète — doctype, feuille de style,
+    // balises — dans laquelle le message d'erreur était noyé. L'outil
+    // devenait illisible exactement au moment où il avait quelque chose
+    // d'important à dire.
+    if (PHP_SAPI === 'cli') {
+        errors_render_cli($e);
+    }
+
     if (!headers_sent()) {
         http_response_code(500);
     }
@@ -131,6 +142,42 @@ function errors_render(Throwable $e): void
     }
 
     exit;
+}
+
+/**
+ * Erreur en ligne de commande : message, emplacement, pile.
+ *
+ * La pile n'est affichée qu'en développement — un script planifié tournant
+ * en production ne doit pas écrire de chemins serveur dans un journal de
+ * tâches, mais le détail part dans storage/logs/ via errors_report().
+ */
+function errors_render_cli(Throwable $e): void
+{
+    fwrite(STDERR, "\n");
+    fwrite(STDERR, "  ✗ " . get_class($e) . "\n");
+    fwrite(STDERR, "  " . str_repeat('─', 60) . "\n");
+    fwrite(STDERR, "  " . $e->getMessage() . "\n\n");
+    fwrite(STDERR, "  " . $e->getFile() . ' ligne ' . $e->getLine() . "\n");
+
+    $previous = $e->getPrevious();
+
+    while ($previous !== null) {
+        fwrite(STDERR, "\n  Cause : " . $previous->getMessage() . "\n");
+        fwrite(STDERR, "  " . $previous->getFile() . ' ligne ' . $previous->getLine() . "\n");
+        $previous = $previous->getPrevious();
+    }
+
+    if (config('app.debug')) {
+        fwrite(STDERR, "\n  Pile d'appels\n");
+
+        foreach (explode("\n", $e->getTraceAsString()) as $frame) {
+            fwrite(STDERR, "    " . $frame . "\n");
+        }
+    }
+
+    fwrite(STDERR, "\n  Détail complet dans storage/logs/\n\n");
+
+    exit(1);
 }
 
 /** Page de diagnostic, affichée uniquement en développement. */

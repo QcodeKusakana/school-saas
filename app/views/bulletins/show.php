@@ -21,6 +21,22 @@ $fullName = full_name($header['last_name'], $header['post_name'], $header['first
 set_title('Bulletin — ' . $fullName);
 
 $annual   = $published['ANNUAL'] ?? null;
+
+// DERNIÈRE PÉRIODE DE CHAQUE REGROUPEMENT.
+//
+// La colonne de total s'insère juste après elle. Auparavant le gabarit
+// écrivait « après EX1 » et « après EX2 » : au primaire, qui compte trois
+// trimestres et se termine par EX3, la colonne du troisième total
+// n'apparaissait tout simplement pas.
+$closes = [];
+
+foreach ($groups as $groupKey => $group) {
+    if ($groupKey === 'ANNUAL' || $group['periods'] === []) {
+        continue;
+    }
+
+    $closes[(string) end($group['periods'])] = $groupKey;
+}
 $subjects = $report['subjects'];
 $periods  = $report['periods'];
 $totals   = $report['totals'];
@@ -89,102 +105,52 @@ $cell = static function (?array $c): string {
     </div>
 <?php else: ?>
 
-    <?php if ($report['missing'] > 0): ?>
+    <?php
+    // On signale le manque du SEMESTRE EN COURS, pas celui de l'année :
+    // en septembre, les périodes du second semestre ne sont pas
+    // « manquantes », elles n'ont pas encore eu lieu. Un avertissement vrai
+    // pour tout le monde toute l'année n'est plus un avertissement.
+    $currentGap = 0;
+
+    foreach (array_keys($groups) as $half) {
+        if ($half === 'ANNUAL') {
+            continue;
+        }
+
+        if (($totals[$half]['max'] ?? 0) > 0) {
+            $currentGap = (int) ($totals[$half]['missing'] ?? 0);
+        }
+    }
+    ?>
+
+    <?php if ($currentGap > 0): ?>
         <div class="alert alert-warning py-2 small avoid-break">
-            <strong><?= (int) $report['missing'] ?></strong> cote(s) non encore saisie(s).
+            <strong><?= $currentGap ?></strong> cote(s) non encore saisie(s) sur le semestre en cours.
             Les totaux ci-dessous ne portent que sur les cotes disponibles.
         </div>
     <?php endif; ?>
 
     <!-- --------------------------------------------------------------
-         Tableau des branches
+         Tableau des branches — gabarit propre à la famille de bulletin
     --------------------------------------------------------------- -->
-    <div class="table-responsive avoid-break">
-        <table class="table table-sm table-bordered align-middle mb-3" style="font-size:.8rem">
-            <thead class="table-light">
-                <tr>
-                    <th scope="col" rowspan="2" style="min-width:9rem">Branche</th>
-                    <?php foreach ($periods as $p): ?>
-                        <th scope="col" class="text-center" title="<?= e($p['name']) ?>">
-                            <?= e($p['code']) ?>
-                        </th>
-                        <?php if ($p['code'] === 'EX1'): ?>
-                            <th scope="col" class="text-center table-secondary">S1</th>
-                        <?php elseif ($p['code'] === 'EX2'): ?>
-                            <th scope="col" class="text-center table-secondary">S2</th>
-                        <?php endif; ?>
-                    <?php endforeach; ?>
-                    <th scope="col" class="text-center table-secondary">TOTAL</th>
-                </tr>
-                <tr>
-                    <?php foreach ($periods as $p): ?>
-                        <th scope="col" class="text-center fw-normal text-secondary small">
-                            ×<?= e(grades_format($p['multiplier'])) ?>
-                        </th>
-                        <?php if (in_array($p['code'], ['EX1', 'EX2'], true)): ?>
-                            <th scope="col" class="table-secondary"></th>
-                        <?php endif; ?>
-                    <?php endforeach; ?>
-                    <th scope="col" class="table-secondary"></th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php foreach ($subjects as $subject): ?>
-                    <tr>
-                        <td>
-                            <?= e($subject['name']) ?>
-                            <?php if (!$subject['ranking']): ?>
-                                <span class="text-secondary" title="Ne compte pas dans le classement">*</span>
-                            <?php endif; ?>
-                        </td>
+    <?php
+    // Les mises en page officielles ne se ramènent pas à une seule. Deux
+    // familles s'opposent réellement : par DOMAINES (primaire, CTEB,
+    // humanités générales) et par BLOCS DE MAXIMA (humanités techniques).
+    // Chacune a son fichier ; ce qui les entoure — en-tête, synthèse,
+    // décision, signatures — leur est commun et reste ici.
+    $modelFile = APP_PATH . '/views/bulletins/models/' . $model . '.php';
 
-                        <?php foreach ($periods as $p): ?>
-                            <td class="text-center"><?= $cell($subject['cells'][$p['code']] ?? null) ?></td>
-
-                            <?php if (in_array($p['code'], ['EX1', 'EX2'], true)): ?>
-                                <?php $g = $subject['groups'][$p['code'] === 'EX1' ? 'S1' : 'S2']; ?>
-                                <td class="text-center table-secondary fw-medium">
-                                    <?= $g['max'] > 0
-                                        ? e(grades_format($g['points'])) . '<span class="text-secondary">/' . e(grades_format($g['max'])) . '</span>'
-                                        : '<span class="text-secondary">—</span>' ?>
-                                </td>
-                            <?php endif; ?>
-                        <?php endforeach; ?>
-
-                        <?php $ga = $subject['groups']['ANNUAL']; ?>
-                        <td class="text-center table-secondary fw-semibold">
-                            <?= $ga['max'] > 0
-                                ? e(grades_format($ga['points'])) . '<span class="fw-normal text-secondary">/' . e(grades_format($ga['max'])) . '</span>'
-                                : '<span class="text-secondary">—</span>' ?>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-            </tbody>
-            <tfoot class="table-light">
-                <tr class="fw-semibold">
-                    <td>TOTAUX</td>
-                    <?php foreach ($periods as $p): ?>
-                        <td></td>
-                        <?php if (in_array($p['code'], ['EX1', 'EX2'], true)): ?>
-                            <?php $t = $totals[$p['code'] === 'EX1' ? 'S1' : 'S2']; ?>
-                            <td class="text-center table-secondary">
-                                <?= e(grades_format($t['points'])) ?>/<?= e(grades_format($t['max'])) ?>
-                            </td>
-                        <?php endif; ?>
-                    <?php endforeach; ?>
-                    <td class="text-center table-secondary">
-                        <?= e(grades_format($totals['ANNUAL']['points'])) ?>/<?= e(grades_format($totals['ANNUAL']['max'])) ?>
-                    </td>
-                </tr>
-            </tfoot>
-        </table>
-    </div>
+    require is_file($modelFile)
+        ? $modelFile
+        : APP_PATH . '/views/bulletins/models/domaines.php';
+    ?>
 
     <!-- --------------------------------------------------------------
          Synthèse
     --------------------------------------------------------------- -->
     <div class="row g-2 mb-3 avoid-break">
-        <?php foreach (['S1', 'S2', 'ANNUAL'] as $key): ?>
+        <?php foreach (array_keys($groups) as $key): ?>
             <?php
             $t   = $totals[$key];
             $pub = $published[$key] ?? null;
@@ -216,6 +182,14 @@ $cell = static function (?array $c): string {
                         <div class="small">
                             Rang <strong><?= (int) $pub['class_rank'] ?></strong>
                             sur <?= (int) $pub['class_size'] ?>
+                        </div>
+                    <?php endif; ?>
+                    <?php
+                    $gap = $frozen ? (int) $pub['missing_grades'] : (int) ($t['missing'] ?? 0);
+                    ?>
+                    <?php if ($gap > 0): ?>
+                        <div class="small text-warning-emphasis">
+                            <?= $gap ?> cote(s) manquante(s)
                         </div>
                     <?php endif; ?>
                     <?php if ($frozen): ?>

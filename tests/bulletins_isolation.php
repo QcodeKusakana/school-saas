@@ -112,7 +112,10 @@ try {
     curriculum_service_import_national();
     curriculum_service_create_standard_periods($yearId);
 
-    $levelId = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_5'", [], true);
+    // Niveau du CTEB : deux semestres, et aucune section requise.
+    // Le primaire est désormais en TROIS TRIMESTRES — il fait l'objet
+    // d'un bloc distinct en fin de fichier.
+    $levelId = (int) db_value("SELECT id FROM education_levels WHERE code = 'CTEB_7'", [], true);
     $program = curriculum_service_create_program($yearId, $levelId, null, null);
     curriculum_service_fill_program((int) $program['id']);
     curriculum_service_activate((int) $program['id']);
@@ -141,16 +144,20 @@ try {
 
     $classroom = tenant_insert('classrooms', [
         'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
-        'code' => '5A', 'name' => '5ème primaire A', 'capacity' => 40,
+        'code' => '7A', 'name' => '7ème année A', 'capacity' => 40,
     ]);
 
+    // Le code d'une période n'est plus unique dans l'année : chaque cycle
+    // a son « P1 ». Il faut donc qualifier la recherche par le cycle de
+    // la classe, exactement comme le font les dépôts.
+    $cycleId = curriculum_classroom_cycle_id($classroom);
     $periods = [];
 
     foreach (['P1', 'P2', 'EX1', 'P3', 'P4', 'EX2'] as $code) {
         $periods[$code] = (int) tenant_one(
             'grade_periods',
-            'academic_year_id = :y AND code = :c',
-            ['y' => $yearId, 'c' => $code]
+            'academic_year_id = :y AND code = :c AND cycle_id = :cy',
+            ['y' => $yearId, 'c' => $code, 'cy' => $cycleId]
         )['id'];
     }
 
@@ -208,6 +215,82 @@ try {
         'Les branches non corrigées sont signalées, pas comptées zéro',
         $report['missing'] > 0 && abs($s1['max'] - 80.0) < 0.001,
         $report['missing'] . ' manquante(s), maximum ' . $s1['max']
+    );
+
+    // Le manque se compte PAR REGROUPEMENT. En septembre, les périodes du
+    // second semestre ne sont pas « manquantes » : elles n'ont pas eu lieu.
+    // Un décompte global affichait le même avertissement à tout le monde
+    // toute l'année, ce qui revenait à n'en afficher aucun.
+    //
+    // Ici : 3 branches × 3 périodes = 9 cellules au premier semestre, dont
+    // 3 déjà cotées → 6 manquantes. Et 9 pour le second, dont aucune cotée.
+    check(
+        'Le manque du premier semestre ne compte que les périodes du premier semestre',
+        $s1['missing'] === 6,
+        (string) $s1['missing']
+    );
+
+    check(
+        'Celui du second semestre lui est propre',
+        $report['totals']['S2']['missing'] === 9,
+        (string) $report['totals']['S2']['missing']
+    );
+
+    check(
+        'Et le total annuel porte bien les deux',
+        $report['totals']['ANNUAL']['missing'] === $s1['missing'] + $report['totals']['S2']['missing'],
+        $report['totals']['ANNUAL']['missing'] . ' = ' . $s1['missing']
+            . ' + ' . $report['totals']['S2']['missing']
+    );
+
+    // =================================================================
+    //  BLOCS DE MAXIMA — STRUCTURE DU BULLETIN OFFICIEL
+    //
+    //  Le document du ministère regroupe les branches par maximum et ouvre
+    //  chaque bloc par une ligne MAXIMA. Les valeurs ci-dessous sont
+    //  vérifiées contre un bulletin officiel réel (1ère Construction,
+    //  Institut Majengo) : pour un maximum unitaire de 20, la ligne MAXIMA
+    //  porte 20 | 20 | 40 | 80 au premier semestre et 160 à l'année.
+    // =================================================================
+    $blocks = $report['blocks'];
+
+    check(
+        'Les trois branches à 20 forment UN SEUL bloc de maxima',
+        count($blocks) === 1 && (int) reset($blocks)['unit'] === 20,
+        count($blocks) . ' bloc(s)'
+    );
+
+    $block = reset($blocks);
+
+    check(
+        'Ligne MAXIMA : période simple = 20, examen = 40',
+        abs($block['periods']['P1'] - 20.0) < 0.001
+            && abs($block['periods']['EX1'] - 40.0) < 0.001,
+        $block['periods']['P1'] . ' et ' . $block['periods']['EX1']
+    );
+
+    check(
+        'Ligne MAXIMA : semestre = 80, année = 160',
+        abs($block['groups']['S1'] - 80.0) < 0.001
+            && abs($block['groups']['ANNUAL'] - 160.0) < 0.001,
+        $block['groups']['S1'] . ' et ' . $block['groups']['ANNUAL']
+    );
+
+    // MAXIMA GÉNÉRAUX = maximum du PROGRAMME, 3 branches × 80 = 240 au
+    // premier semestre. À ne pas confondre avec le dénominateur du
+    // pourcentage, qui ne retient que les cotes disponibles.
+    $general = bulletins_general_maxima($blocks);
+
+    check(
+        'MAXIMA GÉNÉRAUX : 3 branches × 80 = 240 au premier semestre',
+        abs($general['S1'] - 240.0) < 0.001,
+        (string) $general['S1']
+    );
+
+    check(
+        'Et il diffère du dénominateur du pourcentage tant que tout n\'est pas coté',
+        $general['S1'] > $s1['max'],
+        $general['S1'] . ' contre ' . $s1['max'] . ' effectivement cotés'
     );
 
     // =================================================================
@@ -472,7 +555,7 @@ try {
     // Une seconde classe, dont l'enseignant n'a la charge d'aucun élève.
     $otherClassroom = tenant_insert('classrooms', [
         'academic_year_id' => $yearId, 'curriculum_id' => (int) $program['id'],
-        'code' => '5B', 'name' => '5ème primaire B', 'capacity' => 40,
+        'code' => '7B', 'name' => '7ème année B', 'capacity' => 40,
     ]);
 
     $otherStudent = students_service_enroll_new(
@@ -594,6 +677,514 @@ try {
 
     school_setting_set('grading.passing_threshold', 50);
     school_settings_all(true);
+
+    // =================================================================
+    //  SOUS-TOTAUX PAR DOMAINE D'APPRENTISSAGE
+    //
+    //  Ossature des bulletins du primaire, du CTEB et des humanités
+    //  générales : les branches sont rangées sous cinq en-têtes officiels
+    //  et chaque domaine porte une ligne SOUS-TOTAL.
+    // =================================================================
+    $domainReport = bulletins_service_compute($enroll[0]);
+    $domains      = $domainReport['domains'];
+
+    check('Le calcul produit des sous-totaux par domaine', $domains !== []);
+
+    $sumPoints = 0.0;
+    $sumMax    = 0.0;
+
+    foreach ($domains as $domain) {
+        $sumPoints += $domain['groups']['S1']['points'];
+        $sumMax    += $domain['groups']['S1']['max'];
+    }
+
+    // Le contrôle qui compte : un sous-total qui ne somme pas au total
+    // général produirait un bulletin qui se contredit lui-même.
+    check(
+        'Les sous-totaux somment EXACTEMENT au total général',
+        abs($sumPoints - $domainReport['totals']['S1']['points']) < 0.001
+            && abs($sumMax - $domainReport['totals']['S1']['max']) < 0.001,
+        $sumPoints . ' / ' . $sumMax . ' contre '
+            . $domainReport['totals']['S1']['points'] . ' / ' . $domainReport['totals']['S1']['max']
+    );
+
+    // Un sous-total suit la même règle que le total : une branche non
+    // cotée n'entre ni au numérateur ni au dénominateur. Vérifié sur le
+    // bulletin rempli de 3e humanités scientifiques, où le sous-total du
+    // premier bloc vaut 10 et non 30.
+    // Le programme réduit compte trois branches sur 20, soit un maximum
+    // théorique de 3 × 80 = 240 au premier semestre. Une seule est cotée :
+    // le sous-total ne doit donc PAS annoncer 240, faute de quoi les deux
+    // branches non corrigées pèseraient comme des échecs.
+    $firstDomain = reset($domains);
+
+    check(
+        'Le sous-total ne retient que les cotes disponibles',
+        $firstDomain['groups']['S1']['max'] > 0 && $firstDomain['groups']['S1']['max'] < 240.0,
+        $firstDomain['groups']['S1']['max'] . ' au lieu des 240 théoriques'
+    );
+
+    // Les domaines doivent sortir dans l'ordre du bulletin officiel :
+    // langues, sciences, univers social, arts, développement personnel.
+    $orders    = array_map(static fn (array $d): int => $d['order'], $domains);
+    $ascending = array_values($orders);
+    sort($ascending);
+
+    check(
+        'Les domaines sortent dans l\'ordre officiel',
+        array_values($orders) === $ascending,
+        implode(' < ', array_keys($domains))
+    );
+
+    // Chaque branche du relevé appartient à un domaine connu, ou à la
+    // clé « AUTRES ». Une branche muette disparaîtrait du document.
+    $orphans = array_filter(
+        $domainReport['subjects'],
+        static fn (array $x): bool => $x['domain'] === null
+    );
+
+    check(
+        'Aucune branche ne se perd hors des domaines',
+        count($orphans) === 0 || isset($domains['AUTRES']),
+        count($orphans) . ' branche(s) sans domaine'
+    );
+
+    // =================================================================
+    //  LE DOMAINE DÉPEND DU CYCLE
+    //
+    //  Religion relève de l'univers social au CTEB et du développement
+    //  personnel au primaire. Un rattachement unique porté par la matière
+    //  ne peut pas être juste pour les deux : le programme déroge.
+    // =================================================================
+    $religionCteb = db_value(
+        'SELECT COALESCE(d2.code, d1.code)
+           FROM curriculum_subjects cs
+           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
+           LEFT JOIN learning_domains d1 ON d1.id = s.domain_id
+           LEFT JOIN learning_domains d2 ON d2.id = cs.domain_id
+          WHERE cs.school_id = :s AND cs.curriculum_id = :c AND s.code = \'RELIGION\'',
+        ['s' => $schoolId, 'c' => (int) $program['id']],
+        true
+    );
+
+    check(
+        'Au CTEB, Religion relève de l\'univers social',
+        $religionCteb === 'UNIVERS' || $religionCteb === null,
+        (string) ($religionCteb ?? 'branche retirée du programme réduit')
+    );
+
+    // =================================================================
+    //  LE PRIMAIRE EST EN TROIS TRIMESTRES
+    //
+    //  Les quatre modèles officiels du primaire — élémentaire, moyen,
+    //  terminal, terminal spécial — sont tous en trois trimestres, quand
+    //  le CTEB et les humanités sont en deux semestres. Écrire « S1, S2 »
+    //  en dur excluait purement et simplement le troisième trimestre :
+    //  les cotes de P5, P6 et EX3 n'entraient dans aucun total.
+    // =================================================================
+    act_as($schoolId, 'DIRECTION');
+    tenant_set($schoolId);
+
+    $primaryLevel = (int) db_value("SELECT id FROM education_levels WHERE code = 'PRI_4'", [], true);
+    $primaryProg  = curriculum_service_create_program($yearId, $primaryLevel, null, null);
+    curriculum_service_fill_program((int) $primaryProg['id']);
+    curriculum_service_activate((int) $primaryProg['id']);
+
+    $primaryClass = tenant_insert('classrooms', [
+        'academic_year_id' => $yearId, 'curriculum_id' => (int) $primaryProg['id'],
+        'code' => '4A', 'name' => '4ème primaire A', 'capacity' => 40,
+    ]);
+
+    // LA DÉROGATION DE DOMAINE PROPRE AU CYCLE.
+    //
+    // Les bulletins du CTEB placent la religion dans l'univers social,
+    // ceux du primaire dans le développement personnel. Le programme
+    // porte donc la dérogation, faute de quoi l'en-tête imprimé serait
+    // faux pour l'un des deux cycles.
+    $religionPrimary = db_value(
+        'SELECT d.code
+           FROM curriculum_subjects cs
+           JOIN subjects s ON s.id = cs.subject_id AND s.school_id = cs.school_id
+           JOIN learning_domains d ON d.id = COALESCE(cs.domain_id, s.domain_id)
+          WHERE cs.school_id = :s AND cs.curriculum_id = :c AND s.code = \'RELIGION\'',
+        ['s' => $schoolId, 'c' => (int) $primaryProg['id']],
+        true
+    );
+
+    check(
+        'Au primaire, Religion bascule dans le développement personnel',
+        $religionPrimary === 'DEV_PERS',
+        (string) ($religionPrimary ?? 'absente')
+    );
+
+    $religionSource = db_value(
+        'SELECT d.code FROM subjects s
+           JOIN learning_domains d ON d.id = s.domain_id
+          WHERE s.school_id = :s AND s.code = \'RELIGION\'',
+        ['s' => $schoolId],
+        true
+    );
+
+    check(
+        'Alors que la MATIÈRE, elle, reste rattachée à l\'univers social',
+        $religionSource === 'UNIVERS',
+        (string) ($religionSource ?? 'absente')
+    );
+
+    $primaryGroups = bulletins_classroom_groups($primaryClass);
+
+    check(
+        'Une classe de primaire produit T1, T2, T3 et le total général',
+        array_keys($primaryGroups) === ['T1', 'T2', 'T3', 'ANNUAL'],
+        implode(', ', array_keys($primaryGroups))
+    );
+
+    check(
+        'Le troisième trimestre porte bien P5, P6 et EX3',
+        ($primaryGroups['T3']['periods'] ?? []) === ['P5', 'P6', 'EX3'],
+        implode(', ', $primaryGroups['T3']['periods'] ?? [])
+    );
+
+    check(
+        'Le total général du primaire couvre les NEUF périodes',
+        count($primaryGroups['ANNUAL']['periods']) === 9,
+        count($primaryGroups['ANNUAL']['periods']) . ' périodes'
+    );
+
+    // Une cote posée au troisième trimestre doit entrer dans un total.
+    $primaryCycle = curriculum_classroom_cycle_id($primaryClass);
+    $ex3 = tenant_one(
+        'grade_periods',
+        'academic_year_id = :y AND code = :c AND cycle_id = :cy',
+        ['y' => $yearId, 'c' => 'EX3', 'cy' => $primaryCycle]
+    );
+
+    check('La période EX3 existe pour le primaire', $ex3 !== null);
+
+    $primarySubject = tenant_one(
+        'curriculum_subjects',
+        'curriculum_id = :c ORDER BY id',
+        ['c' => (int) $primaryProg['id']]
+    );
+
+    $pupil = students_service_enroll_new(
+        ['last_name' => 'OMEGA', 'first_name' => 'Petit', 'gender' => 'F'],
+        $yearId,
+        $primaryClass
+    );
+    $pupilEnrollment = (int) students_repo_enrollment((int) $pupil['id'], $yearId)['id'];
+
+    $unit   = (float) $primarySubject['max_points'];
+    $saveT3 = grades_service_save_sheet(
+        $primaryClass,
+        (int) $primarySubject['id'],
+        (int) $ex3['id'],
+        [$pupilEnrollment => ['points' => $unit * 2, 'is_absent' => false]]
+    );
+
+    check('Une cote se saisit au troisième trimestre', $saveT3['ok'], $saveT3['message']);
+
+    $primaryReport = bulletins_service_compute($pupilEnrollment);
+
+    check(
+        'Elle entre dans le total du TROISIÈME trimestre',
+        abs(($primaryReport['totals']['T3']['points'] ?? 0.0) - $unit * 2) < 0.001,
+        ($primaryReport['totals']['T3']['points'] ?? 'absent') . ' sur ' . ($unit * 2) . ' attendus'
+    );
+
+    check(
+        'Et dans le total général, qui ne l\'ignore plus',
+        abs(($primaryReport['totals']['ANNUAL']['points'] ?? 0.0) - $unit * 2) < 0.001,
+        (string) ($primaryReport['totals']['ANNUAL']['points'] ?? 'absent')
+    );
+
+    // Le maximum annuel d'une branche du primaire vaut douze fois son
+    // maximum unitaire : 3 trimestres × (1 + 1 + 2). Vérifié sur le
+    // bulletin officiel du degré moyen — MAX per 300, TOTAL 3600.
+    $primaryBlocks = $primaryReport['blocks'];
+    $firstBlock    = reset($primaryBlocks);
+
+    check(
+        'Maximum annuel du primaire = 12 × le maximum unitaire',
+        abs($firstBlock['groups']['ANNUAL'] - $firstBlock['unit'] * 12.0) < 0.001,
+        $firstBlock['groups']['ANNUAL'] . ' pour un unitaire de ' . $firstBlock['unit']
+    );
+
+    // =================================================================
+    //  SOUS-DOMAINES
+    //
+    //  Trois bulletins — 7e CTEB, 8e CTEB, 3e humanités scientifiques —
+    //  intercalent une strate entre le domaine et la branche, chacune
+    //  portant son propre sous-total. Toutes les branches n'en relèvent
+    //  pas : celles qui n'ont pas de sous-domaine restent directement
+    //  sous le domaine et ne doivent pas disparaître du document.
+    // =================================================================
+    $subReport = bulletins_service_compute($enroll[0]);
+
+    check(
+        'Chaque domaine porte une liste de sous-domaines, fût-elle vide',
+        array_reduce(
+            $subReport['domains'],
+            static fn (bool $carry, array $d): bool => $carry && isset($d['subdomains']),
+            true
+        )
+    );
+
+    // Le barème d'un domaine couvre TOUTES ses branches : celles rangées
+    // sous un sous-domaine et celles qui n'en ont pas. La somme des
+    // sous-domaines seule serait donc inférieure — et tout écart en sens
+    // inverse signalerait un double comptage.
+    foreach ($subReport['domains'] as $domainKey => $domain) {
+        if ($domain['subdomains'] === []) {
+            continue;
+        }
+
+        $subScale = 0.0;
+
+        foreach ($domain['subdomains'] as $sub) {
+            $subScale += $sub['groups']['ANNUAL']['scale'];
+        }
+
+        check(
+            'Les sous-domaines de « ' . $domainKey . ' » ne dépassent pas leur domaine',
+            $subScale <= $domain['groups']['ANNUAL']['scale'] + 0.001,
+            $subScale . ' contre ' . $domain['groups']['ANNUAL']['scale']
+        );
+
+        // Aucune branche ne doit figurer dans deux sous-domaines.
+        $seen = [];
+
+        foreach ($domain['subdomains'] as $sub) {
+            foreach ($sub['subjects'] as $sid) {
+                $seen[] = $sid;
+            }
+        }
+
+        check(
+            'Aucune branche n\'apparaît dans deux sous-domaines',
+            count($seen) === count(array_unique($seen)),
+            count($seen) . ' rattachements pour ' . count(array_unique($seen)) . ' branches'
+        );
+
+        // Et toute branche d'un sous-domaine appartient bien au domaine.
+        $inDomain = array_diff($seen, $domain['subjects']);
+
+        check(
+            'Une branche de sous-domaine relève toujours de son domaine',
+            $inDomain === [],
+            count($inDomain) . ' branche(s) égarée(s)'
+        );
+
+        break;
+    }
+
+    // =================================================================
+    //  UN SOUS-DOMAINE NE SUIT PAS UNE BRANCHE HORS DE SON DOMAINE
+    //
+    //  Un programme peut déroger au domaine d'une branche sans toucher à
+    //  son sous-domaine. Le bulletin aurait alors niché un sous-domaine
+    //  des arts sous l'en-tête du développement personnel, sans la
+    //  moindre erreur pour le signaler. La jointure exige maintenant que
+    //  le sous-domaine relève du domaine RETENU.
+    // =================================================================
+    $artSubject = tenant_one(
+        'curriculum_subjects',
+        'curriculum_id = :c AND subject_id = (SELECT id FROM subjects WHERE school_id = :s AND code = \'DESSIN\')',
+        ['c' => (int) $primaryProg['id'], 's' => $schoolId]
+    );
+
+    if ($artSubject !== null) {
+        $before = bulletins_service_compute($pupilEnrollment);
+        $art    = null;
+
+        foreach ($before['subjects'] as $x) {
+            if ((int) $x['id'] === (int) $artSubject['id']) {
+                $art = $x;
+            }
+        }
+
+        check(
+            'Le dessin relève bien d\'un sous-domaine au départ',
+            $art !== null && $art['subdomain'] !== null,
+            (string) ($art['subdomain'] ?? 'aucun')
+        );
+
+        // On le déplace de force vers un domaine auquel son sous-domaine
+        // n'appartient pas.
+        $devPers = (int) db_value(
+            'SELECT id FROM learning_domains WHERE code = \'DEV_PERS\'',
+            [],
+            true
+        );
+
+        tenant_update('curriculum_subjects', ['domain_id' => $devPers],
+            'id = :id', ['id' => (int) $artSubject['id']]);
+
+        $after   = bulletins_service_compute($pupilEnrollment);
+        $moved   = null;
+
+        foreach ($after['subjects'] as $x) {
+            if ((int) $x['id'] === (int) $artSubject['id']) {
+                $moved = $x;
+            }
+        }
+
+        check(
+            'Déplacée de domaine, la branche perd un sous-domaine devenu étranger',
+            $moved !== null && $moved['domain'] === 'DEV_PERS' && $moved['subdomain'] === null,
+            ($moved['domain'] ?? '?') . ' / ' . var_export($moved['subdomain'] ?? null, true)
+        );
+
+        // Elle reste visible : rattachée directement à son domaine.
+        $inDevPers = isset($after['domains']['DEV_PERS'])
+            && in_array((int) $artSubject['id'], $after['domains']['DEV_PERS']['subjects'], true);
+
+        check(
+            'Et elle reste visible, directement sous son domaine',
+            $inDevPers
+        );
+
+        tenant_update('curriculum_subjects', ['domain_id' => null],
+            'id = :id', ['id' => (int) $artSubject['id']]);
+    }
+
+    // =================================================================
+    //  BARÈME ET MAXIMUM RETENU NE SE CONFONDENT PAS
+    //
+    //  Le formulaire officiel imprime le barème de CHAQUE branche, cotée
+    //  ou non : une branche non encore corrigée doit montrer ce qu'elle
+    //  vaut. Le maximum retenu, lui, ne compte que les cellules qui
+    //  entrent au total — c'est le dénominateur du pourcentage.
+    //
+    //  Les confondre laissait la colonne du regroupement vide sur toute
+    //  branche non corrigée, comme si elle ne figurait pas au programme.
+    // =================================================================
+    $scaleReport = bulletins_service_compute($enroll[0]);
+
+    // subjB n'a qu'une cote en P1 sur les trois périodes du semestre.
+    $partial = $scaleReport['subjects'][$subjB]['groups']['S1'];
+
+    check(
+        'Le barème d\'un semestre vaut 80, même partiellement coté',
+        abs($partial['scale'] - 80.0) < 0.001,
+        (string) $partial['scale']
+    );
+
+    check(
+        'Alors que le maximum RETENU est plus petit',
+        $partial['max'] < $partial['scale'] && $partial['max'] > 0,
+        $partial['max'] . ' retenu contre ' . $partial['scale'] . ' au barème'
+    );
+
+    // Une branche sans AUCUNE cote garde son barème : c'est ce qui
+    // manquait, et qui vidait sa colonne sur le document imprimé.
+    $untouched = $scaleReport['subjects'][$subjNoRank]['groups']['S2'];
+
+    check(
+        'Une branche sans aucune cote conserve son barème',
+        abs($untouched['scale'] - 80.0) < 0.001 && $untouched['max'] === 0.0,
+        'barème ' . $untouched['scale'] . ', retenu ' . $untouched['max']
+    );
+
+    // Le barème d'un domaine somme ceux de ses branches.
+    $firstScaleDomain = reset($scaleReport['domains']);
+    $expectedScale    = 0.0;
+
+    foreach ($firstScaleDomain['subjects'] as $sid) {
+        $expectedScale += $scaleReport['subjects'][$sid]['groups']['S1']['scale'];
+    }
+
+    check(
+        'Le barème d\'un domaine somme celui de ses branches',
+        abs($firstScaleDomain['groups']['S1']['scale'] - $expectedScale) < 0.001,
+        $firstScaleDomain['groups']['S1']['scale'] . ' contre ' . $expectedScale
+    );
+
+    // =================================================================
+    //  MODÈLE DE BULLETIN — SÉPARATION PAR FAMILLE
+    //
+    //  Les dix modèles officiels ne se ramènent pas à une mise en page
+    //  unique. Deux familles s'opposent réellement : par DOMAINES
+    //  (primaire, CTEB, humanités générales et scientifiques) et par
+    //  BLOCS DE MAXIMA (humanités techniques : construction, mécanique,
+    //  secrétariat).
+    // =================================================================
+    check(
+        'Une classe de CTEB reçoit le modèle par domaines',
+        bulletins_model_for_classroom($classroom) === 'domaines',
+        bulletins_model_for_classroom($classroom)
+    );
+
+    check(
+        'Une classe de primaire aussi',
+        bulletins_model_for_classroom($primaryClass) === 'domaines',
+        bulletins_model_for_classroom($primaryClass)
+    );
+
+    // Une filière technique : ses bulletins officiels se passent de
+    // domaines et regroupent par maximum.
+    $section = tenant_one('sections', 'code = :c', ['c' => 'INDUSTRIELLE']);
+    $option  = $section !== null
+        ? tenant_one('options', 'section_id = :s ORDER BY id', ['s' => (int) $section['id']])
+        : null;
+
+    check('La section industrielle existe au référentiel', $section !== null);
+
+    if ($section !== null && $option !== null) {
+        $humLevel = (int) db_value("SELECT id FROM education_levels WHERE code = 'HUM_1'", [], true);
+        $techProg = curriculum_service_create_program(
+            $yearId,
+            $humLevel,
+            (int) $section['id'],
+            (int) $option['id']
+        );
+
+        $techClass = tenant_insert('classrooms', [
+            'academic_year_id' => $yearId, 'curriculum_id' => (int) $techProg['id'],
+            'code' => '1TQ', 'name' => '1ère technique', 'capacity' => 30,
+        ]);
+
+        check(
+            'Une classe de filière technique reçoit le modèle par blocs de maxima',
+            bulletins_model_for_classroom($techClass) === 'maxima',
+            bulletins_model_for_classroom($techClass)
+        );
+
+        // Le programme peut contredire la déduction : le référentiel
+        // reste configurable, sans livraison logicielle.
+        tenant_update('curriculums', ['bulletin_model' => 'domaines'],
+            'id = :id', ['id' => (int) $techProg['id']]);
+
+        check(
+            'Le programme peut imposer un autre modèle',
+            bulletins_model_for_classroom($techClass) === 'domaines',
+            bulletins_model_for_classroom($techClass)
+        );
+
+        // Une valeur inconnue ne doit pas faire charger un fichier
+        // arbitraire : la liste blanche est BULLETIN_MODELS.
+        tenant_update('curriculums', ['bulletin_model' => '../../evil'],
+            'id = :id', ['id' => (int) $techProg['id']]);
+
+        // La valeur inconnue est ignorée et la déduction reprend la
+        // main — « maxima » ici, la section étant technique. Ce qui
+        // compte est qu'elle ne SORTE JAMAIS de la liste blanche : le
+        // nom du modèle compose un chemin de fichier, et « ../../evil »
+        // ne doit atteindre aucun include.
+        $resolved = bulletins_model_for_classroom($techClass);
+
+        check(
+            'Un modèle inconnu ne sort jamais de la liste blanche',
+            isset(BULLETIN_MODELS[$resolved]),
+            $resolved
+        );
+
+        check(
+            'Et la déduction par section reprend la main',
+            $resolved === 'maxima',
+            $resolved
+        );
+    }
 
     // =================================================================
     //  ISOLATION ENTRE ÉCOLES
