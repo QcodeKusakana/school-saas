@@ -132,6 +132,46 @@
         });
     }
 
+
+    /* =================================================================
+       Champs dépendants d'un choix
+       Usage :
+         <select data-toggle-target=".js-scope-field" data-toggle-attr="data-scope">
+         <div class="js-scope-field" data-scope="level"> … </div>
+
+       Chaque cible reste visible uniquement si son attribut vaut la
+       valeur choisie. Écrit ici, et non en attribut onchange : la CSP
+       rend tout gestionnaire en ligne INERTE — le formulaire de frais
+       n'a jamais laissé choisir un niveau ni une classe tant que ce
+       comportement vivait dans le HTML.
+
+       L'état initial est appliqué au chargement : le serveur pose déjà
+       l'attribut `hidden` correct, mais le rejouer garantit que les
+       deux sources ne divergent pas.
+       ================================================================= */
+
+    function initToggleTargets() {
+        document.querySelectorAll('[data-toggle-target]').forEach((control) => {
+            const selector = control.getAttribute('data-toggle-target');
+            const attribute = control.getAttribute('data-toggle-attr');
+
+            if (!selector || !attribute) {
+                return;
+            }
+
+            const targets = document.querySelectorAll(selector);
+
+            const sync = () => {
+                targets.forEach((target) => {
+                    target.hidden = target.getAttribute(attribute) !== control.value;
+                });
+            };
+
+            control.addEventListener('change', sync);
+            sync();
+        });
+    }
+
     /* =================================================================
        Grille de saisie des notes
        Usage : <input type="checkbox" data-grade-absent>
@@ -324,6 +364,7 @@
         initSidebar();
         initPasswordToggles();
         initAutoSubmit();
+        initToggleTargets();
         initGradeSheet();
         initPrint();
         initConfirmations();

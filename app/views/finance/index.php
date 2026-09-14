@@ -11,6 +11,7 @@
  * @var array|null $year
  * @var array      $years
  * @var array      $classrooms
+ * @var array      $enrollments  Périmètre par élève, quand aucune classe n'est visible
  * @var int        $feeCount
  */
 declare(strict_types=1);
@@ -35,8 +36,9 @@ $missing = array_sum(array_map(static fn (array $c): int => (int) $c['without_fe
 
     <div class="d-flex gap-2">
         <?php if (count($years) > 1): ?>
-            <form method="get" action="<?= e(url('/finances')) ?>">
-                <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
+            <form method="get" action="<?= e(url('/finances')) ?>" class="d-flex gap-2">
+                <select name="annee" class="form-select form-select-sm" data-auto-submit
+                        aria-label="Année scolaire">
                     <?php foreach ($years as $y): ?>
                         <option value="<?= (int) $y['id'] ?>"
                             <?= $year !== null && (int) $y['id'] === (int) $year['id'] ? 'selected' : '' ?>>
@@ -44,6 +46,8 @@ $missing = array_sum(array_map(static fn (array $c): int => (int) $c['without_fe
                         </option>
                     <?php endforeach; ?>
                 </select>
+                <button type="submit" class="btn btn-sm btn-outline-secondary"
+                        data-auto-submit-fallback>Voir</button>
             </form>
         <?php endif; ?>
 
@@ -77,8 +81,63 @@ $missing = array_sum(array_map(static fn (array $c): int => (int) $c['without_fe
     </div>
 <?php endif; ?>
 
-<?php if ($classrooms === []): ?>
-    <div class="alert alert-info">Aucune classe dans votre périmètre pour cette année.</div>
+<?php if ($classrooms === [] && $enrollments !== []): ?>
+    <!--
+        LA PORTE DU PARENT.
+
+        Un tuteur détient finance.view mais n'a aucune classe : le tableau
+        par classe lui renvoyait une page vide, et l'entrée de menu ne
+        menait donc nulle part. Son périmètre passe par l'élève.
+    -->
+    <div class="card">
+        <div class="card-header fw-medium">
+            <?= count($enrollments) > 1 ? 'Vos enfants' : 'Votre enfant' ?>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th scope="col">Élève</th>
+                        <th scope="col" class="d-none d-md-table-cell">Classe</th>
+                        <th scope="col" class="text-center">Frais</th>
+                        <th scope="col"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($enrollments as $row): ?>
+                        <tr>
+                            <td>
+                                <span class="fw-medium">
+                                    <?= e(full_name($row['last_name'], $row['post_name'], $row['first_name'])) ?>
+                                </span>
+                                <div class="small text-secondary"><?= e((string) $row['matricule']) ?></div>
+                            </td>
+                            <td class="d-none d-md-table-cell">
+                                <?= e((string) ($row['classroom_name'] ?? '—')) ?>
+                            </td>
+                            <td class="text-center">
+                                <?php if ((int) $row['fee_count'] === 0): ?>
+                                    <span class="badge bg-secondary-subtle text-secondary-emphasis">aucun</span>
+                                <?php else: ?>
+                                    <span class="badge bg-success-subtle text-success-emphasis">
+                                        <?= (int) $row['fee_count'] ?>
+                                    </span>
+                                <?php endif; ?>
+                            </td>
+                            <td class="text-end">
+                                <a class="btn btn-sm btn-outline-secondary"
+                                   href="<?= e(url('/finances/eleve/' . (int) $row['enrollment_id'])) ?>">
+                                    Situation
+                                </a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+<?php elseif ($classrooms === []): ?>
+    <div class="alert alert-info">Aucune classe ni élève dans votre périmètre pour cette année.</div>
 <?php else: ?>
     <?php if ($missing > 0): ?>
         <div class="alert alert-danger d-flex align-items-start gap-2">

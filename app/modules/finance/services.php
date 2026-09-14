@@ -1,9 +1,16 @@
 <?php
 /**
- * Module FINANCE — règles métier de la grille tarifaire et des dettes.
+ * Module FINANCE — règles métier.
  *
- * Ce fichier ne connaît pas encore les encaissements (phase 5B). Il
- * répond à une seule question : QUE DOIT CET ÉLÈVE, et pourquoi.
+ * Deux moitiés, et il faut les garder distinctes :
+ *   · 5A — ce que l'école RÉCLAME : grille tarifaire, dettes figées,
+ *     remises, annulations ;
+ *   · 5B — ce qu'elle ENCAISSE : paiements, taux figé, reçus numérotés,
+ *     répartition sur les dettes.
+ *
+ * La règle qui tient les deux ensemble : une dette est due, et soldée,
+ * DANS SA DEVISE. Le parent peut remettre une autre monnaie — le taux
+ * est alors figé sur le paiement, jamais sur la dette.
  */
 
 declare(strict_types=1);
@@ -416,7 +423,24 @@ function finance_service_resync_fee(int $feeId, string $reason): array
         }
     }
 
-    db_transaction(static function () use ($fee, $feeId, $schoolId): void {
+    // ET LE MONTANT DÛ NE DESCEND PAS SOUS CE QUI A ÉTÉ ENCAISSÉ.
+    //
+    // Corriger un minerval de 80 à 20 alors que 50 ont été reçus
+    // produisait un solde de −30 : un trop-perçu né d'une correction de
+    // saisie. Ce module ne sait pas enregistrer un remboursement ; le
+    // plancher est donc le montant encaissé, et les dossiers concernés
+    // sont NOMMÉS pour être traités à part.
+    $floored = [];
+
+    foreach ($affected as $line) {
+        $paid = finance_repo_paid_on_fee((int) $line['id']);
+
+        if ($paid > (float) $fee['amount'] + 0.005) {
+            $floored[(int) $line['id']] = $paid;
+        }
+    }
+
+    db_transaction(static function () use ($fee, $feeId, $schoolId, $floored): void {
         db_query(
             'UPDATE student_fees
                 SET amount_due = :amount, label = :label, due_on = :due_on
@@ -429,6 +453,19 @@ function finance_service_resync_fee(int $feeId, string $reason): array
                 'fee_id'    => $feeId,
             ]
         );
+
+        // Plancher : jamais en dessous de l'encaissé.
+        foreach ($floored as $lineId => $paid) {
+            db_query(
+                'UPDATE student_fees SET amount_due = :amount
+                  WHERE id = :id AND school_id = :school_id',
+                [
+                    'amount'    => number_format($paid, 2, '.', ''),
+                    'id'        => $lineId,
+                    'school_id' => $schoolId,
+                ]
+            );
+        }
 
         db_query(
             'UPDATE student_fees
@@ -445,6 +482,7 @@ function finance_service_resync_fee(int $feeId, string $reason): array
         'currency' => $fee['currency'],
         'updated'  => count($affected),
         'capped'   => $capped,
+        'floored'  => $floored,
     ]);
 
     $message = count($affected) . ' dette(s) réalignée(s) sur le tarif actuel.';
@@ -454,7 +492,19 @@ function finance_service_resync_fee(int $feeId, string $reason): array
             . 'une exonération totale — vérifiez ces dossiers.';
     }
 
-    return ['ok' => true, 'message' => $message, 'updated' => count($affected), 'capped' => $capped];
+    if ($floored !== []) {
+        $message .= ' ' . count($floored) . ' dossier(s) avaient déjà encaissé plus que le nouveau tarif : '
+            . 'leur dette a été ramenée au montant reçu, et non au tarif. '
+            . 'Aucun remboursement n\'est enregistré — traitez-les à part.';
+    }
+
+    return [
+        'ok'      => true,
+        'message' => $message,
+        'updated' => count($affected),
+        'capped'  => $capped,
+        'floored' => count($floored),
+    ];
 }
 
 /**
@@ -535,6 +585,27 @@ function finance_service_set_discount(int $studentFeeId, float $amount, string $
         return ['ok' => false, 'message' => 'Le motif de la remise est obligatoire.'];
     }
 
+    // UNE REMISE NE DESCEND PAS SOUS CE QUI A DÉJÀ ÉTÉ ENCAISSÉ.
+    //
+    // Accorder 60 de remise sur une dette de 80 dont 50 sont déjà payés
+    // laissait un reste à payer de −30 : l'école devait de l'argent à la
+    // famille, née d'une saisie et non d'un remboursement décidé. Ce
+    // module ne sait pas représenter un remboursement ; il doit donc
+    // refuser de le créer par accident.
+    $paid = finance_repo_paid_on_fee($studentFeeId);
+
+    if ((float) $line['amount_due'] - $amount < $paid - 0.005) {
+        return [
+            'ok'      => false,
+            'message' => 'Cette dette a déjà encaissé '
+                . finance_amount($paid, (string) $line['currency'])
+                . '. Une remise qui ramènerait le montant dû en dessous créerait un trop-perçu : '
+                . 'la remise ne peut pas dépasser '
+                . finance_amount(max(0.0, (float) $line['amount_due'] - $paid), (string) $line['currency'])
+                . '. Annulez d\'abord le reçu si le paiement est à reprendre.',
+        ];
+    }
+
     $before = ['discount' => $line['discount_amount'], 'reason' => $line['discount_reason']];
 
     tenant_update('student_fees', [
@@ -581,6 +652,15 @@ function finance_service_cancel_line(int $studentFeeId, string $reason): array
         return ['ok' => false, 'message' => 'Un motif d\'au moins 5 caractères est obligatoire.'];
     }
 
+    // UNE DETTE DÉJÀ PAYÉE NE S'ANNULE PAS EN SILENCE.
+    //
+    // Les allocations survivent (elles gardent la trace de ce qui avait
+    // été soldé) mais cessent de compter : les sommes reçues basculent
+    // en AVANCE, réutilisable sur une autre dette. Sans ce message, le
+    // caissier verrait simplement un solde changer sans savoir où sont
+    // passés les encaissements.
+    $paid = finance_repo_paid_on_fee($studentFeeId);
+
     tenant_update('student_fees', [
         'is_cancelled'     => 1,
         'cancelled_reason' => $reason,
@@ -588,7 +668,19 @@ function finance_service_cancel_line(int $studentFeeId, string $reason): array
         'cancelled_at'     => date('Y-m-d H:i:s'),
     ], 'id = :id', ['id' => $studentFeeId]);
 
-    audit_log('student_fee.cancel', 'student_fees', $studentFeeId, $line, ['reason' => $reason]);
+    audit_log('student_fee.cancel', 'student_fees', $studentFeeId, $line, [
+        'reason'    => $reason,
+        'paid_back' => $paid,
+    ]);
+
+    if ($paid > 0.005) {
+        return [
+            'ok'      => true,
+            'message' => 'Dette annulée. ' . finance_amount($paid, (string) $line['currency'])
+                . ' avaient déjà été encaissés sur cette ligne : ils redeviennent une AVANCE, '
+                . 'affectable à une autre dette. Les reçus ne sont pas touchés.',
+        ];
+    }
 
     return ['ok' => true, 'message' => 'Dette annulée.'];
 }
@@ -648,4 +740,495 @@ function finance_service_restore_line(int $studentFeeId, string $reason): array
         'message' => 'Dette rétablie pour '
             . finance_amount((float) $line['amount_due'], (string) $line['currency']) . '.',
     ];
+}
+
+/**
+ * Annule en bloc les dettes devenues hors portée.
+ *
+ * Rétrécir la portée d'un frais déjà affecté laissait des dettes
+ * orphelines : deux classes entières restaient facturées d'un frais qui
+ * ne les concernait plus, sans le moindre signal. L'affectation ne sait
+ * qu'ajouter, et le gel du tarif interdit de réécrire une dette.
+ *
+ * L'annulation est la sortie juste : elle conserve la ligne, son auteur
+ * et son motif. Elle reste une DÉCISION — le comptable la déclenche, le
+ * programme se contente de compter et de montrer.
+ *
+ * @return array{ok: bool, message: string, cancelled: int}
+ */
+function finance_service_cancel_out_of_scope(int $yearId, string $reason): array
+{
+    $reason = trim($reason);
+
+    if (mb_strlen($reason) < 5) {
+        return ['ok' => false, 'message' => 'Un motif d\'au moins 5 caractères est obligatoire.', 'cancelled' => 0];
+    }
+
+    $lines = finance_repo_out_of_scope($yearId);
+
+    if ($lines === []) {
+        return ['ok' => true, 'message' => 'Aucune dette hors portée.', 'cancelled' => 0];
+    }
+
+    $userId = auth_id();
+    $now    = date('Y-m-d H:i:s');
+
+    db_transaction(static function () use ($lines, $reason, $userId, $now): void {
+        foreach ($lines as $line) {
+            tenant_update('student_fees', [
+                'is_cancelled'     => 1,
+                'cancelled_reason' => mb_substr($reason, 0, 160),
+                'cancelled_by'     => $userId,
+                'cancelled_at'     => $now,
+            ], 'id = :id AND is_cancelled = 0', ['id' => (int) $line['id']]);
+        }
+    });
+
+    audit_log('student_fee.cancel_out_of_scope', 'academic_years', $yearId, ['lines' => $lines], [
+        'reason'    => $reason,
+        'cancelled' => count($lines),
+    ]);
+
+    return [
+        'ok'        => true,
+        'message'   => count($lines) . ' dette(s) hors portée annulée(s). Elles restent visibles, barrées, avec leur motif.',
+        'cancelled' => count($lines),
+    ];
+}
+
+// =====================================================================
+//  ENCAISSEMENTS (phase 5B)
+// =====================================================================
+
+const FINANCE_METHODS = [
+    'cash'         => 'Espèces',
+    'mobile_money' => 'Mobile Money',
+    'bank'         => 'Banque',
+    'cheque'       => 'Chèque',
+    'other'        => 'Autre',
+];
+
+/** Taux par défaut du formulaire : combien de CDF pour 1 USD. */
+function finance_default_rate(): float
+{
+    return (float) school_setting('finance.usd_rate', 2800);
+}
+
+/**
+ * Numéro de reçu suivant — sans trou ni doublon.
+ *
+ * Le compteur est verrouillé par SELECT … FOR UPDATE : deux caissiers
+ * qui encaissent à la même seconde obtiennent deux numéros distincts et
+ * consécutifs. Même mécanique que les matricules (phase 3).
+ *
+ * À n'appeler QUE dans une transaction déjà ouverte.
+ *
+ * @return array{0: string, 1: int}
+ */
+function finance_next_receipt(string $yearCode): array
+{
+    $schoolId = tenant_require();
+    $prefix   = (string) school_setting('finance.receipt_prefix', 'REC');
+
+    db_query(
+        'INSERT IGNORE INTO receipt_counters (school_id, counter_key, last_number)
+         VALUES (:school_id, :key, 0)',
+        ['school_id' => $schoolId, 'key' => $yearCode]
+    );
+
+    $current = (int) db_value(
+        'SELECT last_number FROM receipt_counters
+          WHERE school_id = :school_id AND counter_key = :key
+          FOR UPDATE',
+        ['school_id' => $schoolId, 'key' => $yearCode]
+    );
+
+    $next = $current + 1;
+
+    db_query(
+        'UPDATE receipt_counters SET last_number = :next
+          WHERE school_id = :school_id AND counter_key = :key',
+        ['next' => $next, 'school_id' => $schoolId, 'key' => $yearCode]
+    );
+
+    return [
+        $prefix . '-' . $yearCode . '-' . str_pad((string) $next, 5, '0', STR_PAD_LEFT),
+        $next,
+    ];
+}
+
+/**
+ * Enregistre un encaissement et le répartit sur les dettes.
+ *
+ * LES TROIS MONTANTS
+ * ------------------
+ * `tendered` est ce que le parent a remis au guichet ; `credited` est ce
+ * qui est porté au crédit des dettes. Quand les devises diffèrent, le
+ * TAUX est figé sur le paiement — jamais relu ensuite. Un reçu imprimé
+ * aujourd'hui doit rester vérifiable dans dix ans sans connaître le
+ * cours du jour.
+ *
+ * LA RÉPARTITION
+ * --------------
+ * Par défaut, la plus ancienne échéance d'abord (FIFO) : c'est ce que
+ * fait un caissier, et c'est ce qui minimise les impayés anciens. Le
+ * comptable peut imposer sa propre répartition via $allocations.
+ *
+ * Le reliquat non affecté est CONSERVÉ comme avance. Le perdre
+ * reviendrait à voler la famille ; le refuser obligerait le caissier à
+ * mentir sur le montant reçu.
+ *
+ * @param array<int,mixed> $allocations [student_fee_id => montant], vide = FIFO
+ * @return array{ok: bool, message: string, id?: int, receipt?: string, unallocated?: float}
+ */
+function finance_service_record_payment(int $enrollmentId, array $input, array $allocations = []): array
+{
+    $schoolId   = tenant_require();
+    $enrollment = tenant_find('enrollments', $enrollmentId);
+
+    if ($enrollment === null) {
+        return ['ok' => false, 'message' => 'Inscription introuvable.'];
+    }
+
+    // Le périmètre vaut pour l'écriture comme pour la lecture.
+    if (!finance_can_view_enrollment($enrollmentId)) {
+        return ['ok' => false, 'message' => 'Dossier hors de votre périmètre.'];
+    }
+
+    $year = tenant_find('academic_years', (int) $enrollment['academic_year_id']);
+
+    if ($year === null) {
+        return ['ok' => false, 'message' => 'Année scolaire introuvable.'];
+    }
+
+    $tenderedCurrency = strtoupper((string) ($input['tendered_currency'] ?? ''));
+    $creditedCurrency = strtoupper((string) ($input['credited_currency'] ?? ''));
+
+    if (!isset(FINANCE_CURRENCIES[$tenderedCurrency], FINANCE_CURRENCIES[$creditedCurrency])) {
+        return ['ok' => false, 'message' => 'Devise inconnue.'];
+    }
+
+    $tendered = finance_parse_amount((string) ($input['tendered_amount'] ?? '0'));
+
+    if ($tendered <= 0) {
+        return ['ok' => false, 'message' => 'Le montant remis doit être strictement positif.'];
+    }
+
+    $method = (string) ($input['method'] ?? 'cash');
+
+    if (!isset(FINANCE_METHODS[$method])) {
+        return ['ok' => false, 'message' => 'Mode de paiement inconnu.'];
+    }
+
+    $paidOn = trim((string) ($input['paid_on'] ?? ''));
+
+    if (!finance_valid_date($paidOn)) {
+        return ['ok' => false, 'message' => 'Date de paiement invalide.'];
+    }
+
+    // Une caisse ne s'alimente pas demain. Antidater reste possible — le
+    // caissier saisit parfois le lendemain — mais postdater fausserait
+    // tous les arrêtés de caisse déjà signés.
+    if ($paidOn > date('Y-m-d')) {
+        return ['ok' => false, 'message' => 'Un encaissement ne peut pas être daté dans le futur.'];
+    }
+
+    // ----- LE TAUX ---------------------------------------------------
+    $rate = null;
+
+    if ($tenderedCurrency === $creditedCurrency) {
+        $credited = $tendered;
+    } else {
+        $rate = finance_parse_amount((string) ($input['exchange_rate'] ?? '0'));
+
+        if ($rate <= 0) {
+            return [
+                'ok'      => false,
+                'message' => 'Un taux de change est obligatoire dès que la monnaie remise diffère de '
+                    . 'celle des dettes à solder.',
+            ];
+        }
+
+        // Le taux s'exprime en unités REMISES pour une unité CRÉDITÉE.
+        $credited = round($tendered / $rate, 2);
+
+        if ($credited <= 0) {
+            return ['ok' => false, 'message' => 'Le taux saisi produit un montant crédité nul.'];
+        }
+    }
+
+    $outcome = ['unallocated' => 0.0];
+
+    db_transaction(static function () use (
+        $schoolId, $enrollmentId, $year, $input, $method, $paidOn,
+        $tenderedCurrency, $tendered, $creditedCurrency, $credited, $rate,
+        $allocations, &$outcome
+    ): void {
+        [$receiptNo, $seq] = finance_next_receipt((string) $year['code']);
+
+        $paymentId = db_insert('payments', [
+            'school_id'         => $schoolId,
+            'enrollment_id'     => $enrollmentId,
+            'receipt_no'        => $receiptNo,
+            'receipt_seq'       => $seq,
+            'paid_on'           => $paidOn,
+            'tendered_currency' => $tenderedCurrency,
+            'tendered_amount'   => number_format($tendered, 2, '.', ''),
+            'exchange_rate'     => $rate !== null ? number_format($rate, 6, '.', '') : null,
+            'credited_currency' => $creditedCurrency,
+            'credited_amount'   => number_format($credited, 2, '.', ''),
+            'method'            => $method,
+            'reference'         => trim((string) ($input['reference'] ?? '')) ?: null,
+            'external_status'   => $method === 'cash' ? 'settled' : (string) ($input['external_status'] ?? 'settled'),
+            'payer_name'        => trim((string) ($input['payer_name'] ?? '')) ?: null,
+            'note'              => trim((string) ($input['note'] ?? '')) ?: null,
+            'received_by'       => auth_id(),
+        ]);
+
+        $left = finance_service_apply_allocations($paymentId, $enrollmentId, $creditedCurrency, $credited, $allocations);
+
+        $outcome = [
+            'id'          => $paymentId,
+            'receipt'     => $receiptNo,
+            'unallocated' => $left,
+        ];
+    });
+
+    audit_log('payment.record', 'payments', $outcome['id'] ?? null, null, [
+        'receipt'   => $outcome['receipt'] ?? null,
+        'tendered'  => $tendered . ' ' . $tenderedCurrency,
+        'credited'  => $credited . ' ' . $creditedCurrency,
+        'rate'      => $rate,
+        'method'    => $method,
+    ]);
+
+    $message = 'Reçu ' . ($outcome['receipt'] ?? '') . ' — '
+        . finance_amount($credited, $creditedCurrency) . ' porté au crédit.';
+
+    if (($outcome['unallocated'] ?? 0.0) > 0.005) {
+        $message .= ' ' . finance_amount((float) $outcome['unallocated'], $creditedCurrency)
+            . ' restent en avance, aucune dette ouverte ne les absorbe.';
+    }
+
+    return [
+        'ok'          => true,
+        'message'     => $message,
+        'id'          => (int) ($outcome['id'] ?? 0),
+        'receipt'     => (string) ($outcome['receipt'] ?? ''),
+        'unallocated' => (float) ($outcome['unallocated'] ?? 0.0),
+    ];
+}
+
+/**
+ * Répartit un montant crédité sur les dettes ouvertes.
+ *
+ * Ne dépasse JAMAIS le reste dû d'une dette : une dette sur-payée
+ * produirait un solde négatif, c'est-à-dire une créance de la famille
+ * sur l'école née d'une erreur de saisie.
+ *
+ * @param array<int,mixed> $requested [student_fee_id => montant], vide = FIFO
+ * @return float Le reliquat non affecté.
+ */
+function finance_service_apply_allocations(
+    int $paymentId,
+    int $enrollmentId,
+    string $currency,
+    float $credited,
+    array $requested = []
+): float {
+    $schoolId  = tenant_require();
+    $remaining = $credited;
+
+    // Les dettes de CETTE inscription, dans CETTE devise, non annulées.
+    // Filtrer sur l'inscription interdit d'imputer le paiement d'un
+    // élève sur la dette d'un autre.
+    $lines = array_values(array_filter(
+        finance_repo_fees_with_paid($enrollmentId),
+        static fn (array $l): bool => (string) $l['currency'] === $currency
+    ));
+
+    foreach ($lines as $line) {
+        if ($remaining <= 0.005) {
+            break;
+        }
+
+        $lineId = (int) $line['id'];
+        $open   = round((float) $line['amount_net'] - (float) $line['paid'], 2);
+
+        if ($open <= 0.005) {
+            continue;
+        }
+
+        if ($requested !== []) {
+            if (!array_key_exists($lineId, $requested)) {
+                continue;
+            }
+
+            $wanted = finance_parse_amount((string) $requested[$lineId]);
+
+            if ($wanted <= 0) {
+                continue;
+            }
+
+            $amount = min($wanted, $open, $remaining);
+        } else {
+            // FIFO : la plus ancienne échéance d'abord. C'est ce que
+            // fait un caissier, et cela réduit les impayés anciens.
+            $amount = min($open, $remaining);
+        }
+
+        $amount = round($amount, 2);
+
+        if ($amount <= 0.005) {
+            continue;
+        }
+
+        db_query(
+            'INSERT INTO payment_allocations
+                 (school_id, payment_id, student_fee_id, currency, amount)
+             VALUES (:school_id, :payment_id, :fee_id, :currency, :amount)
+             ON DUPLICATE KEY UPDATE amount = amount + VALUES(amount)',
+            [
+                'school_id'  => $schoolId,
+                'payment_id' => $paymentId,
+                'fee_id'     => $lineId,
+                'currency'   => $currency,
+                'amount'     => number_format($amount, 2, '.', ''),
+            ]
+        );
+
+        $remaining = round($remaining - $amount, 2);
+    }
+
+    return max(0.0, $remaining);
+}
+
+/**
+ * Annule un encaissement — sans le supprimer.
+ *
+ * Le numéro de reçu reste CONSOMMÉ. C'est ce qui rend la séquence
+ * vérifiable : un trou signifie une ligne effacée, donc un incident,
+ * jamais une annulation régulière.
+ *
+ * Les allocations sont conservées : les effacer ferait perdre la trace
+ * de ce qui avait été soldé. C'est la lecture qui les écarte, en
+ * filtrant sur `payments.is_cancelled = 0`.
+ *
+ * @return array{ok: bool, message: string}
+ */
+function finance_service_cancel_payment(int $paymentId, string $reason): array
+{
+    $payment = finance_repo_payment($paymentId);
+
+    if ($payment === null) {
+        return ['ok' => false, 'message' => 'Paiement introuvable.'];
+    }
+
+    if ((int) $payment['is_cancelled'] === 1) {
+        return ['ok' => false, 'message' => 'Ce paiement est déjà annulé.'];
+    }
+
+    $reason = trim($reason);
+
+    if (mb_strlen($reason) < 5) {
+        return ['ok' => false, 'message' => 'Un motif d\'au moins 5 caractères est obligatoire.'];
+    }
+
+    tenant_update('payments', [
+        'is_cancelled'     => 1,
+        'cancelled_reason' => mb_substr($reason, 0, 160),
+        'cancelled_by'     => auth_id(),
+        'cancelled_at'     => date('Y-m-d H:i:s'),
+    ], 'id = :id', ['id' => $paymentId]);
+
+    audit_log('payment.cancel', 'payments', $paymentId, $payment, ['reason' => $reason]);
+
+    return [
+        'ok'      => true,
+        'message' => 'Reçu ' . $payment['receipt_no'] . ' annulé. Le numéro reste consommé : '
+            . 'un trou dans la séquence signalerait un incident, pas une annulation.',
+    ];
+}
+
+/**
+ * Remplace la répartition d'un paiement.
+ *
+ * Utile quand le caissier a laissé le FIFO imputer la mauvaise tranche.
+ * Les anciennes allocations sont retirées puis reconstruites dans la
+ * même transaction : à aucun moment la dette n'apparaît soldée deux
+ * fois.
+ *
+ * @param array<int,mixed> $allocations [student_fee_id => montant]
+ * @return array{ok: bool, message: string, unallocated?: float}
+ */
+function finance_service_reallocate(int $paymentId, array $allocations): array
+{
+    $payment = finance_repo_payment($paymentId);
+
+    if ($payment === null) {
+        return ['ok' => false, 'message' => 'Paiement introuvable.'];
+    }
+
+    if ((int) $payment['is_cancelled'] === 1) {
+        return ['ok' => false, 'message' => 'Un paiement annulé ne se réaffecte pas.'];
+    }
+
+    $before = finance_repo_allocations($paymentId);
+    $left   = 0.0;
+
+    db_transaction(static function () use ($payment, $paymentId, $allocations, &$left): void {
+        db_query(
+            'DELETE FROM payment_allocations
+              WHERE school_id = :school_id AND payment_id = :payment_id',
+            ['school_id' => tenant_require(), 'payment_id' => $paymentId]
+        );
+
+        $left = finance_service_apply_allocations(
+            $paymentId,
+            (int) $payment['enrollment_id'],
+            (string) $payment['credited_currency'],
+            (float) $payment['credited_amount'],
+            $allocations
+        );
+    });
+
+    audit_log('payment.reallocate', 'payments', $paymentId, ['before' => $before], [
+        'requested'   => $allocations,
+        'unallocated' => $left,
+    ]);
+
+    $message = 'Répartition mise à jour.';
+
+    if ($left > 0.005) {
+        $message .= ' ' . finance_amount($left, (string) $payment['credited_currency'])
+            . ' restent non affectés.';
+    }
+
+    return ['ok' => true, 'message' => $message, 'unallocated' => $left];
+}
+
+/**
+ * Lit un montant saisi par un humain.
+ *
+ * « 1 250,50 », « 1250.50 » et « 1.250,50 » désignent la même somme au
+ * guichet. Un caissier qui tape une virgule ne doit pas encaisser 1 USD
+ * au lieu de 1 250.
+ */
+function finance_parse_amount(string $raw): float
+{
+    $clean = str_replace([' ', "\u{00A0}"], '', trim($raw));
+
+    // Séparateur décimal : le dernier signe de ponctuation rencontré.
+    $lastComma = strrpos($clean, ',');
+    $lastDot   = strrpos($clean, '.');
+
+    if ($lastComma !== false && $lastDot !== false) {
+        $decimal = $lastComma > $lastDot ? ',' : '.';
+        $clean   = str_replace($decimal === ',' ? '.' : ',', '', $clean);
+        $clean   = str_replace($decimal, '.', $clean);
+    } elseif ($lastComma !== false) {
+        $clean = str_replace(',', '.', $clean);
+    }
+
+    return (float) $clean;
 }

@@ -100,6 +100,12 @@ const TENANT_TABLES = [
     // rattrapée que par un contrôle manuel.
     'attendance_sessions',
     'attendance_records',
+
+    // Phase 5 — finances. `fees`, `student_fees` et `payments` étaient
+    // déjà déclarés plus haut ; les suivants sont ajoutés à la création
+    // des tables, même règle.
+    'payment_allocations',
+    'receipt_counters',
 ];
 
 /**

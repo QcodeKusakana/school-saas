@@ -32,11 +32,19 @@ $manage = can('fee.manage');
         </p>
     </div>
 
-    <?php if ($classroom !== null): ?>
-        <a href="<?= e(url('/finances/classe/' . (int) $classroom['id'])) ?>" class="btn btn-outline-secondary">
-            <i class="bi bi-arrow-left me-1"></i> La classe
-        </a>
-    <?php endif; ?>
+    <div class="d-flex gap-2">
+        <?php if (can('payment.record') && route_exists('/finances/eleve/{id}/encaisser')): ?>
+            <a href="<?= e(url('/finances/eleve/' . (int) $enrollment['id'] . '/encaisser')) ?>"
+               class="btn btn-primary">
+                <i class="bi bi-cash-coin me-1"></i> Encaisser
+            </a>
+        <?php endif; ?>
+        <?php if ($classroom !== null): ?>
+            <a href="<?= e(url('/finances/classe/' . (int) $classroom['id'])) ?>" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-left me-1"></i> La classe
+            </a>
+        <?php endif; ?>
+    </div>
 </div>
 
 <?php require APP_PATH . '/views/partials/flash.php'; ?>

@@ -52,12 +52,26 @@ function ctrl_finance_index(): void
         }
     }
 
+    // LA PORTE DU PARENT.
+    //
+    // PARENT détient finance.view depuis la phase 1 mais n'a aucune
+    // classe : le tableau par classe lui renvoyait une page vide, et
+    // l'entrée de menu ne menait donc nulle part. Quand le périmètre
+    // par classe est vide, on bascule sur le périmètre par ÉLÈVE.
+    //
+    // La requête n'est lancée QUE dans ce cas : sur un compte de
+    // direction, elle ramènerait l'établissement entier.
+    $enrollments = ($year !== null && $classrooms === [])
+        ? finance_repo_scoped_enrollments((int) $year['id'])
+        : [];
+
     view('finance/index', [
-        'title'      => 'Finances',
-        'year'       => $year,
-        'years'      => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
-        'classrooms' => $classrooms,
-        'feeCount'   => $year !== null ? count(finance_repo_fees((int) $year['id'], true)) : 0,
+        'title'       => 'Finances',
+        'year'        => $year,
+        'years'       => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
+        'classrooms'  => $classrooms,
+        'enrollments' => $enrollments,
+        'feeCount'    => $year !== null ? count(finance_repo_fees((int) $year['id'], true)) : 0,
     ]);
 }
 
@@ -78,12 +92,24 @@ function ctrl_finance_fees(): void
 
     // Combien de dettes une resynchronisation changerait, frais par
     // frais. Affiché AVANT l'action, jamais découvert après.
-    $drift = [];
+    //
+    // Et surtout : le réalignement REFUSE de convertir une monnaie. Un
+    // écran qui proposerait le bouton dans ce cas promettrait une
+    // action qui échoue toujours — une impasse. Les deux situations
+    // sont donc séparées.
+    $drift   = [];
+    $blocked = [];
 
     foreach ($fees as $fee) {
         $count = finance_service_resync_preview((int) $fee['id']);
 
-        if ($count > 0) {
+        if ($count === 0) {
+            continue;
+        }
+
+        if (finance_repo_currency_mismatch((int) $fee['id']) > 0) {
+            $blocked[(int) $fee['id']] = $count;
+        } else {
             $drift[(int) $fee['id']] = $count;
         }
     }
@@ -94,6 +120,8 @@ function ctrl_finance_fees(): void
         'years'      => tenant_all('academic_years', '1 = 1 ORDER BY starts_on DESC'),
         'fees'       => $fees,
         'drift'      => $drift,
+        'blocked'    => $blocked,
+        'outOfScope' => finance_repo_out_of_scope((int) $year['id']),
         'currencies' => FINANCE_CURRENCIES,
         'scopes'     => FINANCE_SCOPES,
         'levels'     => db_all(
@@ -258,4 +286,195 @@ function ctrl_finance_restore_line(string $id): void
     $outcome['ok'] ? flash_success($outcome['message']) : flash_error($outcome['message']);
 
     redirect('/finances/eleve/' . (int) $line['enrollment_id']);
+}
+
+function ctrl_finance_cancel_out_of_scope(): void
+{
+    $yearId = (int) input('academic_year_id', 0);
+
+    if (tenant_find('academic_years', $yearId) === null) {
+        flash_error('Année scolaire introuvable.');
+        redirect('/finances');
+    }
+
+    $outcome = finance_service_cancel_out_of_scope($yearId, (string) input('motif', ''));
+
+    $outcome['ok'] ? flash_success($outcome['message']) : flash_error($outcome['message']);
+
+    redirect('/finances/frais?annee=' . $yearId);
+}
+
+// =====================================================================
+//  CAISSE (phase 5B)
+//
+//  payment.record appartient au COMPTABLE ; payment.cancel n'est
+//  accordée qu'à la DIRECTION. Celui qui encaisse n'annule pas son
+//  propre reçu — c'est la séparation la plus élémentaire d'une caisse.
+// =====================================================================
+
+/** Écran d'encaissement d'un élève : dettes ouvertes + formulaire. */
+function ctrl_finance_pay_form(string $id): void
+{
+    $enrollmentId = (int) $id;
+
+    if (!finance_can_view_enrollment($enrollmentId)) {
+        abort(404, 'Dossier introuvable.');
+    }
+
+    $enrollment = tenant_find('enrollments', $enrollmentId);
+    $student    = tenant_find('students', (int) $enrollment['student_id']);
+
+    view('finance/pay', [
+        'title'      => 'Encaisser — ' . $student['last_name'],
+        'enrollment' => $enrollment,
+        'student'    => $student,
+        'classroom'  => $enrollment['classroom_id'] !== null
+            ? tenant_find('classrooms', (int) $enrollment['classroom_id'])
+            : null,
+        'year'       => tenant_find('academic_years', (int) $enrollment['academic_year_id']),
+        'lines'      => finance_repo_fees_with_paid($enrollmentId),
+        'balance'    => finance_repo_balance($enrollmentId),
+        'payments'   => finance_repo_payments($enrollmentId),
+        'currencies' => FINANCE_CURRENCIES,
+        'methods'    => FINANCE_METHODS,
+        'rate'       => finance_default_rate(),
+        'today'      => date('Y-m-d'),
+    ]);
+}
+
+function ctrl_finance_pay(string $id): void
+{
+    $enrollmentId = (int) $id;
+
+    // La répartition manuelle arrive sous forme allocation[<id>] = montant.
+    // Vide : le service applique le FIFO.
+    $allocations = [];
+
+    foreach ((array) input('allocation', []) as $lineId => $amount) {
+        if (trim((string) $amount) !== '') {
+            $allocations[(int) $lineId] = $amount;
+        }
+    }
+
+    $outcome = finance_service_record_payment($enrollmentId, $_POST, $allocations);
+
+    if (!$outcome['ok']) {
+        flash_error($outcome['message']);
+        redirect('/finances/eleve/' . $enrollmentId . '/encaisser');
+    }
+
+    flash_success($outcome['message']);
+
+    // Le reliquat non affecté est une information de caisse : le taire
+    // présenterait une avance comme un solde ordinaire.
+    if (($outcome['unallocated'] ?? 0.0) > 0.005) {
+        flash_warning(
+            'Vérifiez le montant saisi : une partie du paiement ne solde aucune dette ouverte '
+            . 'et reste en avance.'
+        );
+    }
+
+    redirect('/finances/recu/' . (int) $outcome['id']);
+}
+
+/** Reçu imprimable. */
+function ctrl_finance_receipt(string $id): void
+{
+    $payment = finance_repo_payment((int) $id);
+
+    if ($payment === null || !finance_can_view_enrollment((int) $payment['enrollment_id'])) {
+        abort(404, 'Reçu introuvable.');
+    }
+
+    $student = tenant_find('students', (int) $payment['student_id']);
+
+    view('finance/receipt', [
+        'title'       => 'Reçu ' . $payment['receipt_no'],
+        'payment'     => $payment,
+        'student'     => $student,
+        'classroom'   => $payment['classroom_id'] !== null
+            ? tenant_find('classrooms', (int) $payment['classroom_id'])
+            : null,
+        'year'        => tenant_find('academic_years', (int) $payment['academic_year_id']),
+        'allocations' => finance_repo_allocations((int) $payment['id']),
+        'school'      => db_one('SELECT * FROM schools WHERE id = :id', ['id' => tenant_require()], true),
+        'balance'     => finance_repo_balance((int) $payment['enrollment_id']),
+    ]);
+}
+
+function ctrl_finance_cancel_payment(string $id): void
+{
+    $payment = finance_repo_payment((int) $id);
+
+    if ($payment === null || !finance_can_view_enrollment((int) $payment['enrollment_id'])) {
+        abort(404, 'Reçu introuvable.');
+    }
+
+    $outcome = finance_service_cancel_payment((int) $id, (string) input('motif', ''));
+
+    $outcome['ok'] ? flash_success($outcome['message']) : flash_error($outcome['message']);
+
+    redirect('/finances/recu/' . (int) $id);
+}
+
+function ctrl_finance_reallocate(string $id): void
+{
+    $payment = finance_repo_payment((int) $id);
+
+    if ($payment === null || !finance_can_view_enrollment((int) $payment['enrollment_id'])) {
+        abort(404, 'Reçu introuvable.');
+    }
+
+    $allocations = [];
+
+    foreach ((array) input('allocation', []) as $lineId => $amount) {
+        if (trim((string) $amount) !== '') {
+            $allocations[(int) $lineId] = $amount;
+        }
+    }
+
+    $outcome = finance_service_reallocate((int) $id, $allocations);
+
+    $outcome['ok'] ? flash_success($outcome['message']) : flash_error($outcome['message']);
+
+    redirect('/finances/recu/' . (int) $id);
+}
+
+/** Journal de caisse d'une journée — ce que le caissier remet le soir. */
+function ctrl_finance_cashbook(): void
+{
+    $date = (string) input('date', '');
+
+    if (!finance_valid_date($date)) {
+        $date = date('Y-m-d');
+    }
+
+    $payments = [];
+
+    // Le périmètre vaut ici comme ailleurs : un tuteur qui atteindrait
+    // cette route ne doit voir que les reçus de ses enfants.
+    foreach (finance_repo_cashbook($date) as $row) {
+        if (finance_can_view_enrollment((int) $row['enrollment_id'])) {
+            $payments[] = $row;
+        }
+    }
+
+    $totals = [];
+
+    foreach ($payments as $row) {
+        if ((int) $row['is_cancelled'] === 1) {
+            continue;
+        }
+
+        $currency = (string) $row['credited_currency'];
+        $totals[$currency] = ($totals[$currency] ?? 0.0) + (float) $row['credited_amount'];
+    }
+
+    view('finance/cashbook', [
+        'title'    => 'Journal de caisse',
+        'date'     => $date,
+        'payments' => $payments,
+        'totals'   => $totals,
+        'methods'  => FINANCE_METHODS,
+    ]);
 }

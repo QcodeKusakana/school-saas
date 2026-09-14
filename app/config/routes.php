@@ -182,11 +182,26 @@ route('GET',  '/finances/frais',                'finance', 'ctrl_finance_fees', 
 route('POST', '/finances/frais',                'finance', 'ctrl_finance_fee_save',    ['auth', 'school', 'perm:fee.manage']);
 route('POST', '/finances/frais/{id}/realigner', 'finance', 'ctrl_finance_fee_resync',  ['auth', 'school', 'perm:fee.manage']);
 route('POST', '/finances/affecter',             'finance', 'ctrl_finance_assign',      ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/hors-portee',          'finance', 'ctrl_finance_cancel_out_of_scope', ['auth', 'school', 'perm:fee.manage']);
 route('GET',  '/finances/classe/{id}',          'finance', 'ctrl_finance_classroom',   ['auth', 'school', 'perm:finance.view']);
 route('GET',  '/finances/eleve/{id}',           'finance', 'ctrl_finance_student',     ['auth', 'school', 'perm:finance.view']);
 route('POST', '/finances/ligne/{id}/remise',    'finance', 'ctrl_finance_discount',    ['auth', 'school', 'perm:fee.manage']);
 route('POST', '/finances/ligne/{id}/annuler',   'finance', 'ctrl_finance_cancel_line', ['auth', 'school', 'perm:fee.manage']);
 route('POST', '/finances/ligne/{id}/retablir',  'finance', 'ctrl_finance_restore_line', ['auth', 'school', 'perm:fee.manage']);
+
+// ---------------------------------------------------------------------
+//  CAISSE — phase 5B
+//
+//  payment.record appartient au COMPTABLE ; payment.cancel n'est
+//  accordée qu'à la DIRECTION. Celui qui encaisse n'annule pas son
+//  propre reçu.
+// ---------------------------------------------------------------------
+route('GET',  '/finances/journal',              'finance', 'ctrl_finance_cashbook',        ['auth', 'school', 'perm:payment.view']);
+route('GET',  '/finances/eleve/{id}/encaisser', 'finance', 'ctrl_finance_pay_form',        ['auth', 'school', 'perm:payment.record']);
+route('POST', '/finances/eleve/{id}/encaisser', 'finance', 'ctrl_finance_pay',             ['auth', 'school', 'perm:payment.record']);
+route('GET',  '/finances/recu/{id}',            'finance', 'ctrl_finance_receipt',         ['auth', 'school', 'perm:payment.view']);
+route('POST', '/finances/recu/{id}/annuler',    'finance', 'ctrl_finance_cancel_payment',  ['auth', 'school', 'perm:payment.cancel']);
+route('POST', '/finances/recu/{id}/repartir',   'finance', 'ctrl_finance_reallocate',      ['auth', 'school', 'perm:payment.record']);
 
 // ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :

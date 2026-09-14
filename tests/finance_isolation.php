@@ -14,6 +14,12 @@
  *  · un parent ne voit que la situation de ses enfants ;
  *  · aucune école ne voit la caisse d'une autre.
  *
+ * Phase 5B — la caisse
+ *  · le TAUX est figé sur le paiement, jamais relu ;
+ *  · un numéro de reçu est consommé à jamais, même annulé ;
+ *  · aucune dette ne se sur-paie, aucun solde ne devient négatif ;
+ *  · annuler une dette payée ne fait pas DISPARAÎTRE l'argent.
+ *
  * Usage : php tests/finance_isolation.php
  */
 declare(strict_types=1);
@@ -424,6 +430,378 @@ try {
     }
 
     // =================================================================
+    //  LES PORTÉES « NIVEAU » ET « CLASSE »
+    //
+    //  Le premier jet de ces tests ne créait qu'un seul niveau : les
+    //  deux portées restrictives n'étaient donc jamais exercées, et un
+    //  frais de 8e facturé à toute l'école serait passé inaperçu.
+    // =================================================================
+    $level8  = (int) db_value("SELECT id FROM education_levels WHERE code = 'CTEB_8'", [], true);
+    $prog8   = curriculum_service_create_program($yearId, $level8, null, null);
+    curriculum_service_fill_program((int) $prog8['id']);
+    curriculum_service_activate((int) $prog8['id']);
+
+    $classB = tenant_insert('classrooms', [
+        'academic_year_id' => $yearId, 'curriculum_id' => (int) $prog8['id'],
+        'code' => '8A', 'name' => '8ème A', 'capacity' => 40,
+    ]);
+
+    $r8 = students_service_enroll_new(
+        ['last_name' => 'HUITIEME', 'first_name' => 'Six', 'gender' => 'F'],
+        $yearId,
+        $classB
+    );
+    $enroll8 = (int) students_repo_enrollment((int) $r8['id'], $yearId)['id'];
+
+    $labo = finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'LABO8', 'name' => 'Laboratoire 8e',
+        'currency' => 'USD', 'amount' => '15', 'scope' => 'level', 'level_id' => $level8,
+        'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+
+    $sortie = finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'SORTIE7', 'name' => 'Sortie 7ème A',
+        'currency' => 'USD', 'amount' => '8', 'scope' => 'classroom', 'classroom_id' => $classA,
+        'is_mandatory' => 0, 'is_active' => 1,
+    ]);
+
+    finance_service_assign($yearId);
+
+    $countFor = static function (int $feeId, int $classroomId) use ($schoolId): int {
+        return (int) db_value(
+            'SELECT COUNT(*) FROM student_fees sf
+               JOIN enrollments e ON e.id = sf.enrollment_id AND e.school_id = sf.school_id
+              WHERE sf.school_id = :s AND sf.fee_id = :f AND e.classroom_id = :c
+                AND sf.is_cancelled = 0',
+            ['s' => $schoolId, 'f' => $feeId, 'c' => $classroomId]
+        );
+    };
+
+    check(
+        'Un frais de niveau ne touche que son niveau',
+        $countFor((int) $labo['id'], $classA) === 0 && $countFor((int) $labo['id'], $classB) === 1,
+        $countFor((int) $labo['id'], $classA) . ' en 7ème, ' . $countFor((int) $labo['id'], $classB) . ' en 8ème'
+    );
+
+    check(
+        'Un frais de classe ne touche que sa classe',
+        $countFor((int) $sortie['id'], $classB) === 0 && $countFor((int) $sortie['id'], $classA) > 0,
+        $countFor((int) $sortie['id'], $classA) . ' en 7ème, ' . $countFor((int) $sortie['id'], $classB) . ' en 8ème'
+    );
+
+    // =================================================================
+    //  RÉTRÉCIR UNE PORTÉE LAISSE DES DETTES ORPHELINES
+    //
+    //  L'affectation ne sait qu'ajouter, et le gel du tarif interdit de
+    //  réécrire une dette. Rétrécir la portée d'un frais déjà affecté
+    //  laissait donc des classes entières facturées d'un frais qui ne
+    //  les concernait plus — sans le moindre signal.
+    // =================================================================
+    check(
+        'Rien n\'est hors portée tant que les portées ne bougent pas',
+        finance_repo_out_of_scope($yearId) === []
+    );
+
+    finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'SORTIE7', 'name' => 'Sortie 7ème A',
+        'currency' => 'USD', 'amount' => '8', 'scope' => 'classroom', 'classroom_id' => $classB,
+        'is_mandatory' => 0, 'is_active' => 1,
+    ], (int) $sortie['id']);
+
+    $orphans = finance_repo_out_of_scope($yearId);
+
+    check(
+        'Rétrécir une portée rend les dettes devenues orphelines VISIBLES',
+        count($orphans) > 0,
+        count($orphans) . ' dette(s) signalée(s)'
+    );
+
+    check(
+        'Les annuler en bloc sans motif est refusé',
+        !finance_service_cancel_out_of_scope($yearId, 'ab')['ok']
+    );
+
+    $bulk = finance_service_cancel_out_of_scope($yearId, 'Portee de la sortie restreinte a la 8e');
+
+    check(
+        'Avec motif, elles sont annulées — pas supprimées',
+        $bulk['cancelled'] === count($orphans)
+            && (int) db_value(
+                'SELECT is_cancelled FROM student_fees WHERE id = :i AND school_id = :s',
+                ['i' => (int) $orphans[0]['id'], 's' => $schoolId]
+            ) === 1,
+        $bulk['cancelled'] . ' annulée(s)'
+    );
+
+    check(
+        'Et il ne reste plus rien hors portée',
+        finance_repo_out_of_scope($yearId) === []
+    );
+
+    // =================================================================
+    //  L'ÉCRAN NE PROPOSE QUE CE QUE L'ACTION TIENT
+    //
+    //  Le bouton « Réaligner » s'affichait dès qu'une divergence
+    //  existait — y compris quand elle portait sur la DEVISE, cas que
+    //  le réalignement refuse. L'utilisateur cliquait sur une action
+    //  qui échouait à tous les coups.
+    // =================================================================
+    $cantine = finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'CANTINE', 'name' => 'Cantine',
+        'currency' => 'USD', 'amount' => '12', 'scope' => 'school',
+        'is_mandatory' => 0, 'is_active' => 1,
+    ]);
+
+    finance_service_assign($yearId);
+
+    finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'CANTINE', 'name' => 'Cantine',
+        'currency' => 'CDF', 'amount' => '34000', 'scope' => 'school',
+        'is_mandatory' => 0, 'is_active' => 1,
+    ], (int) $cantine['id']);
+
+    $shown    = finance_service_resync_preview((int) $cantine['id']);
+    $mismatch = finance_repo_currency_mismatch((int) $cantine['id']);
+
+    check(
+        'Une divergence de devise est détectée à part',
+        $shown > 0 && $mismatch === $shown,
+        $shown . ' divergente(s), dont ' . $mismatch . ' de devise'
+    );
+
+    check(
+        'Le bouton n\'est donc pas proposé, et l\'action refuserait bien',
+        !finance_service_resync_fee((int) $cantine['id'], 'Verification de la promesse')['ok']
+    );
+
+    // =================================================================
+    //  LA CAISSE (5B)
+    //
+    //  Les encaissements se datent du JOUR : postdater fausserait tous
+    //  les arrêtés de caisse déjà signés, et la garde le refuse.
+    // =================================================================
+    $today = date('Y-m-d');
+
+    // Un élève neuf, aux dettes intactes, pour ne pas dépendre de tout
+    // ce que les blocs précédents ont modifié.
+    $rc = students_service_enroll_new(
+        ['last_name' => 'CAISSE', 'first_name' => 'Sept', 'gender' => 'M'],
+        $yearId,
+        $classA
+    );
+    $payer = (int) students_repo_enrollment((int) $rc['id'], $yearId)['id'];
+
+    $tarif = finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'TRANCHE1', 'name' => 'Tranche 1',
+        'currency' => 'USD', 'amount' => '50', 'scope' => 'school',
+        'due_on' => '2095-10-15', 'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_assign($yearId, $classA);
+
+    // ----- LE TAUX EST FIGÉ SUR LE PAIEMENT --------------------------
+    $pay = finance_service_record_payment($payer, [
+        'paid_on'           => $today,
+        'tendered_currency' => 'CDF',  'tendered_amount' => '140 000',
+        'credited_currency' => 'USD',  'exchange_rate'   => '2800',
+        'method'            => 'cash',
+    ]);
+
+    check('Un paiement en CDF solde une dette en USD', $pay['ok'], $pay['message']);
+
+    $stored = db_one(
+        'SELECT tendered_amount, exchange_rate, credited_amount
+           FROM payments WHERE id = :i AND school_id = :s',
+        ['i' => (int) $pay['id'], 's' => $schoolId]
+    );
+
+    check(
+        'Les trois montants sont conservés : remis, taux, crédité',
+        abs((float) $stored['tendered_amount'] - 140000.0) < 0.01
+            && abs((float) $stored['exchange_rate'] - 2800.0) < 0.000001
+            && abs((float) $stored['credited_amount'] - 50.0) < 0.01,
+        $stored['tendered_amount'] . ' CDF @ ' . $stored['exchange_rate'] . ' → ' . $stored['credited_amount'] . ' USD'
+    );
+
+    // Changer le taux de l'école ne doit RIEN réécrire.
+    db_query(
+        'UPDATE school_settings SET setting_value = :v
+          WHERE school_id = :s AND setting_key = :k',
+        ['v' => '3500', 's' => $schoolId, 'k' => 'finance.usd_rate']
+    );
+    school_settings_all(true);
+
+    check(
+        'Changer le taux de l\'école ne réécrit aucun reçu',
+        abs((float) db_value(
+            'SELECT exchange_rate FROM payments WHERE id = :i AND school_id = :s',
+            ['i' => (int) $pay['id'], 's' => $schoolId]
+        ) - 2800.0) < 0.000001,
+        'taux courant : ' . finance_default_rate()
+    );
+
+    // ----- LA RÉPARTITION --------------------------------------------
+    $balance = finance_repo_balance($payer);
+
+    check(
+        'Le versement solde la dette la plus ancienne',
+        abs(($balance['USD']['paid'] ?? 0) - 50.0) < 0.01,
+        'payé : ' . ($balance['USD']['paid'] ?? 0) . ' USD'
+    );
+
+    // ----- ON NE SUR-PAIE PAS ----------------------------------------
+    $over = finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '500',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    $overpaid = false;
+
+    foreach (finance_repo_fees_with_paid($payer) as $l) {
+        if ((float) $l['paid'] > (float) $l['amount_net'] + 0.005) {
+            $overpaid = true;
+        }
+    }
+
+    check('Aucune dette ne reçoit plus que son reste dû', !$overpaid);
+
+    check(
+        'Le trop-versé reste une AVANCE, et il est annoncé',
+        ($over['unallocated'] ?? 0) > 0.005 && str_contains($over['message'], 'avance'),
+        $over['message']
+    );
+
+    // ----- LE NUMÉRO DE REÇU EST CONSOMMÉ À JAMAIS -------------------
+    check(
+        'Annuler sans motif suffisant est refusé',
+        !finance_service_cancel_payment((int) $over['id'], 'abc')['ok']
+    );
+
+    check(
+        'Annuler avec motif réussit',
+        finance_service_cancel_payment((int) $over['id'], 'Erreur de guichet sur le montant')['ok']
+    );
+
+    check(
+        'Le reçu annulé ne compte plus dans le solde',
+        abs((finance_repo_balance($payer)['USD']['paid'] ?? 0) - 50.0) < 0.01,
+        'payé : ' . (finance_repo_balance($payer)['USD']['paid'] ?? 0) . ' USD'
+    );
+
+    $seqBefore = array_map('intval', array_column(db_all(
+        'SELECT receipt_seq FROM payments WHERE school_id = :s ORDER BY receipt_seq',
+        ['s' => $schoolId]
+    ), 'receipt_seq'));
+
+    finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '5',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    $seqAfter = array_map('intval', array_column(db_all(
+        'SELECT receipt_seq FROM payments WHERE school_id = :s ORDER BY receipt_seq',
+        ['s' => $schoolId]
+    ), 'receipt_seq'));
+
+    check(
+        'Le numéro d\'un reçu annulé n\'est JAMAIS réattribué',
+        count($seqAfter) === count($seqBefore) + 1
+            && count(array_unique($seqAfter)) === count($seqAfter)
+            && max($seqAfter) === count($seqAfter),
+        'séquence : ' . implode(', ', $seqAfter)
+    );
+
+    // ----- CONTRÔLES DE SAISIE ---------------------------------------
+    check(
+        'Un encaissement daté dans le futur est refusé',
+        !finance_service_record_payment($payer, [
+            'paid_on' => date('Y-m-d', strtotime('+1 day')), 'tendered_currency' => 'USD',
+            'tendered_amount' => '10', 'credited_currency' => 'USD', 'method' => 'cash',
+        ])['ok']
+    );
+
+    check(
+        'Une conversion sans taux est refusée',
+        !finance_service_record_payment($payer, [
+            'paid_on' => $today, 'tendered_currency' => 'CDF', 'tendered_amount' => '50000',
+            'credited_currency' => 'USD', 'method' => 'cash',
+        ])['ok']
+    );
+
+    check(
+        'Un montant remis nul est refusé',
+        !finance_service_record_payment($payer, [
+            'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '0',
+            'credited_currency' => 'USD', 'method' => 'cash',
+        ])['ok']
+    );
+
+    check(
+        'Un montant tapé à la française est lu correctement',
+        abs(finance_parse_amount('1 250,50') - 1250.50) < 0.001
+            && abs(finance_parse_amount('1.250,50') - 1250.50) < 0.001
+            && abs(finance_parse_amount('1250.50') - 1250.50) < 0.001
+    );
+
+    // =================================================================
+    //  LA FRONTIÈRE ENTRE DETTES ET PAIEMENTS
+    //
+    //  Les deux moitiés du module ont été construites séparément. Les
+    //  trois défauts suivants vivaient tous à leur jointure.
+    // =================================================================
+    $payerLine = (int) db_value(
+        'SELECT id FROM student_fees
+          WHERE school_id = :s AND enrollment_id = :e AND fee_id = :f',
+        ['s' => $schoolId, 'e' => $payer, 'f' => (int) $tarif['id']]
+    );
+
+    check(
+        'Une remise qui passerait sous le montant encaissé est refusée',
+        !finance_service_set_discount($payerLine, 40.0, 'Enfant du personnel')['ok'],
+        'la dette a déjà encaissé ' . finance_repo_paid_on_fee($payerLine) . ' USD'
+    );
+
+    // Réaligner le tarif SOUS ce qui a été encaissé : le montant dû est
+    // ramené à l'encaissé, jamais en dessous — sinon l'école devrait de
+    // l'argent à la famille sans avoir décidé de rembourser.
+    finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'TRANCHE1', 'name' => 'Tranche 1',
+        'currency' => 'USD', 'amount' => '20', 'scope' => 'school',
+        'due_on' => '2095-10-15', 'is_mandatory' => 1, 'is_active' => 1,
+    ], (int) $tarif['id']);
+
+    $lowered = finance_service_resync_fee((int) $tarif['id'], 'Correction du tarif de la tranche 1');
+
+    check(
+        'Un réalignement sous le montant encaissé plancher sur l\'encaissé',
+        ($lowered['floored'] ?? 0) >= 1
+            && (finance_repo_balance($payer)['USD']['balance'] ?? 0) >= -0.005,
+        'solde : ' . (finance_repo_balance($payer)['USD']['balance'] ?? 0) . ' USD'
+    );
+
+    check(
+        'Et les dossiers concernés sont NOMMÉS, pas traités en silence',
+        str_contains($lowered['message'], 'remboursement')
+    );
+
+    // Annuler une dette déjà payée : l'argent ne disparaît pas.
+    $paidBefore = finance_repo_paid_on_fee($payerLine);
+    $cancelPaid = finance_service_cancel_line($payerLine, 'Eleve parti en cours d annee');
+
+    check(
+        'Annuler une dette payée le DIT, au lieu de faire disparaître l\'argent',
+        $cancelPaid['ok'] && str_contains($cancelPaid['message'], 'AVANCE'),
+        $cancelPaid['message']
+    );
+
+    check(
+        'Et les sommes reçues basculent en avance, sans s\'évaporer',
+        abs((finance_repo_balance($payer)['USD']['advance'] ?? 0) - ($paidBefore + 5.0)) < 0.01,
+        'avance : ' . (finance_repo_balance($payer)['USD']['advance'] ?? 0) . ' USD'
+    );
+
+    finance_service_restore_line($payerLine, 'Retablissement apres verification');
+
+    // =================================================================
     //  PÉRIMÈTRE : UN PARENT NE VOIT QUE SES ENFANTS
     //
     //  finance.view est accordée à PARENT depuis la phase 1. Sans cette
@@ -476,6 +854,19 @@ try {
         !students_can_view_classroom($classA)
     );
 
+    // MAIS IL DOIT AVOIR UN CHEMIN.
+    //
+    // Sans classe dans son périmètre, /finances lui renvoyait une page
+    // vide : une entrée de menu qui ne menait nulle part. Le périmètre
+    // bascule alors sur l'ÉLÈVE.
+    $mine = finance_repo_scoped_enrollments($yearId);
+
+    check(
+        'Il atteint son enfant depuis l\'accueil des finances',
+        count($mine) === 1 && (int) $mine[0]['enrollment_id'] === $enroll[0],
+        count($mine) . ' inscription(s) dans son périmètre'
+    );
+
     // =================================================================
     //  ISOLATION MULTI-ÉCOLE
     // =================================================================
@@ -506,6 +897,24 @@ try {
     check(
         'Ni l\'annuler',
         !finance_service_cancel_line($lineB, 'Tentative depuis une autre ecole')['ok']
+    );
+
+    check(
+        'Ni voir un de ses reçus',
+        finance_repo_payment((int) $pay['id']) === null
+    );
+
+    check(
+        'Ni encaisser sur un de ses élèves',
+        !finance_service_record_payment($payer, [
+            'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '10',
+            'credited_currency' => 'USD', 'method' => 'cash',
+        ])['ok']
+    );
+
+    check(
+        'Ni annuler un de ses reçus',
+        !finance_service_cancel_payment((int) $pay['id'], 'Tentative depuis une autre ecole')['ok']
     );
 } finally {
     foreach ($createdSchools as $id) {

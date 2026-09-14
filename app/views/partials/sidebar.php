@@ -98,6 +98,11 @@ $isPlatform = $user['school_id'] === null;
                         <i class="bi bi-list-columns"></i><span>Grille tarifaire</span>
                     </a>
                 <?php endif; ?>
+                <?php if (can('payment.view') && route_exists('/finances/journal')): ?>
+                    <a class="nav-item <?= nav_active('/finances/journal') ?>" href="<?= e(url('/finances/journal')) ?>">
+                        <i class="bi bi-journal-text"></i><span>Journal de caisse</span>
+                    </a>
+                <?php endif; ?>
             <?php endif; ?>
 
             <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view'])): ?>

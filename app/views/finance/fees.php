@@ -10,7 +10,9 @@
  * @var array  $year
  * @var array  $years
  * @var array  $fees
- * @var array  $drift       [fee_id => nombre de dettes divergentes]
+ * @var array  $drift       [fee_id => nombre de dettes réalignables]
+ * @var array  $blocked     [fee_id => dettes divergentes mais NON réalignables (devise)]
+ * @var array  $outOfScope  Dettes dont le frais ne vise plus l'inscription
  * @var array  $currencies
  * @var array  $scopes
  * @var array  $levels
@@ -40,8 +42,9 @@ foreach ($fees as $f) {
 
     <div class="d-flex gap-2">
         <?php if (count($years) > 1): ?>
-            <form method="get" action="<?= e(url('/finances/frais')) ?>">
-                <select name="annee" class="form-select form-select-sm" onchange="this.form.submit()">
+            <form method="get" action="<?= e(url('/finances/frais')) ?>" class="d-flex gap-2">
+                <select name="annee" class="form-select form-select-sm" data-auto-submit
+                        aria-label="Année scolaire">
                     <?php foreach ($years as $y): ?>
                         <option value="<?= (int) $y['id'] ?>"
                             <?= (int) $y['id'] === (int) $year['id'] ? 'selected' : '' ?>>
@@ -49,6 +52,8 @@ foreach ($fees as $f) {
                         </option>
                     <?php endforeach; ?>
                 </select>
+                <button type="submit" class="btn btn-sm btn-outline-secondary"
+                        data-auto-submit-fallback>Voir</button>
             </form>
         <?php endif; ?>
 
@@ -59,6 +64,62 @@ foreach ($fees as $f) {
 </div>
 
 <?php require APP_PATH . '/views/partials/flash.php'; ?>
+
+<?php if ($outOfScope !== []): ?>
+    <!--
+        DETTES HORS PORTÉE.
+
+        Rétrécir la portée d'un frais déjà affecté laisse des dettes
+        orphelines : l'affectation ne sait qu'ajouter, et le gel du tarif
+        interdit de réécrire une dette. Sans ce bandeau, des classes
+        entières restaient facturées d'un frais qui ne les concernait plus,
+        et rien ne le disait.
+
+        Le même signal attrape l'élève transféré en cours d'année qui traîne
+        la sortie scolaire de son ancienne classe. Dans les deux cas, c'est
+        au comptable de trancher — le programme compte et montre.
+    -->
+    <div class="alert alert-warning">
+        <div class="d-flex align-items-start gap-2">
+            <i class="bi bi-signpost-split"></i>
+            <div class="flex-grow-1">
+                <strong><?= count($outOfScope) ?> dette(s)</strong> portent sur des élèves que leur frais
+                ne vise plus — portée rétrécie depuis l'affectation, ou élève transféré de classe.
+
+                <ul class="small mt-2 mb-2">
+                    <?php foreach (array_slice($outOfScope, 0, 8) as $line): ?>
+                        <li>
+                            <?= e(full_name($line['last_name'], $line['post_name'], $line['first_name'])) ?>
+                            <?php if ($line['classroom_name'] !== null): ?>
+                                (<?= e((string) $line['classroom_name']) ?>)
+                            <?php endif; ?>
+                            — <?= e((string) $line['fee_name']) ?>,
+                            <?= e(finance_amount((float) $line['amount_due'], (string) $line['currency'])) ?>
+                        </li>
+                    <?php endforeach; ?>
+                    <?php if (count($outOfScope) > 8): ?>
+                        <li class="text-secondary">… et <?= count($outOfScope) - 8 ?> autre(s)</li>
+                    <?php endif; ?>
+                </ul>
+
+                <form method="post" action="<?= e(url('/finances/hors-portee')) ?>"
+                      class="d-flex flex-wrap gap-2 align-items-center">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="academic_year_id" value="<?= (int) $year['id'] ?>">
+                    <input type="text" name="motif" class="form-control form-control-sm"
+                           style="max-width:24rem" required minlength="5"
+                           placeholder="Motif de l'annulation (obligatoire)">
+                    <button type="submit" class="btn btn-sm btn-warning">
+                        Annuler ces <?= count($outOfScope) ?> dette(s)
+                    </button>
+                    <span class="small text-secondary">
+                        Elles restent visibles, barrées, avec leur motif.
+                    </span>
+                </form>
+            </div>
+        </div>
+    </div>
+<?php endif; ?>
 
 <div class="row g-3">
     <!-- ============================ LA GRILLE ============================ -->
@@ -90,7 +151,10 @@ foreach ($fees as $f) {
                         </thead>
                         <tbody>
                             <?php foreach ($fees as $fee): ?>
-                                <?php $diverging = $drift[(int) $fee['id']] ?? 0; ?>
+                                <?php
+                                $diverging = $drift[(int) $fee['id']] ?? 0;
+                                $stuck     = $blocked[(int) $fee['id']] ?? 0;
+                                ?>
                                 <tr<?= (int) $fee['is_active'] === 0 ? ' class="opacity-50"' : '' ?>>
                                     <td>
                                         <span class="fw-medium"><?= e($fee['name']) ?></span>
@@ -131,6 +195,11 @@ foreach ($fees as $f) {
                                                   title="Ces dettes portent encore l'ancien montant">
                                                 <?= (int) $diverging ?> figée(s)
                                             </span>
+                                        <?php elseif ($stuck > 0): ?>
+                                            <span class="badge bg-secondary-subtle text-secondary-emphasis d-block mt-1"
+                                                  title="Dettes libellées dans une autre devise">
+                                                <?= (int) $stuck ?> autre devise
+                                            </span>
                                         <?php endif; ?>
                                     </td>
                                     <td class="text-end text-nowrap">
@@ -152,7 +221,24 @@ foreach ($fees as $f) {
                                     </td>
                                 </tr>
 
-                                <?php if ($diverging > 0): ?>
+                                <?php if ($stuck > 0): ?>
+                                    <!--
+                                        IMPASSE ÉVITÉE. Le réalignement refuse de convertir une
+                                        monnaie : proposer ici le bouton reviendrait à promettre
+                                        une action qui échoue toujours.
+                                    -->
+                                    <tr class="table-secondary">
+                                        <td colspan="6" class="small">
+                                            <strong><?= (int) $stuck ?> dette(s)</strong> de ce frais sont libellées
+                                            dans une autre devise que le tarif actuel.
+                                            <strong>Le réalignement ne convertit pas les monnaies</strong> —
+                                            il n'existe aucun taux qui rendrait cette conversion honnête après coup.
+                                            Pour changer de monnaie : désactivez ce frais, créez-en un nouveau dans
+                                            la devise voulue, puis annulez les dettes devenues sans objet depuis la
+                                            fiche de chaque élève.
+                                        </td>
+                                    </tr>
+                                <?php elseif ($diverging > 0): ?>
                                     <tr class="table-warning">
                                         <td colspan="6" class="small">
                                             <form method="post"
@@ -251,9 +337,15 @@ foreach ($fees as $f) {
 
                     <div class="mb-3">
                         <label class="form-label" for="f-scope">Portée</label>
+                        <!--
+                            data-toggle-target : la CSP rend tout gestionnaire écrit en
+                            attribut INERTE. Un onchange ici ne s'exécutait jamais, et les
+                            champs « Niveau » et « Classe » restaient donc invisibles quelle
+                            que soit la portée choisie — le formulaire ne permettait de créer
+                            que des frais valables pour toute l'école.
+                        -->
                         <select class="form-select" id="f-scope" name="scope"
-                                onchange="document.getElementById('f-level').closest('div').hidden = this.value !== 'level';
-                                          document.getElementById('f-class').closest('div').hidden = this.value !== 'classroom';">
+                                data-toggle-target=".js-scope-field" data-toggle-attr="data-scope">
                             <?php foreach ($scopes as $key => $label): ?>
                                 <option value="<?= e($key) ?>"
                                     <?= ($edit['scope'] ?? 'school') === $key ? 'selected' : '' ?>>
@@ -263,7 +355,8 @@ foreach ($fees as $f) {
                         </select>
                     </div>
 
-                    <div class="mb-3" <?= ($edit['scope'] ?? 'school') !== 'level' ? 'hidden' : '' ?>>
+                    <div class="mb-3 js-scope-field" data-scope="level"
+                         <?= ($edit['scope'] ?? 'school') !== 'level' ? 'hidden' : '' ?>>
                         <label class="form-label" for="f-level">Niveau</label>
                         <select class="form-select" id="f-level" name="level_id">
                             <?php foreach ($levels as $level): ?>
@@ -275,7 +368,8 @@ foreach ($fees as $f) {
                         </select>
                     </div>
 
-                    <div class="mb-3" <?= ($edit['scope'] ?? 'school') !== 'classroom' ? 'hidden' : '' ?>>
+                    <div class="mb-3 js-scope-field" data-scope="classroom"
+                         <?= ($edit['scope'] ?? 'school') !== 'classroom' ? 'hidden' : '' ?>>
                         <label class="form-label" for="f-class">Classe</label>
                         <select class="form-select" id="f-class" name="classroom_id">
                             <?php foreach ($classrooms as $classroom): ?>
