@@ -109,7 +109,44 @@ $relationshipLabels = [
             <?php if ($student['status'] !== 'active'): ?>
                 <span class="badge text-bg-secondary ms-1"><?= e($student['status']) ?></span>
             <?php endif; ?>
+            <?php if ($student['user_id'] !== null): ?>
+                <span class="badge bg-success-subtle text-success-emphasis ms-1"
+                      title="Dispose d'un accès à son espace">accès élève</span>
+            <?php endif; ?>
         </p>
+
+        <?php
+        // L'ACCÈS DE L'ÉLÈVE À SON PROPRE ESPACE (phase 6B).
+        //
+        // Le mot de passe initial s'affiche une seule fois : c'est
+        // pourquoi l'action est un POST confirmé, jamais un lien.
+        ?>
+        <?php if (can('user.create') && $student['user_id'] === null): ?>
+            <form method="post" class="d-inline-block mt-1"
+                  data-confirm="Créer un accès à son espace pour cet élève ? Le mot de passe initial ne sera affiché qu'une seule fois."
+                  action="<?= e(url('/eleves/' . (int) $student['id'] . '/acces')) ?>">
+                <?= csrf_field() ?>
+                <button type="submit" class="btn btn-sm btn-outline-primary">
+                    <i class="bi bi-key me-1"></i> Créer son accès élève
+                </button>
+            </form>
+        <?php elseif (can('user.reset_password') && $student['user_id'] !== null): ?>
+            <?php
+            // UN PRODUIT QUI DONNE UN ACCÈS DOIT SAVOIR LE RENDRE.
+            //
+            // Le mot de passe n'est affiché qu'une fois. Sans ce bouton,
+            // un élève qui l'oublie perd son compte pour de bon : « mot
+            // de passe oublié » exige un courriel qu'il n'a pas.
+            ?>
+            <form method="post" class="d-inline-block mt-1"
+                  data-confirm="Régénérer le mot de passe de cet élève ? L'ancien cessera aussitôt de fonctionner, et le nouveau ne sera affiché qu'une seule fois."
+                  action="<?= e(url('/eleves/' . (int) $student['id'] . '/acces/eleve/' . (int) $student['id'] . '/regenerer')) ?>">
+                <?= csrf_field() ?>
+                <button type="submit" class="btn btn-sm btn-outline-secondary">
+                    <i class="bi bi-arrow-clockwise me-1"></i> Régénérer son accès
+                </button>
+            </form>
+        <?php endif; ?>
     </div>
 
     <?php if ($currentEnrollment !== null && $currentEnrollment['classroom_name'] !== null): ?>
@@ -216,7 +253,40 @@ $relationshipLabels = [
                                         <?php endif; ?>
                                     </td>
                                     <?php if (can('student.edit')): ?>
-                                        <td class="text-end">
+                                        <td class="text-end text-nowrap">
+                                            <?php
+                                            // L'ACCÈS AU PORTAIL (phase 6A).
+                                            //
+                                            // `guardians.user_id` existait depuis la phase 3
+                                            // sans qu'aucun écran ne le remplisse : le lien
+                                            // était prévu, la porte n'avait jamais été posée.
+                                            ?>
+                                            <?php if (can('user.create') && $guardian['user_id'] === null): ?>
+                                                <form method="post" class="d-inline"
+                                                      data-confirm="Créer un accès au portail pour ce tuteur ? Le mot de passe initial ne sera affiché qu'une seule fois."
+                                                      action="<?= e(url('/eleves/' . (int) $student['id'] . '/tuteurs/' . (int) $guardian['id'] . '/acces')) ?>">
+                                                    <?= csrf_field() ?>
+                                                    <button type="submit" class="btn btn-sm btn-link p-0 me-2"
+                                                            title="Créer un accès au portail">
+                                                        <i class="bi bi-key"></i>
+                                                    </button>
+                                                </form>
+                                            <?php elseif ($guardian['user_id'] !== null): ?>
+                                                <i class="bi bi-person-check text-success me-1"
+                                                   title="Dispose d'un accès au portail"></i>
+                                                <?php if (can('user.reset_password')): ?>
+                                                    <form method="post" class="d-inline"
+                                                          data-confirm="Régénérer le mot de passe de ce tuteur ? L'ancien cessera aussitôt de fonctionner."
+                                                          action="<?= e(url('/eleves/' . (int) $student['id'] . '/acces/tuteur/' . (int) $guardian['id'] . '/regenerer')) ?>">
+                                                        <?= csrf_field() ?>
+                                                        <button type="submit" class="btn btn-sm btn-link p-0 me-2"
+                                                                title="Régénérer son mot de passe">
+                                                            <i class="bi bi-arrow-clockwise"></i>
+                                                        </button>
+                                                    </form>
+                                                <?php endif; ?>
+                                            <?php endif; ?>
+
                                             <form method="post" class="d-inline"
                                                   data-confirm="Détacher ce tuteur de l'élève ? Sa fiche sera conservée."
                                                   action="<?= e(url('/eleves/' . (int) $student['id'] . '/tuteurs/' . (int) $guardian['link_id'] . '/retirer')) ?>">

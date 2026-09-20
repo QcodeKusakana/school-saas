@@ -14,6 +14,8 @@
  * @var array  $payments
  * @var array  $totals   Crédité, par devise
  * @var array  $methods
+ * @var array  $expenses Sorties du jour (phase 5D)
+ * @var array  $position Entrées, sorties et solde cumulés à cette date
  */
 declare(strict_types=1);
 
@@ -33,6 +35,18 @@ foreach ($payments as $row) {
 }
 
 $cancelled = array_filter($payments, static fn (array $p): bool => (int) $p['is_cancelled'] === 1);
+
+// Les sorties du jour, par monnaie réellement décaissée.
+$paidOut = [];
+
+foreach ($expenses as $row) {
+    if ((int) $row['is_cancelled'] === 1) {
+        continue;
+    }
+
+    $currency = (string) $row['currency'];
+    $paidOut[$currency] = ($paidOut[$currency] ?? 0.0) + (float) $row['amount'];
+}
 ?>
 
 <div class="page-head">
@@ -80,9 +94,17 @@ $cancelled = array_filter($payments, static fn (array $p): bool => (int) $p['is_
                         </div>
                     <?php endforeach; ?>
                 <?php endif; ?>
+                <?php foreach ($paidOut as $currency => $total): ?>
+                    <div class="d-flex justify-content-between text-danger-emphasis">
+                        <span>Sorti ce jour</span>
+                        <span class="fw-semibold">
+                            − <?= e(finance_amount((float) $total, (string) $currency)) ?>
+                        </span>
+                    </div>
+                <?php endforeach; ?>
                 <p class="small text-secondary mb-0 mt-2">
-                    C'est ce qui doit se trouver physiquement dans le tiroir — la monnaie
-                    telle qu'elle a été remise, pas celle portée au crédit des dettes.
+                    La monnaie telle qu'elle a été remise, pas celle portée au crédit
+                    des dettes — et diminuée des sorties de la journée.
                 </p>
             </div>
         </div>
@@ -184,4 +206,91 @@ $cancelled = array_filter($payments, static fn (array $p): bool => (int) $p['is_
         séquence des numéros incompréhensible et masquerait les erreurs de guichet.
         Ils sont exclus des totaux.
     </p>
+<?php endif; ?>
+
+<!-- =========================== LES SORTIES DU JOUR ======================== -->
+<?php if ($expenses !== []): ?>
+    <div class="card mt-3">
+        <div class="card-header fw-medium">Sorties de caisse du jour</div>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th scope="col">Bon</th>
+                        <th scope="col">Bénéficiaire</th>
+                        <th scope="col" class="d-none d-md-table-cell">Poste</th>
+                        <th scope="col" class="text-end">Montant</th>
+                        <th scope="col" class="d-none d-lg-table-cell">Par</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($expenses as $row): ?>
+                        <?php $void = (int) $row['is_cancelled'] === 1; ?>
+                        <tr<?= $void ? ' class="opacity-50"' : '' ?>>
+                            <td class="small">
+                                <?= e($row['voucher_no']) ?>
+                                <?php if ($void): ?>
+                                    <span class="badge bg-danger-subtle text-danger-emphasis">annulé</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?= e($row['beneficiary']) ?>
+                                <div class="small text-secondary"><?= e($row['description']) ?></div>
+                            </td>
+                            <td class="d-none d-md-table-cell small">
+                                <?= e((string) ($row['category_name'] ?? '—')) ?>
+                            </td>
+                            <td class="text-end text-nowrap fw-medium<?= $void ? ' text-decoration-line-through' : '' ?>">
+                                <?= e(finance_amount((float) $row['amount'], (string) $row['currency'])) ?>
+                            </td>
+                            <td class="d-none d-lg-table-cell small text-secondary">
+                                <?= e(trim((string) ($row['author_last_name'] ?? '') . ' ' . (string) ($row['author_first_name'] ?? ''))) ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+<?php endif; ?>
+
+<!-- ======================= LE SOLDE CUMULÉ À CETTE DATE =================== -->
+<?php if ($position !== []): ?>
+    <div class="card mt-3">
+        <div class="card-header fw-medium d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <span>Solde de caisse cumulé au <?= e(date('d/m/Y', strtotime($date))) ?></span>
+            <span class="badge bg-secondary-subtle text-secondary-emphasis fw-normal">
+                toutes années confondues
+            </span>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-sm mb-0" style="max-width:40rem">
+                <thead>
+                    <tr>
+                        <th scope="col">Devise</th>
+                        <th scope="col" class="text-end">Entré</th>
+                        <th scope="col" class="text-end">Sorti</th>
+                        <th scope="col" class="text-end">Devrait rester</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($position as $currency => $line): ?>
+                        <tr>
+                            <td class="fw-medium"><?= e((string) $currency) ?></td>
+                            <td class="text-end text-nowrap">
+                                <?= e(finance_amount((float) $line['in'], (string) $currency)) ?>
+                            </td>
+                            <td class="text-end text-nowrap">
+                                <?= e(finance_amount((float) $line['out'], (string) $currency)) ?>
+                            </td>
+                            <td class="text-end text-nowrap fw-semibold
+                                       <?= (float) $line['balance'] < 0 ? 'text-danger-emphasis' : '' ?>">
+                                <?= e(finance_amount((float) $line['balance'], (string) $currency)) ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
 <?php endif; ?>

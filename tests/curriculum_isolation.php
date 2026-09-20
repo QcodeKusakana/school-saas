@@ -419,15 +419,18 @@ check(
     ) === 0
 );
 
+// Contrôle d'intégrité sur TOUTES les écoles : c'est justement son
+// objet — une migration qui laisserait une matière orpheline quelque
+// part doit être vue, pas seulement dans l'école du test.
 check(
     'Aucune matière d\'école n\'est orpheline non plus',
-    (int) db_value(
+    platform_scope_cli(static fn (): int => (int) db_value(
         'SELECT COUNT(*) FROM subjects s
            LEFT JOIN learning_domains d ON d.id = s.domain_id
           WHERE s.domain_id IS NOT NULL AND d.id IS NULL',
         [],
         true
-    ) === 0
+    )) === 0
 );
 
 // Contrôles ponctuels tirés des modèles officiels.

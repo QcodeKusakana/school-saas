@@ -776,6 +776,11 @@ function bulletins_service_rank_classroom(int $classroomId, string $periodKey): 
             'missing'            => $total['missing'] ?? 0,
             'absent'             => $total['absent'] ?? 0,
             'student'            => $enrollment,
+            // Le relevé complet est conservé : la publication en fige le
+            // DÉTAIL, branche par branche (phase 6A). Le recalculer une
+            // seconde fois doublerait le travail le plus coûteux de la
+            // classe, pour un résultat identique.
+            'computed'           => $computed,
         ];
     }
 
@@ -885,7 +890,11 @@ function bulletins_service_publish(int $classroomId, string $periodKey): array
         $warnings[] = $totalMissing . ' cote(s) manquante(s) : les bulletins concernés le mentionnent.';
     }
 
-    $published = db_transaction(static function () use ($results, $periodKey, $classSize): int {
+    // Les périodes du regroupement publié : ce sont elles, et elles
+    // seules, dont le détail est figé sur cette pièce.
+    $periodCodes = $groups[$periodKey]['periods'] ?? [];
+
+    $published = db_transaction(static function () use ($results, $periodKey, $classSize, $periodCodes): int {
         $count  = 0;
         $userId = auth_id();
 
@@ -933,6 +942,20 @@ function bulletins_service_publish(int $classroomId, string $periodKey): array
                     'decision'           => $decision,
                     'publisher'          => $userId,
                 ]
+            );
+
+            // LE DÉTAIL EST FIGÉ AVEC LES TOTAUX (phase 6A).
+            //
+            // Sans cela, la liste branche par branche du document se
+            // recalculait à chaque affichage : une cote corrigée après la
+            // remise des bulletins, et la famille rouvrait un bulletin
+            // dont les lignes ne s'additionnaient plus au total figé juste
+            // en dessous. Un bulletin est une pièce, pas une vue.
+            bulletins_freeze_lines(
+                $periodKey,
+                (int) $enrollmentId,
+                $row['computed'],
+                $periodCodes
             );
 
             $count++;
@@ -1039,4 +1062,116 @@ function bulletins_service_suggest_decision(?float $percentage): string
     require_once APP_PATH . '/modules/teachers/services.php';
 
     return $percentage >= teachers_passing_threshold() ? 'passed' : 'failed';
+}
+
+/**
+ * Fige le détail d'un bulletin publié — une ligne par branche ET par
+ * période du regroupement.
+ *
+ * À n'appeler QUE depuis la publication, dans sa transaction : la
+ * pièce et son détail doivent naître ensemble ou pas du tout.
+ *
+ * REPUBLIER REMPLACE, NE COMPLÈTE PAS
+ * -----------------------------------
+ * Les lignes existantes sont effacées avant d'écrire les nouvelles.
+ * Republier veut dire « ce document remplace le précédent » ; garder
+ * les anciennes lignes produirait un bulletin à double entrée.
+ *
+ * CE QUI EST FIGÉ N'EST PAS SEULEMENT LA COTE
+ * -------------------------------------------
+ * Le libellé de la branche, son domaine, son sous-domaine, son ordre et
+ * son maximum unitaire le sont aussi. Renommer une branche ou remanier
+ * un programme ne doit pas réécrire un bulletin de l'an dernier — même
+ * leçon que les libellés d'orientation figés en phase 3.
+ *
+ * @param array<string,mixed> $computed Relevé de bulletins_service_compute()
+ * @param array<int,string>   $periodCodes Périodes du regroupement publié
+ */
+function bulletins_freeze_lines(
+    string $periodKey,
+    int $enrollmentId,
+    array $computed,
+    array $periodCodes
+): void {
+    $schoolId = tenant_require();
+
+    $bulletinId = (int) db_value(
+        'SELECT id FROM bulletins
+          WHERE school_id = :school_id AND enrollment_id = :enrollment_id
+            AND period_key = :period_key',
+        [
+            'school_id'     => $schoolId,
+            'enrollment_id' => $enrollmentId,
+            'period_key'    => $periodKey,
+        ]
+    );
+
+    if ($bulletinId <= 0) {
+        return;
+    }
+
+    db_query(
+        'DELETE FROM bulletin_lines WHERE school_id = :school_id AND bulletin_id = :bulletin_id',
+        ['school_id' => $schoolId, 'bulletin_id' => $bulletinId]
+    );
+
+    $periods = $computed['periods'] ?? [];
+
+    foreach (($computed['subjects'] ?? []) as $subject) {
+        foreach ($periodCodes as $code) {
+            $cell = $subject['cells'][$code] ?? null;
+
+            // Une branche qui n'a aucune case sur cette période n'est pas
+            // au programme de ce regroupement : l'inscrire à zéro ferait
+            // apparaître une ligne vide sur le document.
+            if ($cell === null) {
+                continue;
+            }
+
+            $period = $periods[$code] ?? null;
+
+            db_query(
+                'INSERT INTO bulletin_lines
+                    (school_id, bulletin_id, curriculum_subject_id,
+                     subject_name, subject_short, subject_order, counts_for_ranking,
+                     domain_code, domain_name, domain_order,
+                     subdomain_name, subdomain_order, max_unit,
+                     period_code, period_name, period_order,
+                     points, max_points, is_absent)
+                 VALUES
+                    (:school_id, :bulletin_id, :subject_id,
+                     :subject_name, :subject_short, :subject_order, :ranking,
+                     :domain_code, :domain_name, :domain_order,
+                     :subdomain_name, :subdomain_order, :max_unit,
+                     :period_code, :period_name, :period_order,
+                     :points, :max_points, :is_absent)',
+                [
+                    'school_id'       => $schoolId,
+                    'bulletin_id'     => $bulletinId,
+                    'subject_id'      => (int) $subject['id'],
+                    'subject_name'    => mb_substr((string) $subject['name'], 0, 150),
+                    'subject_short'   => $subject['short'] !== null
+                        ? mb_substr((string) $subject['short'], 0, 30) : null,
+                    'subject_order'   => (int) $subject['order'],
+                    'ranking'         => !empty($subject['ranking']) ? 1 : 0,
+                    'domain_code'     => $subject['domain'] !== null
+                        ? mb_substr((string) $subject['domain'], 0, 30) : null,
+                    'domain_name'     => $subject['domain_name'] !== null
+                        ? mb_substr((string) $subject['domain_name'], 0, 120) : null,
+                    'domain_order'    => (int) ($subject['domain_order'] ?? 99),
+                    'subdomain_name'  => $subject['subdomain_name'] !== null
+                        ? mb_substr((string) $subject['subdomain_name'], 0, 120) : null,
+                    'subdomain_order' => (int) ($subject['subdomain_order'] ?? 99),
+                    'max_unit'        => number_format((float) ($subject['max_unit'] ?? 0), 2, '.', ''),
+                    'period_code'     => $code,
+                    'period_name'     => mb_substr((string) ($period['name'] ?? $code), 0, 80),
+                    'period_order'    => (int) ($period['order'] ?? 0),
+                    'points'          => $cell['points'] !== null
+                        ? number_format((float) $cell['points'], 2, '.', '') : null,
+                    'max_points'      => number_format((float) $cell['max'], 2, '.', ''),
+                    'is_absent'       => !empty($cell['is_absent']) ? 1 : 0,
+                ]
+            );
+        }
+    }
 }

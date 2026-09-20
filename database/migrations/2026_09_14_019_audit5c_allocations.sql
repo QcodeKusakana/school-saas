@@ -1,0 +1,64 @@
+-- =====================================================================
+--  MIGRATION — Audit 5C : allocations orphelines sur dettes annulees
+--
+--
+--  L'ARGENT POUVAIT ETRE COMPTE DEUX FOIS
+--  --------------------------------------
+--  La phase 5B avait choisi de CONSERVER les allocations d'une dette
+--  annulee, « pour ne pas perdre la trace de ce qui avait ete solde ».
+--  Les lectures les ecartaient (jointure sur sf.is_cancelled = 0), et
+--  l'argent basculait proprement en avance.
+--
+--  Le raisonnement etait faux, et l'audit de la phase 5C l'a montre par
+--  execution :
+--
+--      Frais A 100 USD, Frais B 100 USD, un versement de 100 solde A.
+--      1. on annule A          → l'allocation reste, l'argent devient
+--                                une avance de 100 ;
+--      2. on impute l'avance   → une SECONDE allocation de 100 est
+--                                creee, sur B ;
+--      3. on retablit A        → la premiere allocation redevient
+--                                visible.
+--
+--      Resultat : 200 USD d'allocations pour 100 USD encaisses. La
+--      famille apparait avoir paye le double, et l'avance affichee
+--      devient NEGATIVE.
+--
+--  La correction est applicative : l'annulation d'une dette SUPPRIME
+--  desormais ses allocations. C'est la seule lecture honnete du
+--  modele — une dette annulee n'est plus soldee par rien, et
+--  l'allocation qui la visait n'a plus d'objet. La garder « au cas ou »
+--  est precisement ce qui creait la duplication.
+--
+--  La trace n'est pas perdue : le journal d'audit conserve le detail
+--  des allocations supprimees, avec leur montant et leur dette.
+--
+--
+--  CETTE MIGRATION NETTOIE L'EXISTANT
+--  ----------------------------------
+--  Toute allocation pointant sur une dette annulee est supprimee. Elle
+--  ne comptait deja dans aucun solde ; elle ne pouvait que nuire le
+--  jour ou la dette serait retablie.
+--
+--  AVERTISSEMENT : cette migration SUPPRIME des lignes. Elle ne touche
+--  ni les paiements, ni les dettes, ni aucun montant encaisse. Les
+--  soldes affiches avant et apres sont rigoureusement identiques.
+--
+--
+--  PAS DE START TRANSACTION ICI — ET C'EST VOLONTAIRE
+--  --------------------------------------------------
+--  database/runner.php ouvre lui-meme une transaction pour toute
+--  migration SANS DDL (ni CREATE, ni ALTER, ni DROP). Un COMMIT ecrit
+--  dans le fichier fermerait alors la transaction du runner, dont le
+--  commit final echouerait sur « There is no active transaction ».
+--
+--  Les migrations precedentes creaient des tables : elles sortaient de
+--  ce cas et portaient donc leur propre transaction. Une migration
+--  purement DML doit laisser le runner faire.
+-- =====================================================================
+
+DELETE pa
+  FROM payment_allocations pa
+  JOIN student_fees sf ON sf.id = pa.student_fee_id
+                      AND sf.school_id = pa.school_id
+ WHERE sf.is_cancelled = 1;

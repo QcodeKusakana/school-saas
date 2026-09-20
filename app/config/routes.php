@@ -154,6 +154,7 @@ route('GET',  '/bulletins/parametres',          'bulletins', 'ctrl_bulletins_set
 route('POST', '/bulletins/parametres',          'bulletins', 'ctrl_bulletins_settings',      ['auth', 'school', 'perm:school.edit']);
 
 route('GET',  '/bulletins/{id}',                'bulletins', 'ctrl_bulletins_show',     ['auth', 'school', 'perm:bulletin.generate']);
+route('GET',  '/bulletins/publie/{id}',         'bulletins', 'ctrl_bulletins_published', ['auth', 'school', 'perm:bulletin.generate']);
 route('POST', '/bulletins/{id}/decision',       'bulletins', 'ctrl_bulletins_decide',   ['auth', 'school', 'perm:bulletin.publish']);
 
 // ---------------------------------------------------------------------
@@ -170,24 +171,73 @@ route('POST', '/presences/absence/{id}',        'attendance', 'ctrl_attendance_j
 route('POST', '/presences/registre/{id}/verrou', 'attendance', 'ctrl_attendance_lock',    ['auth', 'school', 'perm:attendance.justify']);
 
 // ---------------------------------------------------------------------
+//  ABONNEMENT — phase 7A
+//
+//  L'école CONSULTE, elle ne change pas d'offre : vendre est le métier
+//  de l'éditeur. `platform.subscription.manage` reste au SUPER_ADMIN.
+// ---------------------------------------------------------------------
+route('GET',  '/abonnement', 'subscriptions', 'ctrl_subscription_show', ['auth', 'school', 'perm:subscription.view']);
+
+// ---------------------------------------------------------------------
+//  PORTAIL DES FAMILLES — phase 6A
+//
+//  CES ROUTES N'EXIGENT AUCUNE PERMISSION, ET C'EST DÉLIBÉRÉ.
+//
+//  Partout ailleurs, une permission ouvre la porte et le périmètre
+//  décide du dossier. Ici, c'est le LIEN DE TUTELLE qui fait les deux :
+//  `portal_is_guardian_of()` est la seule clé.
+//
+//  La conséquence est voulue : aucune permission, si mal accordée
+//  soit-elle par un établissement, ne peut ouvrir le portail sur
+//  l'enfant d'un autre. Un directeur qui a ses propres enfants dans
+//  l'école y accède comme n'importe quel parent — et n'y voit que les
+//  siens.
+// ---------------------------------------------------------------------
+route('GET',  '/espace',                        'portal', 'ctrl_portal_index',    ['auth', 'school']);
+route('GET',  '/espace/enfant/{id}',            'portal', 'ctrl_portal_child',    ['auth', 'school']);
+route('GET',  '/espace/bulletin/{id}',          'portal', 'ctrl_portal_bulletin', ['auth', 'school']);
+
+// Le rattachement d'un compte de connexion à une fiche tuteur : c'est
+// l'école qui agit, depuis le dossier de l'élève. `guardians.user_id`
+// existait depuis la phase 3 sans qu'aucun écran ne le remplisse.
+route('POST', '/eleves/{id}/tuteurs/{guardianId}/acces', 'portal', 'ctrl_portal_guardian_access', ['auth', 'school', 'perm:user.create']);
+route('POST', '/eleves/{id}/acces',                      'portal', 'ctrl_portal_student_access',  ['auth', 'school', 'perm:user.create']);
+
+// RÉGÉNÉRER UN ACCÈS PERDU (audit 6B).
+//
+// Sans cette route, un mot de passe de portail égaré tuait le compte :
+// « mot de passe oublié » exige un courriel qu'un élève n'a pas, et
+// aucun écran de gestion des utilisateurs n'existe encore.
+route('POST', '/eleves/{id}/acces/{kind}/{targetId}/regenerer', 'portal', 'ctrl_portal_reset_access', ['auth', 'school', 'perm:user.reset_password']);
+
+// ---------------------------------------------------------------------
 //  FINANCES — phase 5A : grille tarifaire et dettes
 //
 //  finance.view est accordée à PARENT depuis la phase 1 : la permission
 //  ouvre la porte, le PÉRIMÈTRE appliqué dans chaque contrôleur décide
 //  du dossier. La consultation et l'écriture sont séparées — le
 //  comptable détient fee.manage, le parent jamais.
+//
+//  DEUX PERMISSIONS, PAS UNE (recette finances) :
+//   · `fee.manage` — tenir la GRILLE et l'affecter. Un document
+//     collectif, publié, que toute l'école voit. C'est le travail du
+//     comptable.
+//   · `fee.waive`  — toucher à la dette d'UNE famille : remise,
+//     annulation, rétablissement, réalignement. Rien de cela
+//     n'apparaît dans la grille, et le comptable encaisse aussi.
+//     Direction uniquement, comme payment.cancel et expense.cancel.
 // ---------------------------------------------------------------------
 route('GET',  '/finances',                      'finance', 'ctrl_finance_index',       ['auth', 'school', 'perm:finance.view']);
 route('GET',  '/finances/frais',                'finance', 'ctrl_finance_fees',        ['auth', 'school', 'perm:fee.manage']);
 route('POST', '/finances/frais',                'finance', 'ctrl_finance_fee_save',    ['auth', 'school', 'perm:fee.manage']);
-route('POST', '/finances/frais/{id}/realigner', 'finance', 'ctrl_finance_fee_resync',  ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/frais/{id}/realigner', 'finance', 'ctrl_finance_fee_resync',  ['auth', 'school', 'perm:fee.waive']);
 route('POST', '/finances/affecter',             'finance', 'ctrl_finance_assign',      ['auth', 'school', 'perm:fee.manage']);
-route('POST', '/finances/hors-portee',          'finance', 'ctrl_finance_cancel_out_of_scope', ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/hors-portee',          'finance', 'ctrl_finance_cancel_out_of_scope', ['auth', 'school', 'perm:fee.waive']);
 route('GET',  '/finances/classe/{id}',          'finance', 'ctrl_finance_classroom',   ['auth', 'school', 'perm:finance.view']);
 route('GET',  '/finances/eleve/{id}',           'finance', 'ctrl_finance_student',     ['auth', 'school', 'perm:finance.view']);
-route('POST', '/finances/ligne/{id}/remise',    'finance', 'ctrl_finance_discount',    ['auth', 'school', 'perm:fee.manage']);
-route('POST', '/finances/ligne/{id}/annuler',   'finance', 'ctrl_finance_cancel_line', ['auth', 'school', 'perm:fee.manage']);
-route('POST', '/finances/ligne/{id}/retablir',  'finance', 'ctrl_finance_restore_line', ['auth', 'school', 'perm:fee.manage']);
+route('POST', '/finances/ligne/{id}/remise',    'finance', 'ctrl_finance_discount',    ['auth', 'school', 'perm:fee.waive']);
+route('POST', '/finances/ligne/{id}/annuler',   'finance', 'ctrl_finance_cancel_line', ['auth', 'school', 'perm:fee.waive']);
+route('POST', '/finances/ligne/{id}/retablir',  'finance', 'ctrl_finance_restore_line', ['auth', 'school', 'perm:fee.waive']);
 
 // ---------------------------------------------------------------------
 //  CAISSE — phase 5B
@@ -206,6 +256,27 @@ route('POST', '/finances/eleve/{id}/encaisser', 'finance', 'ctrl_finance_pay',  
 route('GET',  '/finances/recu/{id}',            'finance', 'ctrl_finance_receipt',         ['auth', 'school', 'perm:payment.view']);
 route('POST', '/finances/recu/{id}/annuler',    'finance', 'ctrl_finance_cancel_payment',  ['auth', 'school', 'perm:payment.cancel']);
 route('POST', '/finances/recu/{id}/repartir',   'finance', 'ctrl_finance_reallocate',      ['auth', 'school', 'perm:payment.record']);
+
+// ---------------------------------------------------------------------
+//  RECOUVREMENT — phase 5C
+//
+//  L'état des impayés est un document interne : report.financial, que
+//  PARENT ne détient pas. L'avis de situation, lui, est destiné à la
+//  famille : finance.view suffit, et le périmètre décide du dossier.
+// ---------------------------------------------------------------------
+route('GET',  '/finances/impayes',              'finance', 'ctrl_finance_outstanding',     ['auth', 'school', 'perm:report.financial']);
+route('POST', '/finances/avances',              'finance', 'ctrl_finance_apply_advances',  ['auth', 'school', 'perm:payment.record']);
+route('GET',  '/finances/eleve/{id}/avis',      'finance', 'ctrl_finance_notice',          ['auth', 'school', 'perm:finance.view']);
+
+// ---------------------------------------------------------------------
+//  DÉPENSES — phase 5D
+//
+//  Qui engage la dépense ne l'annule pas : expense.manage appartient au
+//  comptable, expense.cancel à la direction seule.
+// ---------------------------------------------------------------------
+route('GET',  '/finances/depenses',             'finance', 'ctrl_finance_expenses',        ['auth', 'school', 'perm:expense.manage']);
+route('POST', '/finances/depenses',             'finance', 'ctrl_finance_expense_save',    ['auth', 'school', 'perm:expense.manage']);
+route('POST', '/finances/depenses/{id}/annuler','finance', 'ctrl_finance_expense_cancel',  ['auth', 'school', 'perm:expense.cancel']);
 
 // ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :

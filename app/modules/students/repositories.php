@@ -91,6 +91,26 @@ function students_scope_clause(?int $yearId = null): array
         $params['scope_user']   = $userId;
     }
 
+    // --- Élève : LUI-MÊME, et personne d'autre (phase 6B) --------------
+    //
+    // Le rôle ELEVE existait depuis la phase 1 sans qu'aucun périmètre ne
+    // lui corresponde : un compte élève tombait sur `1 = 0` et ne voyait
+    // rien. La branche ci-dessous le relie à son propre dossier.
+    //
+    // Elle est volontairement la plus étroite du fichier : un élève n'est
+    // ni tuteur ni enseignant, et ne doit jamais voir un camarade — pas
+    // même de sa classe, pas même son propre frère (c'est au tuteur que
+    // revient cette vue).
+    if (db_exists(
+        'SELECT 1 FROM students
+          WHERE school_id = :school_id AND user_id = :user_id AND deleted_at IS NULL
+          LIMIT 1',
+        ['school_id' => $schoolId, 'user_id' => $userId]
+    )) {
+        $conditions[]         = 's.user_id = :scope_self';
+        $params['scope_self'] = $userId;
+    }
+
     // --- Enseignant : les élèves de ses classes ------------------------
     //
     // Le périmètre est calculé à partir de teacher_subjects et de

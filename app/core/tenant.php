@@ -63,8 +63,11 @@ const TENANT_TABLES = [
     'orientations',
     'student_history',
 
-    // Résultats figés des bulletins (phase 4C).
+    // Résultats figés des bulletins (phase 4C) et leur détail figé
+    // (phase 6A) : le bulletin remis à une famille est une pièce, il ne
+    // se recalcule pas.
     'bulletins',
+    'bulletin_lines',
 
     // Journal d'audit : school_id vaut NULL pour les actions de la
     // plateforme, et l'identifiant de l'école pour toutes les autres.
@@ -106,6 +109,10 @@ const TENANT_TABLES = [
     // des tables, même règle.
     'payment_allocations',
     'receipt_counters',
+
+    // Phase 5D — dépenses. `expenses` était déclarée d'avance ; le
+    // compteur des bons de sortie est ajouté à la création de la table.
+    'expense_counters',
 ];
 
 /**
@@ -113,6 +120,9 @@ const TENANT_TABLES = [
  * Elles décrivent le produit ou le système éducatif national.
  */
 const GLOBAL_TABLES = [
+    // Référentiel des postes de dépense, partagé par toutes les écoles
+    // au même titre que les niveaux scolaires (phase 5D).
+    'expense_categories',
     'schools',
     'plans',
     'permissions',
@@ -234,56 +244,202 @@ function tenant_context(string $action, ?int $value = null): ?int
 // ---------------------------------------------------------------------
 
 /**
- * Vérifie qu'une requête touchant une table multi-école filtre bien
- * sur school_id.
+ * Vérifie qu'une requête touchant une table multi-école LIE bien
+ * school_id — et non qu'elle le mentionne.
  *
- * Analyse volontairement simple et rapide (pas d'analyseur SQL complet) :
- * on extrait les tables citées après FROM / JOIN / INTO / UPDATE, et on
- * vérifie la présence du mot school_id dans la requête.
+ * POURQUOI « LIER » ET NON « MENTIONNER »
+ * =======================================
+ * Ce contrôle était `preg_match('/\bschool_id\b/i', $sql)`. Trois
+ * requêtes le franchissaient, démontrées par exécution avant la
+ * phase 7B :
  *
- * Faux positifs possibles (requête légitime sans school_id) : passer
- * true en 3ème argument de db_query(), avec un commentaire justifiant
- * pourquoi la requête est volontairement inter-écoles.
+ *   SELECT school_id, COUNT(*) FROM students GROUP BY school_id
+ *     → 124 élèves de TOUTES les écoles, sans une alerte.
+ *   SELECT COUNT(*) FROM students -- school_id
+ *     → le mot suffisait, même en commentaire.
+ *   SELECT COUNT(*) FROM students WHERE 'school_id' <> ''
+ *     → même dans une chaîne littérale.
+ *
+ * La première n'est pas un cas d'école : c'est exactement la forme d'un
+ * tableau de bord éditeur — et exactement celle d'une fuite. Un
+ * garde-fou qui ne distingue pas les deux ne garde rien.
+ *
+ * Ce qui compte n'est donc pas la présence du mot, mais qu'il occupe
+ * une position LIANTE :
+ *
+ *   · un prédicat      → school_id = / <> / < / IN / IS / BETWEEN …
+ *   · une jointure     → USING (school_id)
+ *   · une affectation  → INSERT (… school_id …) / SET school_id =
+ *
+ * Un placeholder (`:school_id`) ne lie rien : il ne compte pas.
+ *
+ * L'analyse reste volontairement sans analyseur SQL complet — pas de
+ * dépendance sur un hébergement cPanel — mais elle travaille sur une
+ * requête débarrassée de ses commentaires et de ses littéraux.
+ *
+ * REQUÊTES VOLONTAIREMENT INTER-ÉCOLES
+ * ------------------------------------
+ * Elles existent : la console de l'éditeur doit lire toutes les écoles.
+ * Elles passent par `platform_scope()` (app/core/platform.php), qui
+ * exige d'abord une habilitation plateforme. Le troisième argument de
+ * `db_query()` ne suffit plus à lui seul : voir
+ * `tenant_guard_unscoped()`.
  */
 function tenant_guard(string $sql): void
 {
-    $tables = tenant_extract_tables($sql);
-
-    if ($tables === []) {
-        return;
-    }
-
-    $scoped = array_intersect($tables, TENANT_TABLES);
+    $scoped = tenant_guard_scoped_tables($sql);
 
     if ($scoped === []) {
         return;
     }
 
-    // La requête mentionne-t-elle school_id d'une manière ou d'une autre ?
-    if (preg_match('/\bschool_id\b/i', $sql)) {
+    if (tenant_sql_binds_school(tenant_sql_strip($sql))) {
         return;
     }
 
-    $message = sprintf(
-        'Requête sur une table multi-école sans filtre school_id : %s',
-        implode(', ', $scoped)
+    // Le libellé « sans filtre school_id » est un CONTRAT : onze suites
+    // de tests l'assertent pour prouver que le garde-fou mord encore.
+    // Le préciser est utile, le remplacer casserait la preuve.
+    tenant_guard_refuse(
+        sprintf(
+            'Requête sur une table multi-école sans filtre school_id '
+            . '(le mot doit être LIÉ à une valeur, pas seulement mentionné) : %s',
+            implode(', ', $scoped)
+        ),
+        $sql,
+        "Si la requête est volontairement inter-écoles, l'ouvrir dans "
+        . "platform_scope(...) — voir app/core/platform.php. Mentionner "
+        . "school_id sans le lier ne suffit pas."
     );
+}
 
+/**
+ * Contrôle des requêtes déclarées « sans filtre école ».
+ *
+ * `db_query($sql, $params, true)` servait d'échappatoire sur l'honneur :
+ * rien ne distinguait une lecture légitime d'une table globale (`plans`,
+ * `education_levels`) d'une fuite inter-écoles sur `students`.
+ *
+ * Désormais l'échappatoire ne couvre que ce qu'elle était censée
+ * couvrir. Toucher une table multi-école SANS lier school_id exige un
+ * périmètre plateforme ouvert — donc une habilitation vérifiée.
+ */
+function tenant_guard_unscoped(string $sql): void
+{
+    $scoped = tenant_guard_scoped_tables($sql);
+
+    if ($scoped === []) {
+        return;   // tables globales : c'est l'usage prévu du drapeau
+    }
+
+    if (tenant_sql_binds_school(tenant_sql_strip($sql))) {
+        return;   // le filtre est là malgré le drapeau : rien à dire
+    }
+
+    if (function_exists('platform_scope_is_open') && platform_scope_is_open()) {
+        return;   // console éditeur : lecture transversale assumée
+    }
+
+    tenant_guard_refuse(
+        sprintf(
+            'Lecture inter-écoles hors périmètre plateforme : %s',
+            implode(', ', $scoped)
+        ),
+        $sql,
+        "Une requête transversale doit être ouverte dans platform_scope(...), "
+        . "qui vérifie l'habilitation de l'appelant. Le drapeau "
+        . "db_query(\$sql, \$params, true) ne couvre que les tables globales."
+    );
+}
+
+/** Les tables multi-écoles citées par une requête. */
+function tenant_guard_scoped_tables(string $sql): array
+{
+    $tables = tenant_extract_tables($sql);
+
+    if ($tables === []) {
+        return [];
+    }
+
+    return array_values(array_intersect($tables, TENANT_TABLES));
+}
+
+/**
+ * Refus commun aux deux gardes.
+ *
+ * En développement on casse : l'oubli doit être corrigé avant la
+ * production. En production on ne renvoie pas l'utilisateur sur une page
+ * d'erreur, mais l'incident est tracé en ERROR pour être traité.
+ */
+function tenant_guard_refuse(string $message, string $sql, string $hint): void
+{
     log_error('[TENANT GUARD] ' . $message, ['sql' => $sql]);
 
     if (config('app.debug')) {
-        // En développement : on casse immédiatement pour que l'oubli
-        // soit corrigé avant d'atteindre la production.
         throw new RuntimeException(
-            $message . "\n\nRequête : " . $sql
-            . "\n\nSi la requête est volontairement inter-écoles, appeler "
-            . "db_query(\$sql, \$params, true) et justifier par un commentaire."
+            $message . "\n\nRequête : " . $sql . "\n\n" . $hint
         );
     }
+}
 
-    // En production : on ne bloque pas l'utilisateur, mais l'incident est
-    // tracé en erreur pour être traité. Adapter selon votre tolérance :
-    // lever ici aussi est plus sûr, au prix d'une page d'erreur.
+/**
+ * Retire d'une requête ce qui peut contenir le mot « school_id » sans
+ * rien lier : littéraux et commentaires.
+ *
+ * Les littéraux partent en premier : un commentaire peut vivre dans une
+ * chaîne, et l'inverse aussi.
+ */
+function tenant_sql_strip(string $sql): string
+{
+    $clean = preg_replace("/'(?:[^'\\\\]|\\\\.)*'/", "''", $sql) ?? $sql;
+    $clean = preg_replace('/"(?:[^"\\\\]|\\\\.)*"/', '""', $clean) ?? $clean;
+
+    return preg_replace('/--[^\n]*|#[^\n]*|\/\*.*?\*\//s', ' ', $clean) ?? $clean;
+}
+
+/**
+ * school_id occupe-t-il une position LIANTE dans cette requête ?
+ *
+ * Trois positions comptent, et elles seules :
+ *
+ *   1. PRÉDICAT — `s.school_id = :x`, `school_id IN (…)`,
+ *      `school_id IS NOT NULL`, `school_id BETWEEN …`
+ *   2. JOINTURE — `USING (school_id)`
+ *   3. AFFECTATION — la colonne figure dans la liste d'un INSERT, ou
+ *      dans un `SET school_id = …`
+ *
+ * Un `:school_id` est écarté : un placeholder est une valeur, pas une
+ * colonne. Sans cette exclusion, `WHERE id = :school_id` sur une table
+ * multi-école passerait pour filtrée.
+ *
+ * Le contrôle est volontairement PERMISSIF sur la forme et STRICT sur la
+ * nature : mieux vaut accepter une jointure exotique bien écrite que
+ * refuser du code juste — un garde-fou qui crie à tort finit désactivé.
+ */
+function tenant_sql_binds_school(string $clean): bool
+{
+    // 1. Prédicat : la colonne, non précédée de « : », suivie d'un
+    //    opérateur de comparaison ou d'appartenance.
+    if (preg_match(
+        '/(?<![:\w])(?:`?\w+`?\s*\.\s*)?`?school_id`?\s*(?:=|<|>|!=|<>|<=|>=|\b(?:IN|IS|BETWEEN|LIKE)\b)/i',
+        $clean
+    )) {
+        return true;
+    }
+
+    // 2. Jointure naturelle explicite.
+    if (preg_match('/\bUSING\s*\(\s*`?school_id`?/i', $clean)) {
+        return true;
+    }
+
+    // 3. Affectation : SET school_id = …  (déjà couvert par le prédicat,
+    //    gardé pour la lisibilité de l'intention) ou colonne insérée.
+    if (preg_match('/\bINSERT\b.*?\(([^)]*)\)/is', $clean, $m)
+        && preg_match('/(?<![:\w])`?school_id`?/i', $m[1])) {
+        return true;
+    }
+
+    return false;
 }
 
 /**

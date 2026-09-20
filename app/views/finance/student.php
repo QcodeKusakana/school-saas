@@ -17,7 +17,12 @@ declare(strict_types=1);
 
 set_title('Situation financière');
 
-$manage = can('fee.manage');
+// Toucher à la dette d'UNE famille — remise, annulation, rétablissement
+// — relève de `fee.waive`, réservée à la direction. Le comptable tient
+// la grille (`fee.manage`) mais n'efface pas ce qu'on lui doit : il
+// encaisse aussi. Un bouton qui mènerait à un 403 serait une promesse
+// trompeuse, donc la colonne entière disparaît.
+$manage = can('fee.waive');
 ?>
 
 <div class="page-head">

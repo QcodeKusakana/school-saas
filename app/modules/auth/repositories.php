@@ -21,7 +21,7 @@ function auth_repo_find_by_identifier(string $identifier): ?array
     // Deux paramètres distincts pour une même valeur : voir la note dans
     // auth_attempt() — les requêtes préparées natives interdisent la
     // réutilisation d'un paramètre nommé.
-    return db_one(
+    return tenant_scope_identity(static fn (): ?array => db_one(
         'SELECT id, school_id, username, email, status, first_name, last_name
            FROM users
           WHERE (username = :username OR email = :email)
@@ -29,23 +29,23 @@ function auth_repo_find_by_identifier(string $identifier): ?array
           LIMIT 1',
         ['username' => $identifier, 'email' => $identifier],
         true
-    );
+    ));
 }
 
 /** Recherche un compte par identifiant technique. */
 function auth_repo_find_by_id(int $userId): ?array
 {
-    return db_one(
+    return tenant_scope_identity(static fn (): ?array => db_one(
         'SELECT * FROM users WHERE id = :id AND deleted_at IS NULL LIMIT 1',
         ['id' => $userId],
         true
-    );
+    ));
 }
 
 /** Met à jour le mot de passe et l'horodatage associé. */
 function auth_repo_update_password(int $userId, string $hash, bool $mustChange): int
 {
-    return db_query(
+    return tenant_scope_identity(static fn (): int => db_query(
         'UPDATE users
             SET password_hash = :hash,
                 password_changed_at = :now,
@@ -60,7 +60,7 @@ function auth_repo_update_password(int $userId, string $hash, bool $mustChange):
             'id'          => $userId,
         ],
         true
-    )->rowCount();
+    )->rowCount());
 }
 
 // ---------------------------------------------------------------------

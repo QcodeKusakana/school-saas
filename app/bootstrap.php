@@ -69,6 +69,12 @@ require APP_PATH . '/core/audit.php';
 require APP_PATH . '/core/auth.php';
 require APP_PATH . '/core/permission.php';
 
+// Chargé APRÈS auth.php et permission.php : platform_require() s'appuie
+// sur auth_user() et can(). Le garde-fou de tenant.php, lui, teste
+// l'existence de platform_scope_is_open() avant de l'appeler — il doit
+// pouvoir travailler même si ce fichier n'est pas encore chargé.
+require APP_PATH . '/core/platform.php';
+
 // ---------------------------------------------------------------------
 // Vérification des répertoires inscriptibles
 // Détecté au démarrage plutôt qu'au premier échec d'écriture, souvent

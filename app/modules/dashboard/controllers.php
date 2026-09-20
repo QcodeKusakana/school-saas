@@ -16,15 +16,31 @@ function ctrl_dashboard_index(): void
 
     // Un super administrateur plateforme n'a pas de tableau de bord école.
     if ($user['school_id'] === null) {
-        view('dashboard/platform', [
-            'schools_total'  => (int) db_value('SELECT COUNT(*) FROM schools WHERE deleted_at IS NULL', [], true),
+        // LE COMPTE DES UTILISATEURS EST UNE LECTURE TRANSVERSALE.
+        //
+        // `schools` est une table globale, mais `users` ne l'est pas :
+        // ce COUNT traverse tous les établissements. Un `if` sur
+        // school_id === null le restreignait déjà de fait ; il le
+        // déclare désormais, et l'habilitation est vérifiée.
+        $stats = platform_scope('platform.school.view', static fn (): array => [
+            'schools_total'  => (int) db_value(
+                'SELECT COUNT(*) FROM schools WHERE deleted_at IS NULL',
+                [],
+                true
+            ),
             'schools_active' => (int) db_value(
                 'SELECT COUNT(*) FROM schools WHERE status = :s AND deleted_at IS NULL',
                 ['s' => 'active'],
                 true
             ),
-            'users_total'    => (int) db_value('SELECT COUNT(*) FROM users WHERE deleted_at IS NULL', [], true),
-        ], 'app');
+            'users_total'    => (int) db_value(
+                'SELECT COUNT(*) FROM users WHERE deleted_at IS NULL',
+                [],
+                true
+            ),
+        ]);
+
+        view('dashboard/platform', $stats, 'app');
 
         return;
     }

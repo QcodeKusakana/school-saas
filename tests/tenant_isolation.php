@@ -100,14 +100,74 @@ try {
 }
 check('Requête AVEC school_id : autorisée', $allowed);
 
-// --- 7. Le contournement explicite reste possible ---------------------
+// --- 7. Le 3e argument ne suffit plus sur une table multi-école -------
+//
+// AVANT, ce test vérifiait l'inverse : le drapeau autorisait tout. Il
+// était donc une échappatoire sur l'honneur, indistinguable d'une fuite.
+// Désormais il ne couvre que les tables globales ; une lecture
+// transversale exige un périmètre plateforme.
 $bypass = true;
 try {
     db_all('SELECT COUNT(*) FROM academic_years', [], true);
 } catch (RuntimeException) {
     $bypass = false;
 }
-check('Contournement explicite (3e argument) : autorisé', $bypass);
+check('Le 3e argument seul NE suffit PAS sur une table multi-école', !$bypass);
+
+// --- 7b. Le périmètre plateforme, lui, l'autorise ---------------------
+$inScope = true;
+try {
+    platform_scope_cli(static function (): void {
+        db_all('SELECT COUNT(*) FROM academic_years', [], true);
+    });
+} catch (RuntimeException) {
+    $inScope = false;
+}
+check('Dans un périmètre plateforme : autorisé', $inScope);
+
+// --- 7c. Et il se referme derrière lui, même sur exception ------------
+try {
+    platform_scope_cli(static function (): void {
+        throw new RuntimeException('panne au milieu du tableau de bord');
+    });
+} catch (RuntimeException) {
+    // attendu
+}
+
+$closedAfter = true;
+try {
+    db_all('SELECT COUNT(*) FROM academic_years', [], true);
+    $closedAfter = false;   // ✗ le périmètre est resté ouvert
+} catch (RuntimeException) {
+    // attendu : la porte s'est refermée
+}
+check('Le périmètre se referme même quand la lecture échoue', $closedAfter);
+
+// --- 7d. Mentionner school_id sans le LIER ne passe pas ---------------
+//
+// C'est la forme exacte d'un tableau de bord éditeur — et d'une fuite.
+// Démontrée par exécution avant la phase 7B : elle rendait les élèves
+// de toutes les écoles sans une alerte.
+foreach ([
+    'colonne seulement sélectionnée'
+        => 'SELECT school_id, COUNT(*) FROM students GROUP BY school_id',
+    'mot dans un commentaire'
+        => 'SELECT COUNT(*) FROM students /* school_id */',
+    'mot dans une chaîne'
+        => "SELECT COUNT(*) FROM students WHERE 'school_id' <> ''",
+    'placeholder pris pour un filtre'
+        => 'SELECT COUNT(*) FROM students WHERE id = :school_id',
+] as $label => $sql) {
+    $refused = false;
+
+    try {
+        db_all($sql, str_contains($sql, ':school_id') ? ['school_id' => 1] : []);
+    } catch (RuntimeException) {
+        $refused = true;
+    }
+
+    check("Refusé — {$label}", $refused);
+}
 
 // --- 8. Une table globale n'est pas concernée -------------------------
 $global = true;

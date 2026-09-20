@@ -157,7 +157,10 @@ function perm_can_manage_user(int $targetUserId): bool
         return false;
     }
 
-    $target = db_one(
+    // Lecture d'identité : on cherche à quelle école appartient la CIBLE,
+    // précisément pour vérifier ensuite qu'elle est bien dans la nôtre.
+    // Filtrer sur school_id avant de le savoir serait circulaire.
+    $target = tenant_scope_identity(static fn (): ?array => db_one(
         'SELECT u.school_id, COALESCE(MAX(r.level), 0) AS level
            FROM users u
            LEFT JOIN user_roles ur ON ur.user_id = u.id
@@ -166,7 +169,7 @@ function perm_can_manage_user(int $targetUserId): bool
           GROUP BY u.id, u.school_id',
         ['id' => $targetUserId],
         true
-    );
+    ));
 
     if ($target === null) {
         return false;

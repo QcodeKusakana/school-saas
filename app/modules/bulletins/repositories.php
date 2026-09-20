@@ -122,3 +122,128 @@ function bulletins_repo_header(int $enrollmentId): ?array
         ['school_id' => tenant_require(), 'enrollment_id' => $enrollmentId]
     );
 }
+
+// =====================================================================
+//  LE DOCUMENT PUBLIÉ (phase 6A)
+//
+//  Ces fonctions ne lisent QUE du figé. Aucune ne touche aux cotes
+//  vivantes : c'est ce qui permet de remettre à une famille, des mois
+//  plus tard, exactement le document qu'elle a reçu.
+// =====================================================================
+
+/** Un bulletin publié, avec l'élève et la classe — null si inconnu. */
+function bulletins_repo_published(int $bulletinId): ?array
+{
+    return db_one(
+        'SELECT b.*,
+                e.student_id, e.academic_year_id, e.classroom_id,
+                s.matricule, s.last_name, s.post_name, s.first_name,
+                s.gender, s.birth_date, s.birth_place,
+                c.name AS classroom_name,
+                y.code AS year_code, y.name AS year_name,
+                u.last_name AS publisher_last_name, u.first_name AS publisher_first_name
+           FROM bulletins b
+           JOIN enrollments e ON e.id = b.enrollment_id AND e.school_id = b.school_id
+           JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
+      LEFT JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
+      LEFT JOIN academic_years y ON y.id = e.academic_year_id AND y.school_id = e.school_id
+      LEFT JOIN users u ON u.id = b.published_by
+          WHERE b.id = :id AND b.school_id = :school_id',
+        ['id' => $bulletinId, 'school_id' => tenant_require()]
+    );
+}
+
+/**
+ * Le détail figé d'un bulletin, remis dans la forme d'un relevé.
+ *
+ * MÊME FORME QU'UN RELEVÉ CALCULÉ
+ * -------------------------------
+ * Le retour reprend la structure de bulletins_service_compute() —
+ * `periods` et `subjects[…]['cells']` — pour qu'un même gabarit puisse
+ * afficher l'un ou l'autre. Deux structures pour un seul document
+ * finiraient par diverger, et c'est précisément sur cette divergence
+ * que le défaut du détail non figé était né.
+ *
+ * @return array{periods: array<string,array>, subjects: array<int,array>}
+ */
+function bulletins_repo_lines(int $bulletinId): array
+{
+    $rows = db_all(
+        'SELECT * FROM bulletin_lines
+          WHERE school_id = :school_id AND bulletin_id = :bulletin_id
+          ORDER BY domain_order, subdomain_order, subject_order, subject_name, period_order',
+        ['school_id' => tenant_require(), 'bulletin_id' => $bulletinId]
+    );
+
+    $periods  = [];
+    $subjects = [];
+
+    foreach ($rows as $row) {
+        $code = (string) $row['period_code'];
+
+        $periods[$code] ??= [
+            'code'  => $code,
+            'name'  => (string) $row['period_name'],
+            'order' => (int) $row['period_order'],
+        ];
+
+        // Une branche retirée du programme garde ses lignes : la clé
+        // retombe donc sur le libellé figé plutôt que sur un identifiant
+        // qui peut être NULL.
+        $key = $row['curriculum_subject_id'] !== null
+            ? 'cs' . (int) $row['curriculum_subject_id']
+            : 'nom' . md5((string) $row['subject_name']);
+
+        $subjects[$key] ??= [
+            'id'              => $row['curriculum_subject_id'] !== null
+                ? (int) $row['curriculum_subject_id'] : null,
+            'name'            => (string) $row['subject_name'],
+            'short'           => $row['subject_short'],
+            'order'           => (int) $row['subject_order'],
+            'ranking'         => (int) $row['counts_for_ranking'] === 1,
+            'domain'          => $row['domain_code'],
+            'domain_name'     => $row['domain_name'],
+            'domain_order'    => (int) $row['domain_order'],
+            'subdomain_name'  => $row['subdomain_name'],
+            'subdomain_order' => (int) $row['subdomain_order'],
+            'max_unit'        => (float) $row['max_unit'],
+            'cells'           => [],
+        ];
+
+        $subjects[$key]['cells'][$code] = [
+            'points'    => $row['points'] !== null ? (float) $row['points'] : null,
+            'max'       => (float) $row['max_points'],
+            'is_absent' => (int) $row['is_absent'] === 1,
+        ];
+    }
+
+    uasort($periods, static fn (array $a, array $b): int => $a['order'] <=> $b['order']);
+
+    return ['periods' => $periods, 'subjects' => $subjects];
+}
+
+/**
+ * Les bulletins publiés d'un élève, du plus récent au plus ancien.
+ *
+ * L'ordre d'affichage suit celui des regroupements, pas la date de
+ * publication : republier le premier semestre en mars ne doit pas le
+ * faire passer devant le second.
+ */
+function bulletins_repo_published_for_student(int $studentId): array
+{
+    return db_all(
+        'SELECT b.id, b.period_key, b.percentage, b.total_points, b.max_points,
+                b.class_rank, b.class_size, b.decision, b.published_at,
+                b.absent_count, b.missing_grades,
+                e.academic_year_id,
+                c.name AS classroom_name,
+                y.code AS year_code
+           FROM bulletins b
+           JOIN enrollments e ON e.id = b.enrollment_id AND e.school_id = b.school_id
+      LEFT JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
+      LEFT JOIN academic_years y ON y.id = e.academic_year_id AND y.school_id = e.school_id
+          WHERE b.school_id = :school_id AND e.student_id = :student_id
+          ORDER BY y.starts_on DESC, b.period_key',
+        ['school_id' => tenant_require(), 'student_id' => $studentId]
+    );
+}

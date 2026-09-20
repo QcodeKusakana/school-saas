@@ -432,7 +432,11 @@ function demo_user(
     string $gender,
     string $roleCode
 ): int {
-    $existing = db_one('SELECT id FROM users WHERE username = :u', ['u' => $username], true);
+    // `users.username` est unique pour tout le produit : la recherche
+    // est nécessairement transversale. Lecture d'identité.
+    $existing = tenant_scope_identity(static fn (): ?array => db_one(
+        'SELECT id FROM users WHERE username = :u', ['u' => $username], true
+    ));
 
     if ($existing !== null) {
         echo "  → Compte déjà présent : {$username}\n";

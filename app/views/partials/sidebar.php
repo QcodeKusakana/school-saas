@@ -11,6 +11,11 @@
  */
 declare(strict_types=1);
 
+// Le portail des familles est proposé sur chaque page : son dépôt doit
+// donc être chargé ici, et pas seulement quand une route /espace est
+// appelée. Le routeur ne charge un module que lorsqu'il le dispatche.
+require_once APP_PATH . '/modules/portal/repositories.php';
+
 $isPlatform = $user['school_id'] === null;
 ?>
 <aside class="app-sidebar" data-sidebar>
@@ -34,6 +39,22 @@ $isPlatform = $user['school_id'] === null;
         <a class="nav-item <?= nav_active('/tableau-de-bord') ?>" href="<?= e(url('/tableau-de-bord')) ?>">
             <i class="bi bi-grid-1x2"></i><span>Tableau de bord</span>
         </a>
+
+        <?php
+        // MON ESPACE — le portail des familles (phase 6A).
+        //
+        // L'entrée n'est PAS conditionnée par une permission mais par le
+        // lien de tutelle : c'est la même clé que les routes. Un directeur
+        // qui a ses enfants dans l'école la voit ; un enseignant qui n'a
+        // pas d'enfant inscrit ne la voit pas.
+        //
+        // La requête ne tourne que pour un compte rattaché à une école.
+        ?>
+        <?php if (!$isPlatform && route_exists('/espace') && portal_has_children()): ?>
+            <a class="nav-item <?= nav_active('/espace') ?>" href="<?= e(url('/espace')) ?>">
+                <i class="bi bi-house-heart"></i><span>Mon espace</span>
+            </a>
+        <?php endif; ?>
 
         <?php if ($isPlatform): ?>
 
@@ -98,6 +119,16 @@ $isPlatform = $user['school_id'] === null;
                         <i class="bi bi-list-columns"></i><span>Grille tarifaire</span>
                     </a>
                 <?php endif; ?>
+                <?php if (can('report.financial') && route_exists('/finances/impayes')): ?>
+                    <a class="nav-item <?= nav_active('/finances/impayes') ?>" href="<?= e(url('/finances/impayes')) ?>">
+                        <i class="bi bi-exclamation-diamond"></i><span>Impayés</span>
+                    </a>
+                <?php endif; ?>
+                <?php if (can('expense.manage') && route_exists('/finances/depenses')): ?>
+                    <a class="nav-item <?= nav_active('/finances/depenses') ?>" href="<?= e(url('/finances/depenses')) ?>">
+                        <i class="bi bi-arrow-down-circle"></i><span>Dépenses</span>
+                    </a>
+                <?php endif; ?>
                 <?php if (can('report.financial') && route_exists('/finances/journal')): ?>
                     <a class="nav-item <?= nav_active('/finances/journal') ?>" href="<?= e(url('/finances/journal')) ?>">
                         <i class="bi bi-journal-text"></i><span>Journal de caisse</span>
@@ -105,7 +136,7 @@ $isPlatform = $user['school_id'] === null;
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view'])): ?>
+            <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
                 <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
@@ -129,6 +160,12 @@ $isPlatform = $user['school_id'] === null;
                 <?php if (can('school.edit') && route_exists('/ecole/parametres')): ?>
                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
                         <i class="bi bi-gear"></i><span>Mon établissement</span>
+                    </a>
+                <?php endif; ?>
+
+                <?php if (can('subscription.view') && route_exists('/abonnement')): ?>
+                    <a class="nav-item <?= nav_active('/abonnement') ?>" href="<?= e(url('/abonnement')) ?>">
+                        <i class="bi bi-patch-check"></i><span>Mon abonnement</span>
                     </a>
                 <?php endif; ?>
             <?php endif; ?>

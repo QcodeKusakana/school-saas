@@ -68,7 +68,16 @@ function db(): PDO
  */
 function db_query(string $sql, array $params = [], bool $skipTenantGuard = false): PDOStatement
 {
-    if (!$skipTenantGuard) {
+    // DEUX GARDES, PAS UN SEUL.
+    //
+    // Le drapeau ne fait plus taire le contrôle, il change la question
+    // posée : « cette requête filtre-t-elle l'école ? » devient « cette
+    // requête a-t-elle le DROIT de ne pas la filtrer ? ». Sans cela,
+    // `true` était une échappatoire sur l'honneur, indistinguable d'une
+    // fuite inter-écoles. Voir app/core/tenant.php.
+    if ($skipTenantGuard) {
+        tenant_guard_unscoped($sql);
+    } else {
         tenant_guard($sql);
     }
 

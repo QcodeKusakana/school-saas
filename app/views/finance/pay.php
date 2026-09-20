@@ -154,6 +154,8 @@ $open = array_values(array_filter(
                 <form method="post" id="encaissement"
                       action="<?= e(url('/finances/eleve/' . (int) $enrollment['id'] . '/encaisser')) ?>">
                     <?= csrf_field() ?>
+                    <?php /* Un billet, un reçu : le double clic est refusé. */ ?>
+                    <?= form_nonce_field('finance.pay') ?>
 
                     <div class="mb-3">
                         <label class="form-label" for="p-date">Date</label>

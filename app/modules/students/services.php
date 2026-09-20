@@ -169,6 +169,24 @@ function students_service_enroll_new(array $data, int $yearId, ?int $classroomId
         ];
     }
 
+    // LA LIMITE DE L'ABONNEMENT (phase 7A).
+    //
+    // Posée AVANT toute écriture : refuser après avoir créé l'élève
+    // laisserait un dossier orphelin, et l'école croirait l'inscription
+    // faite. Le message nomme l'offre, le plafond et l'effectif — un
+    // refus qui n'explique pas est un refus qu'on ne peut pas corriger.
+    //
+    // Le refus ne porte que sur la CRÉATION : les dossiers existants
+    // restent entiers et consultables. Retenir les données d'une école
+    // pour la contraindre à payer serait une prise d'otage.
+    require_once APP_PATH . '/modules/subscriptions/services.php';
+
+    $quota = subscription_can_add_student($yearId);
+
+    if (!$quota['ok']) {
+        return ['ok' => false, 'id' => null, 'matricule' => null, 'message' => $quota['message']];
+    }
+
     // La classe, si fournie, doit appartenir à l'école ET à l'année.
     if ($classroomId !== null) {
         $classroom = tenant_one(
@@ -308,6 +326,23 @@ function students_service_re_enroll(int $studentId, int $yearId, ?int $classroom
 
     if (in_array($year['status'], ['closed', 'archived'], true)) {
         return ['ok' => false, 'id' => null, 'message' => 'Cette année scolaire est clôturée.'];
+    }
+
+    // LA LIMITE VAUT AUSSI À LA RÉINSCRIPTION (phase 7A).
+    //
+    // Sans ce contrôle, une école de 700 élèves passée sur une offre à
+    // 600 les réinscrirait tous à la rentrée suivante : la limite ne
+    // s'appliquerait qu'aux nouveaux, donc quasiment jamais.
+    //
+    // La mesure porte sur l'année VISÉE, pas sur l'année courante : une
+    // rentrée préparée en août, avant que la nouvelle année ne devienne
+    // courante, échapperait sinon entièrement au plafond.
+    require_once APP_PATH . '/modules/subscriptions/services.php';
+
+    $quota = subscription_can_add_student($yearId);
+
+    if (!$quota['ok']) {
+        return ['ok' => false, 'id' => null, 'message' => $quota['message']];
     }
 
     // La contrainte uq_enrollment_student_year l'empêcherait de toute

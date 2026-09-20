@@ -20,6 +20,19 @@
  *  · aucune dette ne se sur-paie, aucun solde ne devient négatif ;
  *  · annuler une dette payée ne fait pas DISPARAÎTRE l'argent.
  *
+ * Phase 5C — le recouvrement
+ *  · le retard se mesure ÉCHÉANCE PAR ÉCHÉANCE, jamais sur le solde ;
+ *  · une dette d'élève parti reste une créance, retrouvable ;
+ *  · une famille dont l'école détient déjà l'argent n'est pas relancée ;
+ *  · un versement n'est JAMAIS imputé deux fois — même après une
+ *    annulation de dette suivie d'un rétablissement.
+ *
+ * Phase 5D — les dépenses
+ *  · une dépense sans bénéficiaire nommé est refusée ;
+ *  · un bon de sortie annulé garde son numéro à jamais ;
+ *  · la caisse compte la monnaie REMISE, pas celle créditée ;
+ *  · qui engage la dépense ne l'annule pas.
+ *
  * Usage : php tests/finance_isolation.php
  */
 declare(strict_types=1);
@@ -28,6 +41,7 @@ require dirname(__DIR__) . '/app/bootstrap.php';
 require APP_PATH . '/modules/curriculum/services.php';
 require APP_PATH . '/modules/students/services.php';
 require APP_PATH . '/modules/finance/services.php';
+require_once APP_PATH . '/modules/finance/controllers.php';
 require_once APP_PATH . '/modules/students/repositories.php';
 
 $pass = 0;
@@ -95,9 +109,20 @@ try {
     tenant_set($schoolId);
     school_settings_all(true);
 
+    // LES EXERCICES SONT CALÉS SUR LA DATE RÉELLE.
+    //
+    // Les encaissements de cette suite sont datés d'aujourd'hui, parce
+    // qu'un versement postdaté est refusé depuis la phase 5B. Un
+    // exercice figé en 2095 rendait donc ces tests irréalistes : aucune
+    // école ne reçoit en 2026 l'argent d'une année scolaire 2095.
+    // L'audit 5D, qui exige désormais qu'une opération soit datée dans
+    // la fenêtre de son exercice, l'a mis en évidence.
+    $yearStart = date('Y-m-d', strtotime('-30 days'));
+    $yearEnd   = date('Y-m-d', strtotime('+300 days'));
+
     $yearId = tenant_insert('academic_years', [
-        'code' => '2095-2096', 'name' => 'Test finances', 'starts_on' => '2095-09-01',
-        'ends_on' => '2096-07-31', 'status' => 'active', 'is_current' => 1,
+        'code' => 'TF-' . date('Y'), 'name' => 'Test finances', 'starts_on' => $yearStart,
+        'ends_on' => $yearEnd, 'status' => 'active', 'is_current' => 1,
     ]);
 
     curriculum_service_import_national();
@@ -830,6 +855,738 @@ try {
     finance_service_restore_line($payerLine, 'Retablissement apres verification');
 
     // =================================================================
+    //  LE RECOUVREMENT (5C)
+    //
+    //  Tout se lit sur ce que 5A et 5B ont posé : aucune table nouvelle,
+    //  mais des agrégats qui doivent être justes au centime.
+    // =================================================================
+    $past = date('Y-m-d', strtotime('-20 days'));
+    $soon = date('Y-m-d', strtotime('+20 days'));
+
+    // UNE ANNÉE DÉDIÉE.
+    //
+    // Les frais de portée « école » créés plus haut s'appliqueraient à
+    // toute classe de la même année, et fausseraient chaque montant
+    // vérifié ici. Une année à part donne une grille vierge — et c'est
+    // exactement ce que fait une école qui ouvre un nouvel exercice.
+    //
+    // `is_current` reste NULL : la colonne porte une clé unique par
+    // école et n'accepte jamais 0 (leçon de la phase 1).
+    // L'exercice PRÉCÉDENT : clos depuis deux mois, donc encore dans la
+    // fenêtre de règlement tardif — c'est exactement la situation d'une
+    // école qui recouvre en septembre les impayés de l'année passée.
+    $yearC = tenant_insert('academic_years', [
+        'code' => 'TR-' . date('Y'), 'name' => 'Test recouvrement',
+        'starts_on' => date('Y-m-d', strtotime('-390 days')),
+        'ends_on' => date('Y-m-d', strtotime('-60 days')),
+        'status' => 'active', 'is_current' => null,
+    ]);
+
+    $progC = curriculum_service_create_program($yearC, $levelId, null, null);
+    curriculum_service_fill_program((int) $progC['id']);
+    curriculum_service_activate((int) $progC['id']);
+
+    $classC = tenant_insert('classrooms', [
+        'academic_year_id' => $yearC, 'curriculum_id' => (int) $progC['id'],
+        'code' => '7C', 'name' => '7ème C', 'capacity' => 40,
+    ]);
+
+    $reco = [];
+
+    foreach (['RECOA', 'RECOB', 'RECOC'] as $name) {
+        $rr = students_service_enroll_new(
+            ['last_name' => $name, 'first_name' => 'X', 'gender' => 'M'],
+            $yearC,
+            $classC
+        );
+        $reco[$name] = (int) students_repo_enrollment((int) $rr['id'], $yearC)['id'];
+    }
+
+    // Échue il y a 20 jours / à échoir dans 20 jours.
+    finance_service_save_fee([
+        'academic_year_id' => $yearC, 'code' => 'RECO_ECHUE', 'name' => 'Tranche échue',
+        'currency' => 'USD', 'amount' => '40', 'scope' => 'classroom', 'classroom_id' => $classC,
+        'due_on' => $past, 'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_save_fee([
+        'academic_year_id' => $yearC, 'code' => 'RECO_FUTUR', 'name' => 'Tranche à échoir',
+        'currency' => 'USD', 'amount' => '60', 'scope' => 'classroom', 'classroom_id' => $classC,
+        'due_on' => $soon, 'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_assign($yearC, $classC);
+
+    // RECOA ne paie rien ; RECOB solde l'échéance échue ; RECOC part.
+    finance_service_record_payment($reco['RECOB'], [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '40',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    db_query(
+        'UPDATE enrollments SET status = :st WHERE id = :i AND school_id = :s',
+        ['st' => 'cancelled', 'i' => $reco['RECOC'], 's' => $schoolId]
+    );
+
+    $byName = [];
+
+    foreach (finance_repo_outstanding($yearC, ['classroom_id' => $classC]) as $row) {
+        $byName[(string) $row['last_name']] = $row;
+    }
+
+    check(
+        'Celui qui n\'a rien payé doit tout, et 40 sont échus',
+        abs((float) ($byName['RECOA']['balance'] ?? 0) - 100.0) < 0.01
+            && abs((float) ($byName['RECOA']['overdue'] ?? 0) - 40.0) < 0.01,
+        'reste ' . ($byName['RECOA']['balance'] ?? 0) . ', échu ' . ($byName['RECOA']['overdue'] ?? 0)
+    );
+
+    // LE RETARD SE MESURE PAR ÉCHÉANCE, PAS SUR LE SOLDE.
+    // Celui qui a soldé la tranche échue doit encore 60, mais n'est pas
+    // en retard : le confondre ferait passer un parent à jour pour un
+    // mauvais payeur.
+    check(
+        'Celui qui a soldé l\'échéance échue doit encore, sans être en retard',
+        abs((float) ($byName['RECOB']['balance'] ?? 0) - 60.0) < 0.01
+            && (float) ($byName['RECOB']['overdue'] ?? 99) < 0.01,
+        'reste ' . ($byName['RECOB']['balance'] ?? 0) . ', échu ' . ($byName['RECOB']['overdue'] ?? 0)
+    );
+
+    check(
+        'Le filtre « en retard » ne retient que lui',
+        count(finance_repo_outstanding($yearC, [
+            'classroom_id' => $classC, 'only_overdue' => true,
+        ])) === 1
+    );
+
+    // UNE DETTE D'ÉLÈVE PARTI RESTE UNE CRÉANCE.
+    // Elle disparaissait de tous les écrans, qui filtraient sur
+    // « enrolled » : l'école perdait de vue ce qu'on lui devait.
+    $hasLeaver = static function (array $rows): bool {
+        foreach ($rows as $row) {
+            if ((string) $row['last_name'] === 'RECOC') {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    check(
+        'Un élève parti sort des impayés courants',
+        !$hasLeaver(finance_repo_outstanding($yearC, ['classroom_id' => $classC]))
+    );
+
+    check(
+        'Mais sa créance reste retrouvable',
+        $hasLeaver(finance_repo_outstanding($yearC, [
+            'classroom_id' => $classC, 'include_cancelled' => true,
+        ]))
+    );
+
+    // ON NE RELANCE PAS UNE FAMILLE DONT ON DÉTIENT L'ARGENT.
+    finance_service_record_payment($reco['RECOA'], [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '200',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    $advances = finance_repo_advances($yearC);
+
+    check(
+        'Un trop-versé apparaît comme AVANCE, pas comme rien',
+        ($advances[$reco['RECOA']]['USD'] ?? 0) > 0.005,
+        ($advances[$reco['RECOA']]['USD'] ?? 0) . ' USD d\'avance'
+    );
+
+    // Une nouvelle tranche : l'argent est là, la dette aussi.
+    finance_service_save_fee([
+        'academic_year_id' => $yearC, 'code' => 'RECO_T3', 'name' => 'Tranche 3',
+        'currency' => 'USD', 'amount' => '30', 'scope' => 'classroom', 'classroom_id' => $classC,
+        'due_on' => $past, 'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_assign($yearC, $classC);
+
+    $applied = finance_service_apply_advances($yearC, $classC);
+
+    check(
+        'Imputer les avances solde ce que l\'école détenait déjà',
+        $applied['ok'] && $applied['applied'] > 0,
+        $applied['message']
+    );
+
+    $paidT3 = finance_repo_paid_on_fee((int) db_value(
+        'SELECT sf.id FROM student_fees sf
+           JOIN fees f ON f.id = sf.fee_id AND f.school_id = sf.school_id
+          WHERE sf.school_id = :s AND sf.enrollment_id = :e AND f.code = :c',
+        ['s' => $schoolId, 'e' => $reco['RECOA'], 'c' => 'RECO_T3']
+    ));
+
+    check(
+        'Et n\'impute jamais plus que le reste dû',
+        abs($paidT3 - 30.0) < 0.01,
+        $paidT3 . ' USD sur une dette de 30'
+    );
+
+    // Rejouer l'imputation ne doit rien doubler.
+    finance_service_apply_advances($yearC, $classC);
+
+    check(
+        'Rejouer l\'imputation ne double aucun montant',
+        abs(finance_repo_paid_on_fee((int) db_value(
+            'SELECT sf.id FROM student_fees sf
+               JOIN fees f ON f.id = sf.fee_id AND f.school_id = sf.school_id
+              WHERE sf.school_id = :s AND sf.enrollment_id = :e AND f.code = :c',
+            ['s' => $schoolId, 'e' => $reco['RECOA'], 'c' => 'RECO_T3']
+        )) - 30.0) < 0.01
+    );
+
+    // =================================================================
+    //  UN VERSEMENT N'EST JAMAIS COMPTÉ DEUX FOIS
+    //
+    //  La phase 5B conservait les allocations d'une dette annulée « pour
+    //  garder la trace ». Le raisonnement posait une bombe :
+    //
+    //    1. on annule une dette soldée → l'allocation reste en base
+    //       tout en cessant de compter, l'argent devient une avance ;
+    //    2. on impute l'avance          → une SECONDE allocation naît
+    //       pour le MÊME argent ;
+    //    3. on rétablit la dette        → la première redevient visible.
+    //
+    //  Résultat : 200 imputés pour 100 encaissés, et une avance
+    //  NÉGATIVE. L'annulation supprime désormais les allocations ; la
+    //  trace vit dans le journal d'audit.
+    // =================================================================
+    $dblA = finance_service_save_fee([
+        'academic_year_id' => $yearC, 'code' => 'DBL_A', 'name' => 'Double A',
+        'currency' => 'USD', 'amount' => '100', 'scope' => 'classroom', 'classroom_id' => $classC,
+        'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_save_fee([
+        'academic_year_id' => $yearC, 'code' => 'DBL_B', 'name' => 'Double B',
+        'currency' => 'USD', 'amount' => '100', 'scope' => 'classroom', 'classroom_id' => $classC,
+        'is_mandatory' => 1, 'is_active' => 1,
+    ]);
+    finance_service_assign($yearC, $classC);
+
+    $dblPay = finance_service_record_payment($reco['RECOB'], [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '100',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    $dblLine = (int) db_value(
+        'SELECT id FROM student_fees
+          WHERE school_id = :s AND enrollment_id = :e AND fee_id = :f',
+        ['s' => $schoolId, 'e' => $reco['RECOB'], 'f' => (int) $dblA['id']]
+    );
+
+    $allocatedOn = static function (int $paymentId) use ($schoolId): float {
+        return (float) db_value(
+            'SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
+              WHERE school_id = :s AND payment_id = :p',
+            ['s' => $schoolId, 'p' => $paymentId]
+        );
+    };
+
+    $allocatedFor = static function (int $studentFeeId) use ($schoolId): float {
+        return (float) db_value(
+            'SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
+              WHERE school_id = :s AND student_fee_id = :f',
+            ['s' => $schoolId, 'f' => $studentFeeId]
+        );
+    };
+
+    $beforeCancel = $allocatedFor($dblLine);
+
+    finance_service_cancel_line($dblLine, 'Annulation pour eprouver la double imputation');
+
+    check(
+        'Annuler une dette SUPPRIME ses allocations au lieu de les garder',
+        $beforeCancel > 0.005 && $allocatedFor($dblLine) < 0.005,
+        $beforeCancel . ' USD imputés avant, ' . $allocatedFor($dblLine) . ' après'
+    );
+
+    finance_service_apply_advances($yearC, $classC);
+    finance_service_restore_line($dblLine, 'Retablissement apres verification');
+
+    check(
+        'Annuler, imputer l\'avance puis rétablir n\'impute jamais deux fois',
+        $allocatedOn((int) $dblPay['id']) <= 100.0 + 0.005,
+        $allocatedOn((int) $dblPay['id']) . ' USD imputés pour 100 USD encaissés'
+    );
+
+    check(
+        'Et l\'avance ne devient jamais négative',
+        (finance_repo_balance($reco['RECOB'])['USD']['advance'] ?? 0) >= -0.005,
+        'avance : ' . (finance_repo_balance($reco['RECOB'])['USD']['advance'] ?? 0)
+    );
+
+    // =================================================================
+    //  L'EXPORT CSV
+    //
+    //  Écrit comme une fonction PURE : la version précédente posait ses
+    //  en-têtes HTTP puis appelait exit, et n'était donc exécutable par
+    //  aucun test. Elle plantait sous PHP 8.4 — fputcsv() y exige son
+    //  paramètre d'échappement — sans que rien ne le révèle.
+    // =================================================================
+    $csvRows = finance_repo_outstanding($yearC, ['classroom_id' => $classC]);
+    $csvAdv  = finance_repo_advances($yearC);
+
+    foreach ($csvRows as $i => $csvRow) {
+        $csvRows[$i]['advance'] =
+            $csvAdv[(int) $csvRow['enrollment_id']][(string) $csvRow['currency']] ?? 0.0;
+    }
+
+    $csv = finance_build_outstanding_csv($csvRows);
+
+    check(
+        'L\'export CSV se génère sans planter',
+        $csv !== '',
+        strlen($csv) . ' octets'
+    );
+
+    check(
+        'Il porte le BOM UTF-8 — sans lui Excel abîme les accents',
+        str_starts_with($csv, "\xEF\xBB\xBF")
+    );
+
+    check(
+        'Il sépare au point-virgule — la virgule est la décimale française',
+        str_contains($csv, 'Matricule;Nom')
+    );
+
+    check(
+        'Et il conserve les accents des en-têtes',
+        str_contains($csv, 'Échéance')
+    );
+
+    check(
+        'Le recouvrement par classe distingue débiteurs et retardataires',
+        (bool) array_filter(
+            finance_repo_recovery_by_classroom($yearC),
+            static fn (array $r): bool => (string) $r['classroom_name'] === '7ème C'
+                && (int) $r['debtors'] > 0
+        )
+    );
+
+    // =================================================================
+    //  LES DÉPENSES (5D)
+    // =================================================================
+    $categories = finance_repo_expense_categories();
+
+    check(
+        'Le référentiel des postes de dépense est peuplé',
+        count($categories) >= 10,
+        count($categories) . ' poste(s)'
+    );
+
+    $catId  = (int) $categories[0]['id'];
+    $expBase = [
+        'category_id' => $catId, 'spent_on' => $today, 'currency' => 'USD',
+        'amount' => '50', 'beneficiary' => 'Fournisseur Kasa',
+        'description' => 'Achat de craies', 'method' => 'cash',
+    ];
+
+    // UNE DÉPENSE SANS BÉNÉFICIAIRE EST UN TROU DANS LA CAISSE.
+    // C'est la seule chose qui permette, six mois plus tard, de savoir
+    // à qui l'argent est allé.
+    check(
+        'Une dépense sans bénéficiaire nommé est refusée',
+        !finance_service_record_expense($yearId, array_merge($expBase, ['beneficiary' => '']))['ok']
+    );
+
+    check(
+        'Une dépense sans motif est refusée',
+        !finance_service_record_expense($yearId, array_merge($expBase, ['description' => '']))['ok']
+    );
+
+    check(
+        'Une dépense datée dans le futur est refusée',
+        !finance_service_record_expense($yearId, array_merge($expBase, [
+            'spent_on' => date('Y-m-d', strtotime('+1 day')),
+        ]))['ok']
+    );
+
+    check(
+        'Un poste de dépense inconnu est refusé',
+        !finance_service_record_expense($yearId, array_merge($expBase, ['category_id' => 999999]))['ok']
+    );
+
+    $exp1 = finance_service_record_expense($yearId, $expBase);
+
+    check('Une dépense complète s\'enregistre et reçoit un numéro', $exp1['ok'], $exp1['message']);
+
+    // LA CAISSE COMPTE LA MONNAIE REMISE, PAS CELLE CRÉDITÉE.
+    //
+    // Un parent qui remet 140 000 CDF pour un minerval en dollars met
+    // bien 140 000 CDF dans le tiroir. Compter les dollars crédités
+    // donnerait une caisse qui ne se recoupe jamais avec l'argent
+    // physiquement présent.
+    $cashBefore = finance_repo_cash_position($today);
+
+    finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'CDF', 'tendered_amount' => '28 000',
+        'credited_currency' => 'USD', 'exchange_rate' => '2800', 'method' => 'cash',
+    ]);
+
+    $cashAfter = finance_repo_cash_position($today);
+
+    check(
+        'Un versement en CDF fait entrer des CDF dans la caisse, pas des USD',
+        abs((($cashAfter['CDF']['in'] ?? 0) - ($cashBefore['CDF']['in'] ?? 0)) - 28000.0) < 0.01
+            && abs(($cashAfter['USD']['in'] ?? 0) - ($cashBefore['USD']['in'] ?? 0)) < 0.01,
+        'CDF +' . (($cashAfter['CDF']['in'] ?? 0) - ($cashBefore['CDF']['in'] ?? 0))
+            . ', USD +' . (($cashAfter['USD']['in'] ?? 0) - ($cashBefore['USD']['in'] ?? 0))
+    );
+
+    check(
+        'Une dépense diminue le solde de sa propre devise',
+        abs(($cashAfter['USD']['out'] ?? 0) - 50.0) < 0.01,
+        ($cashAfter['USD']['out'] ?? 0) . ' USD sortis'
+    );
+
+    // LE NUMÉRO DU BON EST CONSOMMÉ À JAMAIS.
+    // Un trou dans la séquence ne signale pas une erreur de saisie :
+    // il signale une ligne effacée, donc un détournement.
+    check(
+        'Annuler une dépense sans motif suffisant est refusé',
+        !finance_service_cancel_expense((int) $exp1['id'], 'abc')['ok']
+    );
+
+    check(
+        'Annuler avec motif réussit',
+        finance_service_cancel_expense((int) $exp1['id'], 'Facture reglee deux fois par erreur')['ok']
+    );
+
+    check(
+        'Le bon annulé sort du solde de caisse',
+        abs((finance_repo_cash_position($today)['USD']['out'] ?? 0)) < 0.01,
+        (finance_repo_cash_position($today)['USD']['out'] ?? 0) . ' USD sortis'
+    );
+
+    $seqBeforeExp = array_map('intval', array_column(db_all(
+        'SELECT voucher_seq FROM expenses WHERE school_id = :s ORDER BY voucher_seq',
+        ['s' => $schoolId]
+    ), 'voucher_seq'));
+
+    finance_service_record_expense($yearId, array_merge($expBase, [
+        'beneficiary' => 'Autre fournisseur', 'description' => 'Registres',
+    ]));
+
+    $seqAfterExp = array_map('intval', array_column(db_all(
+        'SELECT voucher_seq FROM expenses WHERE school_id = :s ORDER BY voucher_seq',
+        ['s' => $schoolId]
+    ), 'voucher_seq'));
+
+    check(
+        'Le numéro d\'un bon annulé n\'est JAMAIS réattribué',
+        count($seqAfterExp) === count($seqBeforeExp) + 1
+            && count(array_unique($seqAfterExp)) === count($seqAfterExp)
+            && max($seqAfterExp) === count($seqAfterExp),
+        'séquence : ' . implode(', ', $seqAfterExp)
+    );
+
+    check(
+        'Le compteur des bons se prépare hors transaction, comme les reçus',
+        function_exists('finance_ensure_expense_counter')
+    );
+
+    // QUI ENGAGE LA DÉPENSE NE L'ANNULE PAS.
+    check(
+        'Le comptable ne détient PAS le droit d\'annuler une dépense',
+        !db_exists(
+            'SELECT 1 FROM role_permissions rp
+               JOIN roles r ON r.id = rp.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+              WHERE r.code = :role AND r.school_id IS NULL AND p.code = :perm',
+            ['role' => 'COMPTABLE', 'perm' => 'expense.cancel'],
+            true
+        )
+    );
+
+    check(
+        'La direction le détient',
+        db_exists(
+            'SELECT 1 FROM role_permissions rp
+               JOIN roles r ON r.id = rp.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+              WHERE r.code = :role AND r.school_id IS NULL AND p.code = :perm',
+            ['role' => 'DIRECTION', 'perm' => 'expense.cancel'],
+            true
+        )
+    );
+
+    // =================================================================
+    //  AUDIT 5D — CE QUE LA SONDE A TROUVÉ
+    //
+    //  Cinq défauts, tous dans des chemins qu'aucun test n'exécutait :
+    //  l'écran mentait sur les francs, un exercice clos acceptait encore
+    //  de l'argent, une dépense pouvait être imputée à n'importe quel
+    //  exercice, un double clic créait deux écritures, et la séparation
+    //  des rôles ne tenait que par le middleware de la route.
+    // =================================================================
+    echo "\n  AUDIT 5D — L'ARGENT DIT LA VÉRITÉ\n";
+
+    // ----- LE FRANC CONGOLAIS N'A PAS DE CENTIMES --------------------
+    //
+    // `finance_decimals()` le savait depuis la 5A, mais ne servait qu'à
+    // l'affichage. Une dette pouvait garder un solde de 0,41 CDF, rester
+    // dans l'état des impayés en affichant « 0 CDF », et n'être jamais
+    // soldable : la pièce n'existe pas.
+    $feeCdf = finance_service_save_fee([
+        'academic_year_id' => $yearId, 'code' => 'AUD5D_CDF', 'name' => 'Frais en francs',
+        'currency' => 'CDF', 'amount' => '45000,60', 'scope' => 'school', 'is_active' => 1,
+    ]);
+
+    $storedFee = (float) db_value(
+        'SELECT amount FROM fees WHERE school_id = :s AND code = :c',
+        ['s' => $schoolId, 'c' => 'AUD5D_CDF']
+    );
+
+    check(
+        'Un tarif en francs est stocké SANS centimes',
+        $feeCdf['ok'] && abs($storedFee - 45001.0) < 0.0001,
+        $storedFee . ' CDF'
+    );
+
+    check(
+        'Ce qui est stocké est exactement ce qui est affiché',
+        finance_amount($storedFee, 'CDF') === number_format($storedFee, 0, ',', ' ') . ' CDF'
+    );
+
+    // Une conversion vers le franc ne doit pas fabriquer de centimes.
+    $conv = finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '20',
+        'credited_currency' => 'CDF', 'exchange_rate' => '0.000357', 'method' => 'cash',
+    ]);
+
+    $convAmount = (float) db_value(
+        'SELECT credited_amount FROM payments WHERE school_id = :s AND id = :id',
+        ['s' => $schoolId, 'id' => (int) ($conv['id'] ?? 0)]
+    );
+
+    check(
+        'Convertir des dollars en francs ne fabrique pas de centimes',
+        $conv['ok'] && abs($convAmount - round($convAmount)) < 0.0001,
+        $convAmount . ' CDF'
+    );
+
+    check(
+        'Un dollar, lui, garde bien ses deux décimales',
+        finance_round(12.345, 'USD') === 12.35 && finance_round(12.4, 'CDF') === 12.0
+    );
+
+    // ----- UN EXERCICE CLOS N'ACCEPTE PLUS D'ARGENT ------------------
+    //
+    // Un exercice clôturé est un exercice dont les chiffres ont été
+    // remis au promoteur. Y ajouter une écriture après coup réécrit un
+    // état déjà signé.
+    $closedYear = tenant_insert('academic_years', [
+        'code' => 'TC-' . date('Y'), 'name' => 'Exercice clos',
+        'starts_on' => date('Y-m-d', strtotime('-390 days')),
+        'ends_on' => date('Y-m-d', strtotime('-60 days')),
+        'status' => 'closed', 'is_current' => null,
+    ]);
+
+    check(
+        'Un exercice clôturé refuse une dépense',
+        !finance_service_record_expense($closedYear, array_merge($expBase, [
+            'spent_on' => date('Y-m-d', strtotime('-70 days')),
+        ]))['ok']
+    );
+
+    // Pour l'encaissement, on ferme temporairement l'exercice courant :
+    // monter une inscription complète dans un exercice déjà clos serait
+    // monter une situation qui ne peut pas exister.
+    tenant_update('academic_years', ['status' => 'closed'], 'id = :id', ['id' => $yearId]);
+
+    $refusClos = finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '10',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    tenant_update('academic_years', ['status' => 'active'], 'id = :id', ['id' => $yearId]);
+
+    check(
+        'Un exercice clôturé refuse aussi un encaissement',
+        !$refusClos['ok'],
+        $refusClos['message']
+    );
+
+    check(
+        'Rouvrir l\'exercice rend la caisse à nouveau opérante',
+        finance_service_record_payment($payer, [
+            'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '1',
+            'credited_currency' => 'USD', 'method' => 'cash',
+        ])['ok']
+    );
+
+    // ----- LA DATE APPARTIENT À SON EXERCICE -------------------------
+    //
+    // Une dépense datée du 15/01/2020 était acceptée sur un exercice de
+    // 2092 : le total annuel devenait librement falsifiable.
+    check(
+        'Une dépense trop éloignée de son exercice est refusée',
+        !finance_service_record_expense($yearId, array_merge($expBase, [
+            'spent_on' => date('Y-m-d', strtotime('-5 years')),
+        ]))['ok']
+    );
+
+    // …mais la règle ne doit pas piéger le travail réel : les familles
+    // versent l'inscription de l'année suivante AVANT sa rentrée.
+    $avance = finance_service_record_payment($payer, [
+        'paid_on' => date('Y-m-d', strtotime('-25 days')),
+        'tendered_currency' => 'USD', 'tendered_amount' => '5',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    check(
+        'Un versement fait avant la rentrée reste accepté',
+        $avance['ok'],
+        $avance['message']
+    );
+
+    // ----- UN BILLET, UN REÇU ----------------------------------------
+    //
+    // Le jeton CSRF vit deux heures et vaut pour tous les formulaires :
+    // il prouve l'origine d'une requête, jamais son unicité. Un double
+    // clic créait deux reçus pour un seul versement.
+    $once = form_nonce('finance.pay');
+
+    check('Le premier envoi d\'un formulaire d\'argent est accepté', form_nonce_consume('finance.pay', $once));
+    check('Le SECOND envoi du même formulaire est refusé', !form_nonce_consume('finance.pay', $once));
+    check(
+        'Un jeton d\'encaissement ne vaut pas pour une dépense',
+        !form_nonce_consume('finance.expense', form_nonce('finance.pay'))
+    );
+    check('Un jeton inventé est refusé', !form_nonce_consume('finance.pay', 'jeton-invente'));
+
+    // ----- TOUTES LES PORTES PORTENT LA SÉPARATION DES RÔLES ---------
+    //
+    // La règle « qui engage la dépense ne l'annule pas » ne tenait que
+    // par le middleware de la route. Le service, lui, annulait pour
+    // quiconque l'appelait.
+    $expSep = finance_service_record_expense($yearId, array_merge($expBase, [
+        'description' => 'Dépense de contrôle de la séparation des rôles',
+    ]));
+
+    act_as($schoolId, 'COMPTABLE');
+
+    check(
+        'Le SERVICE d\'annulation refuse un comptable, pas seulement la route',
+        !finance_service_cancel_expense((int) $expSep['id'], 'Tentative depuis le guichet')['ok']
+    );
+
+    check(
+        'Le service d\'annulation d\'un reçu porte la même règle',
+        !finance_service_cancel_payment((int) $conv['id'], 'Tentative depuis le guichet')['ok']
+    );
+
+    act_as($schoolId, 'DIRECTION');
+
+    check(
+        'La direction, elle, annule bien',
+        finance_service_cancel_expense((int) $expSep['id'], 'Annulation régulière par la direction')['ok']
+    );
+
+    // =================================================================
+    //  RECETTE — CELUI QUI ENCAISSE NE RÉDUIT PAS LA DETTE
+    //
+    //  Trouvé en interrogeant les vraies URL : le comptable détenait
+    //  `fee.manage`, qui ouvrait à la fois la GRILLE (un document
+    //  collectif et visible) et la DETTE D'UNE SEULE FAMILLE (une
+    //  remise, une annulation — invisibles dans la grille).
+    //
+    //  Comme il détient aussi `payment.record`, il pouvait encaisser
+    //  45 000 CDF en espèces, annuler la dette, et garder l'argent :
+    //  les comptes tombaient juste, puisqu'il ne restait ni dette ni
+    //  reçu. `fee.waive` sépare les deux.
+    // =================================================================
+    echo "\n  SÉPARATION DES RÔLES — LA DETTE D'UNE FAMILLE\n";
+
+    check(
+        'Le comptable tient la grille tarifaire',
+        db_exists(
+            'SELECT 1 FROM role_permissions rp
+               JOIN roles r ON r.id = rp.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+              WHERE r.code = :role AND r.school_id IS NULL AND p.code = :perm',
+            ['role' => 'COMPTABLE', 'perm' => 'fee.manage'],
+            true
+        )
+    );
+
+    check(
+        'Mais il ne détient PAS le droit de toucher à une dette',
+        !db_exists(
+            'SELECT 1 FROM role_permissions rp
+               JOIN roles r ON r.id = rp.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+              WHERE r.code = :role AND r.school_id IS NULL AND p.code = :perm',
+            ['role' => 'COMPTABLE', 'perm' => 'fee.waive'],
+            true
+        )
+    );
+
+    check(
+        'La direction le détient',
+        db_exists(
+            'SELECT 1 FROM role_permissions rp
+               JOIN roles r ON r.id = rp.role_id
+               JOIN permissions p ON p.id = rp.permission_id
+              WHERE r.code = :role AND r.school_id IS NULL AND p.code = :perm',
+            ['role' => 'DIRECTION', 'perm' => 'fee.waive'],
+            true
+        )
+    );
+
+    // La règle est portée par le SERVICE, pas seulement par la route :
+    // un import, une reprise de caisse ou une API mobile passeraient
+    // à côté du middleware.
+    $ligneTest = (int) db_value(
+        'SELECT id FROM student_fees
+          WHERE school_id = :s AND is_cancelled = 0 AND discount_amount = 0
+          ORDER BY id DESC LIMIT 1',
+        ['s' => $schoolId]
+    );
+
+    act_as($schoolId, 'COMPTABLE');
+
+    check(
+        'Le comptable ne peut PAS accorder de remise',
+        !finance_service_set_discount($ligneTest, 5.0, 'Remise tentee par le comptable')['ok']
+    );
+
+    check(
+        'Ni annuler la dette d\'une famille',
+        !finance_service_cancel_line($ligneTest, 'Annulation tentee par le comptable')['ok']
+    );
+
+    check(
+        'Ni réaligner des dettes déjà annoncées',
+        !finance_service_resync_fee((int) db_value(
+            'SELECT id FROM fees WHERE school_id = :s ORDER BY id LIMIT 1',
+            ['s' => $schoolId]
+        ), 'Realignement tente par le comptable')['ok']
+    );
+
+    check(
+        'Ni annuler en masse les dettes hors portée',
+        !finance_service_cancel_out_of_scope($yearId, 'Annulation tentee par le comptable')['ok']
+    );
+
+    // Il garde en revanche tout son métier.
+    $encCpt = finance_service_record_payment($payer, [
+        'paid_on' => $today, 'tendered_currency' => 'USD', 'tendered_amount' => '2',
+        'credited_currency' => 'USD', 'method' => 'cash',
+    ]);
+
+    check('Le comptable encaisse toujours', $encCpt['ok'], $encCpt['message']);
+
+    act_as($schoolId, 'DIRECTION');
+
+    $remiseDir = finance_service_set_discount($ligneTest, 5.0, 'Remise sociale accordee par la direction');
+
+    check('La direction accorde bien la remise', $remiseDir['ok'], $remiseDir['message']);
+
+    // =================================================================
     //  PÉRIMÈTRE : UN PARENT NE VOIT QUE SES ENFANTS
     //
     //  finance.view est accordée à PARENT depuis la phase 1. Sans cette
@@ -948,6 +1705,26 @@ try {
     check(
         'Ni lire son journal de caisse',
         finance_repo_cashbook($today) === []
+    );
+
+    check(
+        'Ni son état des impayés',
+        finance_repo_outstanding($yearId, ['include_cancelled' => true]) === []
+    );
+
+    check(
+        'Ni ses avances',
+        finance_repo_advances($yearId) === []
+    );
+
+    check(
+        'Ni ses dépenses',
+        finance_repo_expenses($yearId) === []
+    );
+
+    check(
+        'Ni sa situation de caisse',
+        finance_repo_cash_position($today) === []
     );
 } finally {
     foreach ($createdSchools as $id) {

@@ -8,6 +8,9 @@ declare(strict_types=1);
 require_once __DIR__ . '/services.php';
 require_once __DIR__ . '/repositories.php';
 require_once __DIR__ . '/../students/repositories.php';
+// grades_format() vient du module NOTES : le gabarit du bulletin publié
+// s'en sert pour écrire « 15 » et non « 15,00 ».
+require_once __DIR__ . '/../grades/services.php';
 
 /**
  * Regroupement demandé, validé contre la liste connue.
@@ -189,4 +192,35 @@ function bulletins_passing_threshold_safe(): float
     require_once APP_PATH . '/modules/teachers/services.php';
 
     return teachers_passing_threshold();
+}
+
+/**
+ * Le même document, côté personnel.
+ *
+ * Le périmètre est celui de la scolarité — un titulaire doit pouvoir
+ * réimprimer le bulletin d'un de ses élèves. Deux rendus du même
+ * document finiraient par diverger : c'est pourquoi le gabarit est
+ * partagé avec le portail.
+ */
+function ctrl_bulletins_published(string $id): void
+{
+    $bulletin = bulletins_repo_published((int) $id);
+
+    if ($bulletin === null) {
+        abort(404, 'Bulletin introuvable.');
+    }
+
+    if (!students_can_view((int) $bulletin['student_id'], (int) $bulletin['academic_year_id'])) {
+        abort(404, 'Bulletin introuvable.');
+    }
+
+    view('bulletins/published', [
+        'title'     => 'Bulletin publié',
+        'bulletin'  => $bulletin,
+        'report'    => bulletins_repo_lines((int) $id),
+        'threshold' => bulletins_passing_threshold_safe(),
+        'decisions' => BULLETIN_DECISIONS,
+        'backUrl'   => '/bulletins/' . (int) $bulletin['enrollment_id'],
+        'backLabel' => 'Retour au relevé',
+    ], 'print');
 }

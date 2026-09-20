@@ -615,3 +615,467 @@ function finance_repo_cashbook(string $date): array
         $scopeParams + ['school_id' => tenant_require(), 'date' => $date]
     );
 }
+
+// =====================================================================
+//  ÉTAT DES IMPAYÉS (phase 5C)
+//
+//  Une seule requête agrégée, jamais une boucle. Sur 1 200 inscrits et
+//  6 frais, une lecture ligne à ligne ferait 7 200 allers-retours —
+//  l'écran deviendrait inutilisable précisément dans l'école qui en a
+//  le plus besoin.
+//
+//  LE RETARD SE CALCULE PAR DETTE, PAS PAR SOLDE
+//  ---------------------------------------------
+//  Un élève qui doit 100 USD dont 50 échus et 50 à échoir n'est pas
+//  « en retard de 100 ». Le retard se mesure échéance par échéance,
+//  puis se somme. Une dette sans échéance n'est jamais en retard.
+// =====================================================================
+
+/**
+ * Impayés d'une année, une ligne par inscription ET par devise.
+ *
+ * @param array{classroom_id?: int|null, currency?: string|null,
+ *              only_overdue?: bool, include_cancelled?: bool} $filters
+ */
+function finance_repo_outstanding(int $yearId, array $filters = []): array
+{
+    [$scope, $scopeParams] = students_scope_clause($yearId);
+
+    // `school_alloc` double `school_id` a dessein : avec
+    // ATTR_EMULATE_PREPARES = false, un parametre nomme ne peut pas
+    // apparaitre deux fois dans la meme requete (HY093). C'est la
+    // cinquieme fois que ce piege se presente dans ce projet.
+    $params = $scopeParams + [
+        'school_id'    => tenant_require(),
+        'school_alloc' => tenant_require(),
+        'year_id'      => $yearId,
+        'today'        => date('Y-m-d'),
+    ];
+
+    $where = [
+        'sf.school_id = :school_id',
+        'e.academic_year_id = :year_id',
+        'sf.is_cancelled = 0',
+        's.deleted_at IS NULL',
+        $scope,
+    ];
+
+    // UNE INSCRIPTION ANNULÉE GARDE SES DETTES.
+    //
+    // Elles disparaissaient de tous les écrans, qui filtraient sur
+    // « enrolled » : l'école perdait de vue une créance bien réelle —
+    // un élève parti en janvier doit toujours le premier trimestre.
+    // Elles sont donc consultables, mais jamais mélangées par défaut
+    // aux impayés des élèves présents.
+    if (!empty($filters['include_cancelled'])) {
+        $where[]            = 'e.status IN (:status_enrolled, :status_cancelled)';
+        $params['status_enrolled']  = 'enrolled';
+        $params['status_cancelled'] = 'cancelled';
+    } else {
+        $where[]           = 'e.status = :status_enrolled';
+        $params['status_enrolled'] = 'enrolled';
+    }
+
+    if (!empty($filters['classroom_id'])) {
+        $where[]                 = 'e.classroom_id = :classroom_id';
+        $params['classroom_id']  = (int) $filters['classroom_id'];
+    }
+
+    if (!empty($filters['currency'])) {
+        $where[]             = 'sf.currency = :currency';
+        $params['currency']  = (string) $filters['currency'];
+    }
+
+    $sql = 'SELECT e.id            AS enrollment_id,
+                   e.status        AS enrollment_status,
+                   s.id            AS student_id,
+                   s.matricule, s.last_name, s.post_name, s.first_name,
+                   c.name          AS classroom_name,
+                   sf.currency,
+                   SUM(sf.amount_due - sf.discount_amount)                       AS due,
+                   SUM(COALESCE(a.paid, 0))                                      AS paid,
+                   SUM(GREATEST(sf.amount_due - sf.discount_amount
+                                - COALESCE(a.paid, 0), 0))                       AS balance,
+                   SUM(CASE
+                         WHEN sf.due_on IS NOT NULL AND sf.due_on < :today
+                         THEN GREATEST(sf.amount_due - sf.discount_amount
+                                       - COALESCE(a.paid, 0), 0)
+                         ELSE 0
+                       END)                                                      AS overdue,
+                   MIN(CASE
+                         WHEN sf.due_on IS NOT NULL
+                              AND (sf.amount_due - sf.discount_amount
+                                   - COALESCE(a.paid, 0)) > 0.005
+                         THEN sf.due_on
+                       END)                                                      AS oldest_due
+              FROM student_fees sf
+              JOIN enrollments e ON e.id = sf.enrollment_id AND e.school_id = sf.school_id
+              JOIN students s ON s.id = e.student_id AND s.school_id = e.school_id
+         LEFT JOIN classrooms c ON c.id = e.classroom_id AND c.school_id = e.school_id
+         LEFT JOIN (
+                   SELECT pa.student_fee_id, SUM(pa.amount) AS paid
+                     FROM payment_allocations pa
+                     JOIN payments pm ON pm.id = pa.payment_id AND pm.school_id = pa.school_id
+                    WHERE pa.school_id = :school_alloc
+                      AND pm.is_cancelled = 0
+                    GROUP BY pa.student_fee_id
+              ) a ON a.student_fee_id = sf.id
+             WHERE ' . implode(' AND ', $where) . '
+             GROUP BY e.id, e.status, s.id, s.matricule, s.last_name, s.post_name,
+                      s.first_name, c.name, sf.currency';
+
+    // Le filtre « en retard » porte sur l'agrégat : il appartient donc
+    // au HAVING, pas au WHERE.
+    if (!empty($filters['only_overdue'])) {
+        $sql .= ' HAVING overdue > 0.005';
+    } else {
+        $sql .= ' HAVING balance > 0.005';
+    }
+
+    $sql .= ' ORDER BY overdue DESC, balance DESC, s.last_name, s.first_name';
+
+    return db_all($sql, $params);
+}
+
+/**
+ * Totaux d'une année, par devise : réclamé, encaissé, restant, en retard.
+ *
+ * Sert l'en-tête du tableau de bord financier. Les devises ne sont
+ * jamais additionnées entre elles.
+ *
+ * @return array<string, array{due: float, paid: float, balance: float, overdue: float, students: int}>
+ */
+function finance_repo_year_totals(int $yearId, bool $includeCancelled = false): array
+{
+    $totals = [];
+
+    foreach (finance_repo_outstanding($yearId, ['include_cancelled' => $includeCancelled]) as $row) {
+        $currency = (string) $row['currency'];
+
+        $totals[$currency] ??= [
+            'due' => 0.0, 'paid' => 0.0, 'balance' => 0.0, 'overdue' => 0.0, 'students' => 0,
+        ];
+
+        $totals[$currency]['due']     += (float) $row['due'];
+        $totals[$currency]['paid']    += (float) $row['paid'];
+        $totals[$currency]['balance'] += (float) $row['balance'];
+        $totals[$currency]['overdue'] += (float) $row['overdue'];
+        $totals[$currency]['students']++;
+    }
+
+    return $totals;
+}
+
+/**
+ * Recouvrement par classe : une ligne par classe et par devise.
+ *
+ * `debtors` compte les élèves qui doivent encore quelque chose ;
+ * `late` ceux dont une échéance est dépassée.
+ */
+function finance_repo_recovery_by_classroom(int $yearId): array
+{
+    $rows = [];
+
+    foreach (finance_repo_outstanding($yearId) as $row) {
+        $key = ($row['classroom_name'] ?? '—') . '|' . $row['currency'];
+
+        $rows[$key] ??= [
+            'classroom_name' => $row['classroom_name'],
+            'currency'       => $row['currency'],
+            'balance'        => 0.0,
+            'overdue'        => 0.0,
+            'debtors'        => 0,
+            'late'           => 0,
+        ];
+
+        $rows[$key]['balance'] += (float) $row['balance'];
+        $rows[$key]['overdue'] += (float) $row['overdue'];
+        $rows[$key]['debtors']++;
+
+        if ((float) $row['overdue'] > 0.005) {
+            $rows[$key]['late']++;
+        }
+    }
+
+    uasort($rows, static function (array $a, array $b): int {
+        return [$a['classroom_name'], $a['currency']] <=> [$b['classroom_name'], $b['currency']];
+    });
+
+    return array_values($rows);
+}
+
+/**
+ * Avances d'une année : encaissé non encore imputé, par inscription et
+ * par devise.
+ *
+ * POURQUOI UNE REQUÊTE À PART
+ * ---------------------------
+ * L'état des impayés se lit sur les DETTES. Une avance vit sur les
+ * PAIEMENTS. Les joindre dans la même requête agrégée donnerait une
+ * sous-requête imbriquée à trois niveaux, illisible et fragile ; deux
+ * requêtes simples, fusionnées en PHP, coûtent le même temps et se
+ * relisent.
+ *
+ * Sans cette colonne, la liste des impayés ferait relancer une famille
+ * dont l'école détient déjà l'argent — le pire reproche qu'on puisse
+ * faire à un état de recouvrement.
+ *
+ * @return array<int, array<string, float>> [enrollment_id][devise] => avance
+ */
+function finance_repo_advances(int $yearId): array
+{
+    $rows = db_all(
+        'SELECT pm.enrollment_id,
+                pm.credited_currency AS currency,
+                SUM(pm.credited_amount) - COALESCE(SUM(al.allocated), 0) AS advance
+           FROM payments pm
+           JOIN enrollments e ON e.id = pm.enrollment_id AND e.school_id = pm.school_id
+      LEFT JOIN (
+                SELECT pa.payment_id, SUM(pa.amount) AS allocated
+                  FROM payment_allocations pa
+                  JOIN student_fees sf ON sf.id = pa.student_fee_id AND sf.school_id = pa.school_id
+                 WHERE pa.school_id = :school_alloc
+                   AND sf.is_cancelled = 0
+                 GROUP BY pa.payment_id
+           ) al ON al.payment_id = pm.id
+          WHERE pm.school_id = :school_id
+            AND pm.is_cancelled = 0
+            AND e.academic_year_id = :year_id
+          GROUP BY pm.enrollment_id, pm.credited_currency',
+        [
+            'school_id'    => tenant_require(),
+            'school_alloc' => tenant_require(),
+            'year_id'      => $yearId,
+        ]
+    );
+
+    $advances = [];
+
+    foreach ($rows as $row) {
+        $advance = round((float) $row['advance'], 2);
+
+        if ($advance > 0.005) {
+            $advances[(int) $row['enrollment_id']][(string) $row['currency']] = $advance;
+        }
+    }
+
+    return $advances;
+}
+
+/** Paiements d'une inscription portant encore un reliquat non imputé. */
+function finance_repo_payments_with_remainder(int $enrollmentId, string $currency): array
+{
+    return db_all(
+        'SELECT pm.id,
+                pm.credited_amount
+                - COALESCE((SELECT SUM(pa.amount)
+                              FROM payment_allocations pa
+                              JOIN student_fees sf ON sf.id = pa.student_fee_id
+                                                  AND sf.school_id = pa.school_id
+                             WHERE pa.school_id = pm.school_id
+                               AND pa.payment_id = pm.id
+                               AND sf.is_cancelled = 0), 0) AS remainder
+           FROM payments pm
+          WHERE pm.school_id = :school_id
+            AND pm.enrollment_id = :enrollment_id
+            AND pm.credited_currency = :currency
+            AND pm.is_cancelled = 0
+          HAVING remainder > 0.005
+          ORDER BY pm.receipt_seq',
+        [
+            'school_id'     => tenant_require(),
+            'enrollment_id' => $enrollmentId,
+            'currency'      => $currency,
+        ]
+    );
+}
+
+// =====================================================================
+//  DÉPENSES (phase 5D)
+//
+//  Aucune fonction de cette section n'additionne deux devises. Une
+//  dépense est engagée dans sa monnaie, comme une dette est due dans
+//  la sienne.
+// =====================================================================
+
+/** Postes de dépense actifs, dans l'ordre d'affichage. */
+function finance_repo_expense_categories(): array
+{
+    return db_all(
+        'SELECT id, code, name FROM expense_categories
+          WHERE is_active = 1 ORDER BY position, name',
+        [],
+        true // table globale, partagée par toutes les écoles
+    );
+}
+
+function finance_repo_expense(int $expenseId): ?array
+{
+    return db_one(
+        'SELECT x.*, c.name AS category_name, c.code AS category_code,
+                u.last_name AS author_last_name, u.first_name AS author_first_name
+           FROM expenses x
+      LEFT JOIN expense_categories c ON c.id = x.category_id
+      LEFT JOIN users u ON u.id = x.recorded_by
+          WHERE x.id = :id AND x.school_id = :school_id',
+        ['id' => $expenseId, 'school_id' => tenant_require()]
+    );
+}
+
+/**
+ * Dépenses d'une année, filtrables.
+ *
+ * @param array{category_id?: int|null, currency?: string|null,
+ *              from?: string|null, to?: string|null,
+ *              include_cancelled?: bool} $filters
+ */
+function finance_repo_expenses(int $yearId, array $filters = []): array
+{
+    $params = ['school_id' => tenant_require(), 'year_id' => $yearId];
+    $where  = ['x.school_id = :school_id', 'x.academic_year_id = :year_id'];
+
+    // Les dépenses annulées restent visibles par défaut, barrées : les
+    // faire disparaître rendrait la séquence des bons incompréhensible
+    // et masquerait les erreurs de caisse. Même règle que les reçus.
+    if (isset($filters['include_cancelled']) && !$filters['include_cancelled']) {
+        $where[] = 'x.is_cancelled = 0';
+    }
+
+    if (!empty($filters['category_id'])) {
+        $where[]                = 'x.category_id = :category_id';
+        $params['category_id']  = (int) $filters['category_id'];
+    }
+
+    if (!empty($filters['currency'])) {
+        $where[]            = 'x.currency = :currency';
+        $params['currency'] = (string) $filters['currency'];
+    }
+
+    if (!empty($filters['from'])) {
+        $where[]        = 'x.spent_on >= :from';
+        $params['from'] = (string) $filters['from'];
+    }
+
+    if (!empty($filters['to'])) {
+        $where[]      = 'x.spent_on <= :to';
+        $params['to'] = (string) $filters['to'];
+    }
+
+    return db_all(
+        'SELECT x.*, c.name AS category_name,
+                u.last_name AS author_last_name, u.first_name AS author_first_name
+           FROM expenses x
+      LEFT JOIN expense_categories c ON c.id = x.category_id
+      LEFT JOIN users u ON u.id = x.recorded_by
+          WHERE ' . implode(' AND ', $where) . '
+          ORDER BY x.spent_on DESC, x.voucher_seq DESC',
+        $params
+    );
+}
+
+/**
+ * Totaux des dépenses d'une année, par devise puis par poste.
+ *
+ * @return array<string, array{total: float, categories: array<string, float>}>
+ */
+function finance_repo_expense_totals(int $yearId): array
+{
+    $rows = db_all(
+        'SELECT x.currency,
+                COALESCE(c.name, :unknown) AS category_name,
+                SUM(x.amount) AS total
+           FROM expenses x
+      LEFT JOIN expense_categories c ON c.id = x.category_id
+          WHERE x.school_id = :school_id
+            AND x.academic_year_id = :year_id
+            AND x.is_cancelled = 0
+          GROUP BY x.currency, c.name
+          ORDER BY x.currency, total DESC',
+        [
+            'school_id' => tenant_require(),
+            'year_id'   => $yearId,
+            'unknown'   => 'Poste supprimé',
+        ]
+    );
+
+    $totals = [];
+
+    foreach ($rows as $row) {
+        $currency = (string) $row['currency'];
+
+        $totals[$currency] ??= ['total' => 0.0, 'categories' => []];
+        $totals[$currency]['total'] += (float) $row['total'];
+        $totals[$currency]['categories'][(string) $row['category_name']] = (float) $row['total'];
+    }
+
+    return $totals;
+}
+
+/** Dépenses d'une journée — pour le journal de caisse. */
+function finance_repo_expenses_of_day(string $date): array
+{
+    return db_all(
+        'SELECT x.*, c.name AS category_name,
+                u.last_name AS author_last_name, u.first_name AS author_first_name
+           FROM expenses x
+      LEFT JOIN expense_categories c ON c.id = x.category_id
+      LEFT JOIN users u ON u.id = x.recorded_by
+          WHERE x.school_id = :school_id AND x.spent_on = :date
+          ORDER BY x.voucher_seq',
+        ['school_id' => tenant_require(), 'date' => $date]
+    );
+}
+
+/**
+ * Situation de caisse à une date : ce qui est entré, ce qui est sorti,
+ * et ce qui devrait rester.
+ *
+ * LA MONNAIE COMPTÉE EST CELLE QUI A ÉTÉ REMISE
+ * ---------------------------------------------
+ * Un parent remet 140 000 CDF pour une dette en USD : ce sont bien
+ * 140 000 CDF qui entrent dans le tiroir, pas 50 USD. Le solde de
+ * caisse se calcule donc sur `tendered_currency`, jamais sur la devise
+ * portée au crédit des dettes. Confondre les deux donnerait une caisse
+ * qui ne se recoupe jamais.
+ *
+ * @return array<string, array{in: float, out: float, balance: float}>
+ */
+function finance_repo_cash_position(string $upToDate): array
+{
+    $schoolId = tenant_require();
+    $position = [];
+
+    $in = db_all(
+        'SELECT tendered_currency AS currency, SUM(tendered_amount) AS total
+           FROM payments
+          WHERE school_id = :school_id AND is_cancelled = 0 AND paid_on <= :date
+          GROUP BY tendered_currency',
+        ['school_id' => $schoolId, 'date' => $upToDate]
+    );
+
+    foreach ($in as $row) {
+        $currency = (string) $row['currency'];
+        $position[$currency] ??= ['in' => 0.0, 'out' => 0.0, 'balance' => 0.0];
+        $position[$currency]['in'] = (float) $row['total'];
+    }
+
+    $out = db_all(
+        'SELECT currency, SUM(amount) AS total
+           FROM expenses
+          WHERE school_id = :school_id AND is_cancelled = 0 AND spent_on <= :date
+          GROUP BY currency',
+        ['school_id' => $schoolId, 'date' => $upToDate]
+    );
+
+    foreach ($out as $row) {
+        $currency = (string) $row['currency'];
+        $position[$currency] ??= ['in' => 0.0, 'out' => 0.0, 'balance' => 0.0];
+        $position[$currency]['out'] = (float) $row['total'];
+    }
+
+    foreach ($position as $currency => $line) {
+        $position[$currency]['balance'] = round($line['in'] - $line['out'], 2);
+    }
+
+    return $position;
+}

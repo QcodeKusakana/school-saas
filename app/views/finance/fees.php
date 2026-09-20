@@ -102,6 +102,11 @@ foreach ($fees as $f) {
                     <?php endif; ?>
                 </ul>
 
+                <?php if (!can('fee.waive')): ?>
+                    <p class="small mb-0">
+                        Annuler ces dettes relève de la direction : signalez-les-lui.
+                    </p>
+                <?php else: ?>
                 <form method="post" action="<?= e(url('/finances/hors-portee')) ?>"
                       class="d-flex flex-wrap gap-2 align-items-center">
                     <?= csrf_field() ?>
@@ -116,6 +121,7 @@ foreach ($fees as $f) {
                         Elles restent visibles, barrées, avec leur motif.
                     </span>
                 </form>
+                <?php endif; ?>
             </div>
         </div>
     </div>
@@ -236,6 +242,15 @@ foreach ($fees as $f) {
                                             Pour changer de monnaie : désactivez ce frais, créez-en un nouveau dans
                                             la devise voulue, puis annulez les dettes devenues sans objet depuis la
                                             fiche de chaque élève.
+                                        </td>
+                                    </tr>
+                                <?php elseif ($diverging > 0 && !can('fee.waive')): ?>
+                                    <tr class="table-warning">
+                                        <td colspan="6" class="small">
+                                            <strong><?= (int) $diverging ?> dette(s)</strong> portent encore
+                                            l'ancien montant. C'est voulu : le tarif annoncé à une famille ne se
+                                            réécrit pas tout seul. Si c'est une erreur de saisie à corriger, la
+                                            direction seule peut réaligner ces dettes.
                                         </td>
                                     </tr>
                                 <?php elseif ($diverging > 0): ?>

@@ -37,7 +37,7 @@ function auth_attempt(string $identifier, string $password, bool $remember = fal
     // avec les requêtes réellement préparées côté MySQL
     // (ATTR_EMULATE_PREPARES = false), un paramètre nommé ne peut pas être
     // réutilisé dans une même requête. Le pilote rejette la requête.
-    $user = db_one(
+    $user = tenant_scope_identity(static fn (): ?array => db_one(
         'SELECT u.*, s.status AS school_status, s.name AS school_name
            FROM users u
            LEFT JOIN schools s ON s.id = u.school_id
@@ -46,7 +46,7 @@ function auth_attempt(string $identifier, string $password, bool $remember = fal
           LIMIT 1',
         ['username' => $identifier, 'email' => $identifier],
         true
-    );
+    ));
 
     // 3. Vérification du mot de passe.
     // On exécute password_verify même quand le compte est introuvable, afin
@@ -113,13 +113,15 @@ function auth_login(array $user, bool $remember = false): void
 
     tenant_set($_SESSION['school_id']);
 
-    db_query(
-        'UPDATE users
-            SET last_login_at = :now, last_login_ip = :ip, failed_attempts = 0, locked_until = NULL
-          WHERE id = :id',
-        ['now' => now(), 'ip' => ip_binary(), 'id' => (int) $user['id']],
-        true // mise à jour ciblée par id, hors périmètre école
-    );
+    tenant_scope_identity(static function () use ($user): void {
+        db_query(
+            'UPDATE users
+                SET last_login_at = :now, last_login_ip = :ip, failed_attempts = 0, locked_until = NULL
+              WHERE id = :id',
+            ['now' => now(), 'ip' => ip_binary(), 'id' => (int) $user['id']],
+            true
+        );
+    });
 
     auth_track_session((int) $user['id'], $_SESSION['school_id']);
 
@@ -186,15 +188,17 @@ function auth_user(bool $refresh = false): ?array
         return $user = null;
     }
 
-    $row = db_one(
+    // Rechargement du compte à chaque requête. L'école n'est pas encore
+    // dans le contexte : c'est CETTE requête qui l'y place.
+    $row = tenant_scope_identity(static fn (): ?array => db_one(
         'SELECT u.*, s.name AS school_name, s.status AS school_status, s.logo_path AS school_logo
            FROM users u
            LEFT JOIN schools s ON s.id = u.school_id
           WHERE u.id = :id AND u.deleted_at IS NULL
           LIMIT 1',
         ['id' => (int) $userId],
-        true // recherche par clé primaire, contexte école pas encore établi
-    );
+        true
+    ));
 
     if (!$row || $row['status'] !== 'active') {
         session_destroy_secure();
@@ -257,11 +261,13 @@ function auth_rehash_if_needed(int $userId, string $plainPassword, string $curre
         return;
     }
 
-    db_query(
-        'UPDATE users SET password_hash = :hash, password_changed_at = :now WHERE id = :id',
-        ['hash' => auth_hash_password($plainPassword), 'now' => now(), 'id' => $userId],
-        true
-    );
+    tenant_scope_identity(static function () use ($plainPassword, $userId): void {
+        db_query(
+            'UPDATE users SET password_hash = :hash, password_changed_at = :now WHERE id = :id',
+            ['hash' => auth_hash_password($plainPassword), 'now' => now(), 'id' => $userId],
+            true
+        );
+    });
 }
 
 // ---------------------------------------------------------------------
@@ -336,18 +342,20 @@ function auth_increment_failures(?int $userId): void
     $max      = (int) config('security.max_attempts_user', 5);
     $duration = (int) config('security.lockout_duration', 900);
 
-    db_query(
-        'UPDATE users
-            SET failed_attempts = failed_attempts + 1,
-                locked_until = IF(failed_attempts + 1 >= :max, :until, locked_until)
-          WHERE id = :id',
-        [
-            'max'   => $max,
-            'until' => date('Y-m-d H:i:s', time() + $duration),
-            'id'    => $userId,
-        ],
-        true
-    );
+    tenant_scope_identity(static function () use ($max, $duration, $userId): void {
+        db_query(
+            'UPDATE users
+                SET failed_attempts = failed_attempts + 1,
+                    locked_until = IF(failed_attempts + 1 >= :max, :until, locked_until)
+              WHERE id = :id',
+            [
+                'max'   => $max,
+                'until' => date('Y-m-d H:i:s', time() + $duration),
+                'id'    => $userId,
+            ],
+            true
+        );
+    });
 }
 
 // ---------------------------------------------------------------------
