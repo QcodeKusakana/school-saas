@@ -5,12 +5,17 @@
  * CE QU'IL MONTRE DE PLUS QUE LE JOURNAL D'UNE ÉCOLE
  * ===================================================
  * La colonne établissement, et les lignes SANS établissement : les
- * actions de l'éditeur lui-même — entrée dans une école cliente,
- * changement d'offre, encaissement d'abonnement — s'écrivent avec
- * `school_id = NULL` et n'apparaissent dans aucun journal d'école.
+ * actions de l'éditeur menées HORS de toute école — facturation,
+ * changement d'offre, gestion du parc — s'écrivent avec
+ * `school_id = NULL` et n'appartiennent à aucun journal d'école.
  *
- * C'est précisément ce qui rend cet écran nécessaire : sans lui,
- * personne ne relit ce que fait l'éditeur.
+ * Ses actions À L'INTÉRIEUR d'une école, elles, portent l'identifiant de
+ * cette école : elles apparaissent ici ET dans le journal de l'école
+ * concernée, qui les y verra marquées « Éditeur ». C'est le sens même
+ * d'une trace — celui dont on touche les données doit pouvoir le relire.
+ *
+ * C'est aussi ce qui rend cet écran nécessaire : sans lui, personne ne
+ * relit ce que fait l'éditeur hors des écoles.
  *
  * IL N'AFFICHE PAS LES VALEURS MODIFIÉES, et c'est délibéré. Elles
  * concernent des élèves mineurs d'écoles clientes. L'éditeur voit QUE
@@ -54,9 +59,10 @@ $lien = static function (array $extra) use ($filtres, $page): string {
 
 <div class="alert alert-secondary small">
     <i class="bi bi-info-circle me-1"></i>
-    Les lignes <strong>sans établissement</strong> sont les actions de
-    l'éditeur : entrée dans une école cliente, changement d'offre,
-    encaissement. Elles n'apparaissent dans aucun journal d'école.
+    Les lignes <strong>sans établissement</strong> sont vos actions menées
+    hors de toute école : facturation, offres, gestion du parc. Vos actions
+    <em>à l'intérieur</em> d'une école portent son nom et apparaissent aussi
+    dans le journal de cette école, marquées « Éditeur ».
     Les valeurs modifiées ne sont pas affichées ici — elles concernent des
     élèves d'établissements clients.
 </div>

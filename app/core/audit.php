@@ -73,7 +73,31 @@ function audit_log(
 ): void {
     try {
         db_insert('audit_logs', [
-            'school_id'   => $_SESSION['school_id'] ?? null,
+            // L'ÉCOLE VIENT DU CONTEXTE, PAS DE LA SESSION.
+            //
+            // `auth_user()` réétablit le contexte multi-école DEPUIS LA
+            // BASE à chaque requête, précisément pour qu'une session
+            // altérée ne puisse pas changer d'école. Le journal, lui,
+            // lisait `$_SESSION['school_id']` : il enregistrait donc
+            // l'école depuis la source la MOINS digne de confiance de
+            // tout le produit.
+            //
+            // Deux cas mesurés à l'exécution, le contexte valant 2 :
+            //   · en ligne de commande (pas de session), la trace
+            //     s'écrivait avec `school_id = NULL` — elle
+            //     n'appartenait à aucune école et disparaissait de tous
+            //     les journaux ;
+            //   · avec une session portant 999999, la trace s'écrivait
+            //     avec 999999 : la session primait sur le contexte.
+            //
+            //   > Une trace qui prend son périmètre dans la source que
+            //   > l'on protège partout ailleurs ne protège rien.
+            //
+            // Pour un compte d'école, `tenant_id()` et la session
+            // coïncident : le comportement ne change pas. Pour la visite
+            // d'un éditeur, il vaut l'école visitée — ce qui est bien
+            // l'école dont les données sont touchées.
+            'school_id'   => tenant_id(),
             'user_id'     => $_SESSION['user_id'] ?? null,
             'action'      => mb_substr($action, 0, 60),
             'entity_type' => $entityType !== null ? mb_substr($entityType, 0, 60) : null,

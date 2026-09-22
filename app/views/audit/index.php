@@ -47,6 +47,17 @@ $nom = static function (array $e): string {
 
     return $complet !== '' ? $complet : (string) $e['username'];
 };
+
+/**
+ * L'auteur appartient-il à l'éditeur de la plateforme ?
+ *
+ * Un compte de plateforme porte `school_id IS NULL`. Depuis que la trace
+ * prend son école dans le contexte, ses actions à l'intérieur de l'école
+ * apparaissent ici — et l'école doit savoir que ce n'est pas son
+ * personnel.
+ */
+$estEditeur = static fn (array $e): bool
+    => $e['user_id'] !== null && $e['author_school_id'] === null;
 ?>
 
 <div class="page-head">
@@ -72,6 +83,23 @@ $nom = static function (array $e): string {
     s'inscrit elle-même dans le journal. Les mots de passe et les clés ne
     sont jamais recopiés ici.
 </div>
+
+<?php
+/*
+ * Ce bandeau n'apparaît QUE si l'éditeur est réellement intervenu : une
+ * mise en garde permanente finirait par ne plus être lue.
+ */
+$interventions = count(array_filter($entrees, $estEditeur));
+?>
+<?php if ($interventions > 0): ?>
+    <div class="alert alert-warning small">
+        <i class="bi bi-person-badge me-1"></i>
+        Cette page contient <strong><?= (int) $interventions ?> action(s) de
+        l'éditeur de la plateforme</strong>, marquée(s) « Éditeur ». Elles ont
+        été faites sur vos données par un compte qui n'appartient pas à votre
+        établissement.
+    </div>
+<?php endif; ?>
 
 <!-- Filtres -->
 <form method="get" action="<?= e(url('/journal')) ?>" class="card mb-3">
@@ -174,7 +202,13 @@ $nom = static function (array $e): string {
                                 <span class="text-body-tertiary">#<?= (int) $entree['entity_id'] ?></span>
                             <?php endif; ?>
                         </td>
-                        <td class="small"><?= e($nom($entree)) ?></td>
+                        <td class="small">
+                            <?= e($nom($entree)) ?>
+                            <?php if ($estEditeur($entree)): ?>
+                                <span class="badge text-bg-dark ms-1"
+                                      title="Action de l'éditeur de la plateforme, pas de votre personnel">Éditeur</span>
+                            <?php endif; ?>
+                        </td>
                         <td class="small text-muted d-none d-lg-table-cell">
                             <?= e((string) ($entree['description'] ?? '')) ?>
                         </td>

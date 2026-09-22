@@ -318,6 +318,153 @@ try {
         ])['total'] === 0);
 
     // =================================================================
+    echo "\n  LE PÉRIMÈTRE VIENT DU CONTEXTE, PAS DE LA SESSION\n";
+
+    // `auth_user()` réétablit le contexte multi-école DEPUIS LA BASE à
+    // chaque requête, pour qu'une session altérée ne puisse pas changer
+    // d'école. Le journal lisait `$_SESSION['school_id']` : il prenait
+    // son périmètre dans la source la moins digne de confiance.
+
+    // Cas 1 — pas de session du tout (tâche en ligne de commande).
+    $sauvegarde = $_SESSION['school_id'] ?? null;
+    unset($_SESSION['school_id']);
+    tenant_set($idA);
+
+    audit_log('update', 'sonde', 1, null, ['x' => 1], 'SANS SESSION');
+
+    check('Sans session, la trace porte quand même l\'école',
+        (int) db_value(
+            'SELECT school_id FROM audit_logs
+              WHERE school_id = :s AND description = :d ORDER BY id DESC LIMIT 1',
+            ['s' => $idA, 'd' => 'SANS SESSION'],
+            true
+        ) === $idA,
+        'la trace doit être retrouvable DANS l\'école, pas ailleurs');
+
+    // Cas 2 — session altérée : le contexte doit primer.
+    $_SESSION['school_id'] = 999999;
+    tenant_set($idA);
+
+    audit_log('update', 'sonde', 2, null, ['x' => 1], 'SESSION ALTEREE');
+
+    check('Une session altérée ne détourne pas la trace',
+        (int) db_value(
+            'SELECT school_id FROM audit_logs
+              WHERE school_id = :s AND description = :d ORDER BY id DESC LIMIT 1',
+            ['s' => $idA, 'd' => 'SESSION ALTEREE'],
+            true
+        ) === $idA,
+        'la session portait 999999');
+
+    $_SESSION['school_id'] = $sauvegarde;
+    reprendre($adminA, $idA);
+
+    // =================================================================
+    echo "\n  L'ÉCOLE DISTINGUE L'ÉDITEUR DE SON PROPRE PERSONNEL\n";
+
+    // Un compte de plateforme porte `school_id IS NULL`. Depuis que la
+    // trace prend son école dans le contexte, ses actions DANS une école
+    // apparaissent dans le journal de celle-ci — il faut donc qu'elle
+    // puisse les reconnaître.
+    $editeur = db_insert('users', [
+        'uuid'          => str_uuid(),
+        'school_id'     => null,
+        'username'      => 'jrn.editeur.' . $idA,
+        'email'         => 'jrn.editeur.' . $idA . '@example.test',
+        'password_hash' => password_hash('MotDePasse2026', PASSWORD_BCRYPT, ['cost' => 4]),
+        'last_name'     => 'EDITEUR',
+        'first_name'    => 'Patrick',
+        'status'        => 'active',
+    ], true);
+
+    db_query(
+        'INSERT INTO user_roles (user_id, role_id)
+         SELECT :u, id FROM roles WHERE code = \'SUPER_ADMIN\' AND school_id IS NULL',
+        ['u' => $editeur],
+        true
+    );
+
+    // Il agit DANS l'école A.
+    $_SESSION['user_id'] = $editeur;
+    $_SESSION['school_id'] = null;
+    auth_user(true); perm_all(true); perm_roles(true);
+    tenant_set($idA);
+
+    audit_log('update', 'grade_sheet', 7, ['note' => 8], ['note' => 18],
+        'INTERVENTION EDITEUR');
+
+    reprendre($adminA, $idA);
+
+    $liste = audit_repo_search(['action' => 'update']);
+    $ligne = null;
+
+    foreach ($liste['rows'] as $r) {
+        if ($r['description'] === 'INTERVENTION EDITEUR') {
+            $ligne = $r;
+        }
+    }
+
+    check('L\'école VOIT l\'action de l\'éditeur sur ses données', $ligne !== null);
+
+    if ($ligne !== null) {
+        check('…et peut la reconnaître comme telle',
+            $ligne['author_school_id'] === null,
+            'author_school_id = ' . var_export($ligne['author_school_id'], true));
+
+        check('…alors que ses propres actions portent son école',
+            (int) ($liste['rows'][0]['author_school_id'] ?? 0) === $idA
+            || array_filter($liste['rows'], static fn (array $r): bool
+                => (int) ($r['author_school_id'] ?? 0) === $idA) !== []);
+
+        $detail = audit_repo_find((int) $ligne['id']);
+
+        check('La fiche de détail porte aussi la distinction',
+            $detail !== null && $detail['author_school_id'] === null);
+    }
+
+    // Le compte éditeur n'appartient à aucune école : son retrait est
+    // une écriture transversale, et le garde-fou l'exige explicite.
+    platform_scope_cli(static function () use ($editeur): void {
+        db_query('DELETE FROM user_roles WHERE user_id = :u', ['u' => $editeur], true);
+        db_query('DELETE FROM users WHERE id = :u', ['u' => $editeur], true);
+    });
+
+    // =================================================================
+    echo "\n  UN FILTRE DE DATE INCOMPRÉHENSIBLE EST IGNORÉ\n";
+
+    // Mesuré sur l'écran livré : `au=n'importe quoi` répondait 500
+    // (`strtotime` rend `false`, `date()` le refuse en PHP 8), et
+    // `du=2026-13-45` rendait ZÉRO résultat — l'écran affirmait qu'il ne
+    // s'était rien passé.
+    $reference = audit_repo_search([])['total'];
+
+    foreach (['pas une date', '2026-13-45', '2026-02-31', '0000-00-00', '--', '2026'] as $mauvaise) {
+        $obtenu = null;
+
+        try {
+            $obtenu = audit_repo_search(['au' => $mauvaise])['total'];
+        } catch (Throwable $e) {
+            $obtenu = 'ERREUR';
+        }
+
+        check('« ' . $mauvaise .' » en borne haute est ignoré, sans erreur',
+            $obtenu === $reference, (string) $obtenu);
+    }
+
+    check('Et en borne basse aussi',
+        audit_repo_search(['du' => '2026-13-45'])['total'] === $reference);
+
+    // Une date VALIDE doit toujours filtrer : « ignoré » ne doit pas
+    // devenir « inopérant ».
+    check('Une date valide filtre toujours',
+        audit_repo_search(['au' => date('Y-m-d', strtotime('-1 day'))])['total'] < $reference
+        && audit_repo_search(['du' => date('Y-m-d', strtotime('+1 day'))])['total'] === 0);
+
+    check('Le 31 février est refusé, pas reporté au 3 mars',
+        audit_date_valide('2026-02-31') === null
+        && audit_date_valide('2026-02-28') === '2026-02-28');
+
+    // =================================================================
     echo "\n  LA PAGINATION NE SAUTE NI NE RÉPÈTE\n";
 
     // Douze entrées dans la MÊME seconde : un tri sur `created_at` seul

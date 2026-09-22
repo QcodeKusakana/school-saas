@@ -7,10 +7,19 @@
  *
  * NOTE SUR `school_id` NULLABLE
  * =============================
- * Les actions de plateforme (visite d'une école par l'éditeur,
- * facturation) s'écrivent avec `school_id = NULL`. Une école filtrant
- * `school_id = :id` ne les voit donc pas — ce qui est voulu : ce sont
- * des actions de l'éditeur, pas de l'école.
+ * `audit_log()` prend l'école dans `tenant_id()`, le contexte réétabli
+ * depuis la base à chaque requête. Deux conséquences :
+ *
+ *  · une action de l'éditeur À L'INTÉRIEUR d'une école cliente porte
+ *    l'identifiant de CETTE école, et apparaît donc dans son journal —
+ *    ce sont ses données, elle doit pouvoir les relire ;
+ *  · seules les actions de l'éditeur HORS de toute école (facturation,
+ *    catalogue d'offres, gestion du parc) portent `NULL`, et celles-là
+ *    n'appartiennent à aucun journal d'école.
+ *
+ * L'en-tête de ce fichier affirmait l'inverse — que toute action de
+ * l'éditeur restait invisible à l'école. C'était vrai, et c'était le
+ * défaut : le journal prenait son périmètre dans la session.
  */
 
 declare(strict_types=1);
@@ -84,15 +93,50 @@ function audit_repo_apply_filters(array $filtres, array &$where, array &$params)
     // `created_at` est un `datetime`. Comparer `<= '2026-09-22'` exclut
     // toute la journée du 22, qui vaut `2026-09-22 00:00:00`. On borne
     // donc au lendemain, strictement.
-    if (!empty($filtres['du'])) {
-        $where[]        = 'a.created_at >= :du';
-        $params['du']   = (string) $filtres['du'] . ' 00:00:00';
+    //
+    // ET ON VALIDE AVANT DE CALCULER.
+    //
+    // Le champ est un `<input type="date">`, mais rien n'oblige un client
+    // à le respecter. Mesuré à l'exécution sur l'écran livré :
+    //   · `au=n'importe quoi` → `strtotime()` rend `false`, `date()` le
+    //     refuse en PHP 8, et la page répondait 500 ;
+    //   · `du=2026-13-45` → aucune erreur, mais ZÉRO résultat : l'écran
+    //     affirmait qu'il ne s'était rien passé.
+    //
+    //   > Un filtre qu'on n'a pas compris ne doit ni planter ni répondre
+    //   > « rien » : il doit être ignoré, et le dire.
+    $du = audit_date_valide($filtres['du'] ?? '');
+    $au = audit_date_valide($filtres['au'] ?? '');
+
+    if ($du !== null) {
+        $where[]       = 'a.created_at >= :du';
+        $params['du']  = $du . ' 00:00:00';
     }
 
-    if (!empty($filtres['au'])) {
-        $where[]        = 'a.created_at < :au';
-        $params['au']   = date('Y-m-d', strtotime((string) $filtres['au'] . ' +1 day')) . ' 00:00:00';
+    if ($au !== null) {
+        $where[]       = 'a.created_at < :au';
+        $params['au']  = date('Y-m-d', (int) strtotime($au . ' +1 day')) . ' 00:00:00';
     }
+}
+
+/**
+ * Une date de filtre, ou `null` si elle n'est pas exploitable.
+ *
+ * On exige la forme exacte `Y-m-d` ET une date réellement existante :
+ * `checkdate` refuse le 31 février, que `strtotime` accepterait en le
+ * reportant au 3 mars.
+ */
+function audit_date_valide(mixed $valeur): ?string
+{
+    $texte = trim((string) $valeur);
+
+    if ($texte === '' || preg_match('/^\d{4}-\d{2}-\d{2}$/', $texte) !== 1) {
+        return null;
+    }
+
+    [$a, $m, $j] = array_map('intval', explode('-', $texte));
+
+    return checkdate($m, $j, $a) ? $texte : null;
 }
 
 /**
@@ -109,6 +153,18 @@ function audit_repo_run(array $where, array $params, int $page, int $parPage, bo
     $page   = min(max(1, $page), $pages);
     $offset = ($page - 1) * $parPage;
 
+    // `author_school_id` : L'AUTEUR EST-IL DE CETTE ÉCOLE ?
+    //
+    // Depuis que la trace prend son école dans le CONTEXTE et non dans
+    // la session, une action de l'éditeur à l'intérieur d'une école
+    // cliente apparaît dans le journal de cette école — c'est voulu, ce
+    // sont ses données. Mais l'école doit pouvoir la distinguer de celles
+    // de son propre personnel, sans quoi un nom inconnu s'affiche au
+    // milieu du sien. Un compte de plateforme porte `school_id IS NULL`.
+    //
+    // (Cette explication était écrite DANS la chaîne SQL, en commentaire
+    // `--` : dix lignes de prose envoyées à MySQL à chaque requête.)
+    //
     // ON N'ORDONNE PAS PAR `created_at` SEUL.
     //
     // Plusieurs écritures partagent la même seconde — c'est courant lors
@@ -118,7 +174,8 @@ function audit_repo_run(array $where, array $params, int $page, int $parPage, bo
     $rows = db_all(
         'SELECT a.id, a.school_id, a.user_id, a.action, a.entity_type, a.entity_id,
                 a.description, a.created_at, a.ip_address,
-                u.username, u.last_name, u.first_name'
+                u.username, u.last_name, u.first_name,
+                u.school_id AS author_school_id'
         . ($platform ? ', s.name AS school_name, s.code AS school_code' : '') . '
            FROM audit_logs a
            LEFT JOIN users u ON u.id = a.user_id'
@@ -141,7 +198,8 @@ function audit_repo_run(array $where, array $params, int $page, int $parPage, bo
 function audit_repo_find(int $id): ?array
 {
     $ligne = db_one(
-        'SELECT a.*, u.username, u.last_name, u.first_name
+        'SELECT a.*, u.username, u.last_name, u.first_name,
+                u.school_id AS author_school_id
            FROM audit_logs a
            LEFT JOIN users u ON u.id = a.user_id
           WHERE a.id = :id AND a.school_id = :school_id

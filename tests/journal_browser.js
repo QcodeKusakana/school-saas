@@ -97,6 +97,30 @@ const titre = (t) => console.log('\n  ' + t);
     check('une période sans activité affiche un vide explicite',
         /Aucune entrée/.test(await p.locator('body').innerText()));
 
+    // UNE DATE QUE LE NAVIGATEUR N'A PAS PRODUITE.
+    //
+    // Le champ est un `<input type="date">`, mais rien n'oblige un client
+    // a le respecter. `au=pas-une-date` repondait 500 : `strtotime()`
+    // rend `false` et `date()` le refuse en PHP 8.
+    for (const mauvaise of ['pas-une-date', '2026-13-45', '2026-02-31']) {
+        const r = await p.goto(BASE + '/journal?au=' + encodeURIComponent(mauvaise));
+        await p.waitForLoadState('networkidle');
+
+        check('une date « ' + mauvaise + ' » ne casse pas la page',
+            r.status() === 200
+            && !/TypeError|Erreur —/.test(await p.locator('body').innerText()),
+            'HTTP ' + r.status());
+    }
+
+    // Et elle est IGNORÉE, pas appliquée : l'écran ne doit pas affirmer
+    // qu'il ne s'est rien passé.
+    await p.goto(BASE + '/journal?au=2026-13-45');
+    await p.waitForLoadState('networkidle');
+
+    check('et elle est ignorée, pas appliquée',
+        await p.locator('table tbody tr').count() > 0,
+        await p.locator('table tbody tr').count() + ' ligne(s)');
+
     // =================================================================
     titre('LE DÉTAIL D\'UNE ENTRÉE');
 

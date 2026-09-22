@@ -25,7 +25,15 @@ $nom = static function (array $e): string {
 
     $complet = trim((string) $e['last_name'] . ' ' . (string) $e['first_name']);
 
-    return $complet !== '' ? $complet . ' (' . (string) $e['username'] . ')' : (string) $e['username'];
+    $affiche = $complet !== ''
+        ? $complet . ' (' . (string) $e['username'] . ')'
+        : (string) $e['username'];
+
+    // Un compte de plateforme porte `school_id IS NULL` : l'école doit
+    // savoir que cette action n'est pas celle de son personnel.
+    return $e['author_school_id'] === null
+        ? $affiche . ' — éditeur de la plateforme'
+        : $affiche;
 };
 
 /** Affiche une valeur de journal sans jamais la laisser interpréter. */
