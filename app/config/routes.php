@@ -459,3 +459,21 @@ route('GET',  '/ecole/logo',             'school', 'ctrl_school_logo',          
 // donc à grossir chaque module sur une carte de 85 mm. La forme longue
 // (`/verifier/…`), imprimée en clair à côté, reste pour qui la saisit.
 route('GET',  '/v/{token}', 'documents', 'ctrl_documents_verify', []);
+
+// ---------------------------------------------------------------------
+//  PHASE 9B — LE JOURNAL
+//
+// `audit.view` dormait depuis la phase 1 : neuf phases écrivaient dans
+// `audit_logs` sans que personne puisse en lire une ligne.
+//
+// La PURGE porte sa propre permission, `audit.purge`, volontairement
+// distincte : lire le journal et pouvoir l'effacer sont deux pouvoirs
+// différents, et la DIRECTION — qui lit — est justement l'une des
+// personnes que ce journal trace.
+route('GET',  '/journal',        'audit', 'ctrl_audit_index', ['auth', 'school', 'perm:audit.view']);
+route('GET',  '/journal/{id}',   'audit', 'ctrl_audit_show',  ['auth', 'school', 'perm:audit.view']);
+route('POST', '/journal/purger', 'audit', 'ctrl_audit_purge', ['auth', 'school', 'perm:audit.purge']);
+
+// Le journal global de l'éditeur. La lecture est inter-écoles : le
+// contrôleur l'ouvre dans `platform_scope()`, qui exige l'habilitation.
+route('GET', '/plateforme/journal', 'platform', 'ctrl_platform_audit', ['auth', 'perm:platform.audit.view']);

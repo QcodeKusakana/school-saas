@@ -147,7 +147,7 @@ $isPlatform = $user['school_id'] === null;
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view'])): ?>
+            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view', 'audit.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
                 <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
@@ -211,12 +211,35 @@ $isPlatform = $user['school_id'] === null;
                     </a>
                 <?php endif; ?>
 
-                <?php /* La garde suit la permission de la ROUTE — .
-                   Les deux avaient divergé : un compte portant 
-                   sans  voyait un lien qui le refusait. */ ?>
+                <?php
+                /*
+                 * La garde suit la permission de la ROUTE, school.branding.
+                 * Les deux avaient divergé : un compte portant school.edit
+                 * sans school.branding voyait un lien qui le refusait.
+                 *
+                 * (Ce commentaire avait perdu les deux noms de permission
+                 * qu'il citait et ne disait plus rien ; un commentaire vide
+                 * est pire qu'un silence.)
+                 */
+                ?>
                 <?php if (can('school.branding') && route_exists('/ecole/parametres')): ?>
                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
                         <i class="bi bi-gear"></i><span>Mon établissement</span>
+                    </a>
+                <?php endif; ?>
+
+                <?php
+                /*
+                 * LE JOURNAL — phase 9B.
+                 *
+                 * `audit.view` est semée depuis la phase 1 et n'ouvrait
+                 * aucun écran : neuf phases ont écrit dans `audit_logs`
+                 * sans que personne puisse en lire une ligne.
+                 */
+                if (can('audit.view') && route_exists('/journal')):
+                    ?>
+                    <a class="nav-item <?= nav_active('/journal') ?>" href="<?= e(url('/journal')) ?>">
+                        <i class="bi bi-shield-check"></i><span>Journal des actions</span>
                     </a>
                 <?php endif; ?>
 

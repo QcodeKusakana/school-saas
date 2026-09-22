@@ -165,6 +165,20 @@ if ($hasCycles === 0) {
 $adminId   = demo_user($schoolId, 'directeur.demo', 'KABAMBA', 'Thérèse', 'F', 'DIRECTION');
 $teacherId = demo_user($schoolId, 'enseignant.demo', 'MUKENDI', 'Joseph', 'M', 'ENSEIGNANT');
 
+// UN COMPTE ÉDITEUR — `school_id = NULL`.
+//
+// Il n'y en avait aucun, et toute la console de l'éditeur (parc,
+// abonnements, soldes, journal global) était donc INVÉRIFIABLE en
+// navigateur : les suites PHP la couvraient, aucune recette ne l'ouvrait.
+//
+//   > Un écran qu'aucun compte ne peut ouvrir n'est pas un écran testé,
+//   > c'est un écran supposé.
+//
+// Comme le reste de ce fichier, ce compte est une donnée de DÉMONSTRATION :
+// `seed_demo.php` est à supprimer avant la mise en service (voir la liste
+// « Avant mise en production »).
+demo_user(null, 'editeur.demo', 'NGOY', 'Patrick', 'M', 'SUPER_ADMIN');
+
 // Toute la suite s'exécute AU NOM du directeur : les services vérifient les
 // permissions, les exécuter sans identité échouerait.
 $_SESSION['user_id']   = $adminId;
@@ -425,7 +439,7 @@ function demo_school(): ?array
  * créé par l'application.
  */
 function demo_user(
-    int $schoolId,
+    ?int $schoolId,
     string $username,
     string $lastName,
     string $firstName,

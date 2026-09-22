@@ -243,3 +243,58 @@ function ctrl_platform_billing_cancel(string $id, string $paymentId): void
 
     redirect('/plateforme/ecoles/' . (int) $id . '/facturation');
 }
+
+// ---------------------------------------------------------------------
+//  LE JOURNAL GLOBAL — phase 9B
+//
+// `platform.audit.view` était semée depuis la phase 1, et le lien de la
+// barre latérale était masqué par `route_exists()` faute d'écran.
+//
+// LA LECTURE EST INTER-ÉCOLES, DONC ELLE PASSE PAR LE PÉRIMÈTRE.
+// `platform_scope()` vérifie d'abord l'habilitation ; sans lui, le
+// garde-fou refuse la requête — et c'est bien ce qu'on veut.
+// ---------------------------------------------------------------------
+
+function ctrl_platform_audit(): void
+{
+    require_once APP_PATH . '/modules/audit/services.php';
+
+    $filtres = [
+        'school' => (string) input('ecole', ''),
+        'action' => (string) input('action', ''),
+        'entity' => (string) input('entite', ''),
+        'du'     => (string) input('du', ''),
+        'au'     => (string) input('au', ''),
+    ];
+
+    $page = max(1, (int) input_int('page', 1));
+
+    [$resultat, $ecoles, $actions] = platform_scope(
+        'platform.audit.view',
+        static function () use ($filtres, $page): array {
+            return [
+                audit_repo_search_platform($filtres, $page),
+                db_all(
+                    'SELECT id, code, name FROM schools ORDER BY name',
+                    [],
+                    true
+                ),
+                array_map(
+                    static fn (array $r): string => (string) $r['action'],
+                    db_all('SELECT DISTINCT action FROM audit_logs ORDER BY action', [], true)
+                ),
+            ];
+        }
+    );
+
+    view('platform/audit', [
+        'title'   => 'Journal global',
+        'entrees' => $resultat['rows'],
+        'total'   => $resultat['total'],
+        'pages'   => $resultat['pages'],
+        'page'    => $resultat['page'],
+        'filtres' => $filtres,
+        'ecoles'  => $ecoles,
+        'actions' => $actions,
+    ], 'app');
+}
