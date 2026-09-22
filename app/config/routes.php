@@ -114,6 +114,76 @@ route('GET',  '/enseignants/{id}',     'teachers', 'ctrl_teachers_show',        
 route('POST', '/enseignants/{id}',     'teachers', 'ctrl_teachers_update',        ['auth', 'school', 'perm:teacher.manage']);
 route('POST', '/enseignants/{id}/statut', 'teachers', 'ctrl_teachers_change_status', ['auth', 'school', 'perm:teacher.manage']);
 
+// ---------------------------------------------------------------------
+// Phase 8B1 — Hors connexion
+//
+// LES TROIS POINTS D'ENTRÉE DE L'APPAREIL NE SONT PAS DISPENSÉS DE
+// GRAND-CHOSE : `auth`, `school` et le jeton CSRF s'appliquent comme
+// partout. Un point d'entrée de synchronisation « allégé » serait la
+// porte de service du produit.
+//
+// Ils n'exigent AUCUNE permission de synchronisation : c'est
+// `attendance.record` qui décide, au fond, puisque la synchronisation
+// rejoue `attendance_service_take()`. Exiger une permission de plus
+// ici la rendrait contournable ou redondante.
+//
+// `sync.view` et `sync.resolve` gouvernent l'écran de l'établissement,
+// pas le téléphone de l'enseignant.
+// ---------------------------------------------------------------------
+route('POST', '/sync/appareil',  'sync', 'ctrl_sync_device', ['auth', 'school']);
+route('POST', '/sync/envoyer',   'sync', 'ctrl_sync_push',   ['auth', 'school']);
+route('GET',  '/sync/etat',      'sync', 'ctrl_sync_state',  ['auth', 'school']);
+
+route('GET',  '/synchronisation',                'sync', 'ctrl_sync_conflicts', ['auth', 'school', 'perm:sync.view']);
+route('POST', '/synchronisation/conflit/{id}',   'sync', 'ctrl_sync_resolve',   ['auth', 'school', 'perm:sync.resolve']);
+
+// ---------------------------------------------------------------------
+// Phase 8A — Messagerie
+//
+// `email.manage` est DISTINCTE de `school.edit`, et ce n'est pas du
+// zèle : détenir les identifiants du serveur d'envoi, c'est pouvoir
+// écrire aux familles AU NOM de l'établissement. Modifier l'adresse
+// postale de l'école n'a pas cette portée.
+//
+// Le JOURNAL est ouvert plus largement (`email.view`) : savoir si un
+// message est parti n'est pas savoir comment il part.
+// ---------------------------------------------------------------------
+route('GET',  '/ecole/emails',          'mail', 'ctrl_mail_settings_form', ['auth', 'school', 'perm:email.manage']);
+route('POST', '/ecole/emails',          'mail', 'ctrl_mail_settings_save', ['auth', 'school', 'perm:email.manage']);
+route('POST', '/ecole/emails/essai',    'mail', 'ctrl_mail_test',          ['auth', 'school', 'perm:email.manage']);
+route('GET',  '/ecole/emails/journal',  'mail', 'ctrl_mail_journal',       ['auth', 'school', 'perm:email.view']);
+route('POST', '/ecole/emails/journal/{id}/rejouer', 'mail', 'ctrl_mail_retry', ['auth', 'school', 'perm:email.manage']);
+
+// ---------------------------------------------------------------------
+// Phase 7D — Utilisateurs du personnel
+//
+// LE MODULE LE PLUS DANGEREUX DU PRODUIT : tous les autres décident de
+// ce qu'on peut FAIRE, celui-ci décide de QUI PEUT LE FAIRE.
+//
+// Les cinq permissions `user.*` étaient semées depuis la phase 1 et
+// n'avaient aucun écran : les comptes du personnel naissaient en base.
+//
+// Trois pouvoirs distincts, trois permissions, et ce n'est pas du
+// zèle : créer un compte, réinitialiser son mot de passe et le
+// désactiver sont trois gestes dont le plus anodin en apparence —
+// la réinitialisation — est celui qui permet de prendre la place de
+// quelqu'un d'autre.
+//
+// `user.edit` couvre aussi les rôles : une permission de plus
+// n'apporterait rien tant que la hiérarchie des niveaux, portée par
+// le service, interdit déjà d'attribuer au-dessus de soi.
+// ---------------------------------------------------------------------
+route('GET',  '/utilisateurs',            'users', 'ctrl_users_index',          ['auth', 'school', 'perm:user.view']);
+route('GET',  '/utilisateurs/nouveau',    'users', 'ctrl_users_create_form',    ['auth', 'school', 'perm:user.create']);
+route('POST', '/utilisateurs',            'users', 'ctrl_users_store',          ['auth', 'school', 'perm:user.create']);
+route('GET',  '/utilisateurs/{id}',       'users', 'ctrl_users_show',           ['auth', 'school', 'perm:user.view']);
+route('POST', '/utilisateurs/{id}',       'users', 'ctrl_users_update',         ['auth', 'school', 'perm:user.edit']);
+route('POST', '/utilisateurs/{id}/roles', 'users', 'ctrl_users_set_roles',      ['auth', 'school', 'perm:user.edit']);
+route('POST', '/utilisateurs/{id}/etat',  'users', 'ctrl_users_set_status',     ['auth', 'school', 'perm:user.delete']);
+route('POST', '/utilisateurs/{id}/archiver',   'users', 'ctrl_users_archive',   ['auth', 'school', 'perm:user.delete']);
+route('POST', '/utilisateurs/{id}/mot-de-passe', 'users', 'ctrl_users_reset_password', ['auth', 'school', 'perm:user.reset_password']);
+route('POST', '/utilisateurs/{id}/deverrouiller', 'users', 'ctrl_users_unlock', ['auth', 'school', 'perm:user.edit']);
+
 route('GET',  '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_classroom_grid', ['auth', 'school', 'perm:teacher.view']);
 route('POST', '/classes/{id}/repartition',                  'teachers', 'ctrl_teachers_assign',         ['auth', 'school', 'perm:teacher.assign']);
 route('POST', '/classes/{id}/repartition/{assignment_id}/retirer', 'teachers', 'ctrl_teachers_unassign', ['auth', 'school', 'perm:teacher.assign']);
@@ -279,9 +349,113 @@ route('POST', '/finances/depenses',             'finance', 'ctrl_finance_expense
 route('POST', '/finances/depenses/{id}/annuler','finance', 'ctrl_finance_expense_cancel',  ['auth', 'school', 'perm:expense.cancel']);
 
 // ---------------------------------------------------------------------
+//  PHASE 7B — LA CONSOLE DE L'ÉDITEUR
+// ---------------------------------------------------------------------
+//
+// Ces écrans n'ont PAS le middleware `school` : ils vivent hors de tout
+// établissement. C'est leur nature — l'éditeur regarde toutes les
+// écoles à la fois — et c'est pourquoi chaque lecture passe par
+// `platform_scope()`, qui exige un compte de la plateforme ET la
+// permission. Voir app/core/platform.php.
+//
+// La permission est posée ici EN PLUS de celle du périmètre : une
+// défense qui se répète à deux niveaux survit à la disparition de l'un
+// des deux.
+
+route('GET',  '/plateforme/ecoles',       'platform', 'ctrl_platform_schools',       ['auth', 'perm:platform.school.view']);
+route('GET',  '/plateforme/ecoles/{id}',  'platform', 'ctrl_platform_school_show',   ['auth', 'perm:platform.school.view']);
+route('POST', '/plateforme/ecoles/{id}/ouvrir', 'platform', 'ctrl_platform_enter_school', ['auth', 'perm:platform.school.view']);
+route('POST', '/plateforme/quitter',      'platform', 'ctrl_platform_leave_school',  ['auth', 'perm:platform.school.view']);
+
+route('GET',  '/plateforme/abonnements',  'platform', 'ctrl_platform_subscriptions', ['auth', 'perm:platform.subscription.manage']);
+route('POST', '/plateforme/ecoles/{id}/offre',   'platform', 'ctrl_platform_change_plan',        ['auth', 'perm:platform.subscription.manage']);
+route('POST', '/plateforme/ecoles/{id}/statut',  'platform', 'ctrl_platform_subscription_status', ['auth', 'perm:platform.subscription.manage']);
+
+// --- Facturation SaaS (7B2) ------------------------------------------
+//
+// `platform.billing.manage` est DISTINCTE de
+// `platform.subscription.manage` : négocier une offre et constater
+// qu'elle est payée sont deux pouvoirs de nature différente. La leçon
+// de la recette Finances vaut ici — une permission qui recouvre deux
+// pouvoirs finit toujours par accorder le plus dangereux des deux.
+
+route('GET',  '/plateforme/soldes', 'platform', 'ctrl_platform_billing_index',  ['auth', 'perm:platform.billing.manage']);
+route('GET',  '/plateforme/ecoles/{id}/facturation', 'platform', 'ctrl_platform_billing_school', ['auth', 'perm:platform.billing.manage']);
+route('POST', '/plateforme/ecoles/{id}/versement',   'platform', 'ctrl_platform_billing_record', ['auth', 'perm:platform.billing.manage']);
+route('POST', '/plateforme/ecoles/{id}/versement/{paymentId}/confirmer', 'platform', 'ctrl_platform_billing_confirm', ['auth', 'perm:platform.billing.manage']);
+route('POST', '/plateforme/ecoles/{id}/versement/{paymentId}/annuler',   'platform', 'ctrl_platform_billing_cancel',  ['auth', 'perm:platform.billing.manage']);
+
+// ---------------------------------------------------------------------
 // Les modules des phases suivantes viendront s'ajouter ici :
 //
-//   Phase 5B — encaissements /finances/caisse/...
-//   Phase 6 — portails      /parent/..., /eleve/...
-//   Phase 7 — plateforme    /plateforme/...
+//   Phase 7C  — Mobile Money
+//   Phase 9   — journal global    /plateforme/journal
 // ---------------------------------------------------------------------
+
+// --- Documents officiels (9A) ----------------------------------------
+//
+// `document.generate` délivre, `document.view` consulte, et
+// `document.revoke` — créée en phase 9A — retire sa valeur à un
+// document déjà remis. Les trois sont distinctes à dessein : établir
+// une attestation est un geste de secrétariat, la retirer engage
+// l'établissement vis-à-vis de qui la détient.
+
+route('GET',  '/documents',                        'documents', 'ctrl_documents_index',  ['auth', 'school', 'perm:document.view']);
+route('GET',  '/documents/delivrer/{enrollmentId}','documents', 'ctrl_documents_new',    ['auth', 'school', 'perm:document.generate']);
+route('POST', '/documents/delivrer/{enrollmentId}','documents', 'ctrl_documents_issue',  ['auth', 'school', 'perm:document.generate']);
+route('GET',  '/documents/{id}/imprimer',          'documents', 'ctrl_documents_print',  ['auth', 'school', 'perm:document.view']);
+route('POST', '/documents/{id}/revoquer',          'documents', 'ctrl_documents_revoke', ['auth', 'school', 'perm:document.revoke']);
+
+// LA VÉRIFICATION EST PUBLIQUE, et c'est la raison d'être du QR code.
+//
+// Un employeur, une banque ou une autre école doit pouvoir contrôler un
+// papier sans posséder de compte ici. Aucun intergiciel : ni `auth`, ni
+// `guest` — un parent connecté doit pouvoir vérifier lui aussi.
+//
+// Ce qu'elle rend ne nomme aucun élève. Le jeton n'est pas énumérable
+// (10^18 combinaisons), et il n'ouvre rien d'autre que ces quatre
+// lignes. Voir `document_service_verify()`.
+route('GET',  '/verifier',         'documents', 'ctrl_documents_verify', []);
+route('GET',  '/verifier/{token}', 'documents', 'ctrl_documents_verify', []);
+
+// --- Photo de l'élève (9A) -------------------------------------------
+//
+// `photo_path` existait depuis la phase 1 sans que rien ne l'écrive. La
+// carte d'élève a rendu le manque visible : son refus disait « ajoutez
+// une photo » alors qu'aucun écran ne le permettait.
+//
+// LA PHOTO N'EST PAS SERVIE PAR UNE URL PUBLIQUE. Les fichiers vivent
+// dans `storage/uploads`, hors de la racine web, et cette route est le
+// seul chemin vers eux — derrière `auth`, `school` et `student.view`.
+// Une photo de mineur déposée dans `public/` serait lisible par qui
+// devine son URL, sans session.
+route('POST', '/eleves/{id}/photo',           'students', 'ctrl_students_set_photo',    ['auth', 'school', 'perm:student.edit']);
+route('POST', '/eleves/{id}/photo/retirer',   'students', 'ctrl_students_remove_photo', ['auth', 'school', 'perm:student.edit']);
+route('GET',  '/eleves/{id}/photo',           'students', 'ctrl_students_photo',        ['auth', 'school', 'perm:student.view']);
+
+// --- Aperçu d'un document (9A) ---------------------------------------
+//
+// Un SPÉCIMEN, jamais un document : aucun numéro consommé, aucune ligne
+// créée, aucun code de vérification. Voir ctrl_documents_preview().
+route('GET',  '/documents/apercu/{enrollmentId}', 'documents', 'ctrl_documents_preview', ['auth', 'school', 'perm:document.view']);
+
+// --- Mon établissement (9A) ------------------------------------------
+//
+// `schools.logo_path` était déclaré depuis la phase 1, lu à deux
+// endroits, jamais écrit ; `school.branding` dormait ; et
+// `school_settings` était vide, ce qui faisait imprimer « Fait à , » au
+// bas des documents officiels.
+//
+// Le logo se sert par une route contrôlée, comme la photo d'élève :
+// deux chemins de service voudraient dire deux jeux de règles.
+route('GET',  '/ecole/parametres',       'school', 'ctrl_school_settings_form', ['auth', 'school', 'perm:school.branding']);
+route('POST', '/ecole/parametres',       'school', 'ctrl_school_settings_save', ['auth', 'school', 'perm:school.branding']);
+route('POST', '/ecole/logo',             'school', 'ctrl_school_set_logo',      ['auth', 'school', 'perm:school.branding']);
+route('POST', '/ecole/logo/retirer',     'school', 'ctrl_school_remove_logo',   ['auth', 'school', 'perm:school.branding']);
+route('GET',  '/ecole/logo',             'school', 'ctrl_school_logo',          ['auth', 'school']);
+
+// La forme COURTE de la vérification — c'est elle qu'encode le QR.
+// Sept caractères de moins suffisent à faire gagner une version de code,
+// donc à grossir chaque module sur une carte de 85 mm. La forme longue
+// (`/verifier/…`), imprimée en clair à côté, reste pour qui la saisit.
+route('GET',  '/v/{token}', 'documents', 'ctrl_documents_verify', []);

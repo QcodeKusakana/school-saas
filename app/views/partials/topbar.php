@@ -26,10 +26,13 @@ declare(strict_types=1);
 
     <div class="topbar-actions">
 
-        <!-- Indicateur de connexion réseau, piloté par app.js (utile en phase 8) -->
-        <span class="net-status" data-net-status hidden>
-            <i class="bi bi-wifi-off"></i><span class="net-status-text">Hors connexion</span>
-        </span>
+        <!-- ÉTAT DE LA SYNCHRONISATION (phase 8B).
+             Il ne dit pas seulement « en ligne » : il annonce ce qui
+             attend d'être envoyé et ce qui est en conflit. Un appel
+             saisi hors connexion qui ne partirait jamais sans que
+             personne ne le voie serait pire que pas de hors connexion
+             du tout. -->
+        <span id="etat-connexion" class="badge bg-secondary-subtle text-secondary-emphasis">…</span>
 
         <div class="dropdown">
             <button class="user-button" type="button" data-bs-toggle="dropdown" aria-expanded="false">
@@ -63,7 +66,10 @@ declare(strict_types=1);
                 <li>
                     <!-- Déconnexion en POST : un lien GET serait déclenchable
                          par une image distante (CSRF de déconnexion). -->
-                    <form method="post" action="<?= e(url('/logout')) ?>" class="px-1">
+                    <!-- `data-deconnexion` : offline.js efface les listes
+                         d'élèves, la file et le cache. Un téléphone est
+                         souvent partagé ; se déconnecter doit vider. -->
+                    <form method="post" action="<?= e(url('/logout')) ?>" class="px-1" data-deconnexion>
                         <?= csrf_field() ?>
                         <button type="submit" class="dropdown-item text-danger">
                             <i class="bi bi-box-arrow-right"></i> Se déconnecter

@@ -75,8 +75,22 @@ $locked   = $session !== null && (int) $session['is_locked'] === 1;
         </div>
     </div>
 <?php else: ?>
+    <?php
+    /* HORS CONNEXION (phase 8B).
+       Le formulaire porte ce qu'il faut pour être rejoué plus tard :
+       la classe, la date, le moment, et surtout `seen-updated` —
+       l'état du registre AU MOMENT OÙ IL A ÉTÉ OUVERT. C'est lui qui
+       permettra au serveur de distinguer « personne n'y a touché »
+       de « quelqu'un l'a modifié pendant ma coupure », au lieu
+       d'écraser en silence. */
+    ?>
     <form method="post"
-          action="<?= e(url('/presences/classe/' . (int) $classroom['id'], ['date' => $date, 'moment' => $slot])) ?>">
+          action="<?= e(url('/presences/classe/' . (int) $classroom['id'], ['date' => $date, 'moment' => $slot])) ?>"
+          data-appel
+          data-classe="<?= (int) $classroom['id'] ?>"
+          data-date="<?= e($date) ?>"
+          data-moment="<?= e($slot) ?>"
+          data-seen-updated="<?= e((string) ($session['updated_at'] ?? '')) ?>">
         <?= csrf_field() ?>
 
         <div class="card">
@@ -95,11 +109,17 @@ $locked   = $session !== null && (int) $session['is_locked'] === 1;
                         <?php foreach ($students as $row): ?>
                             <?php
                             $id      = (int) $row['enrollment_id'];
+                            $nomComplet = trim((string) $row['last_name'] . ' '
+                                . (string) ($row['post_name'] ?? '') . ' '
+                                . (string) $row['first_name']);
                             // Par défaut « présent » : l'appel consiste à
                             // signaler les manquants, pas à cocher 45 fois.
                             $current = $row['status'] ?? 'present';
                             ?>
-                            <tr>
+                            <tr data-eleve
+                                data-inscription="<?= $id ?>"
+                                data-nom="<?= e($nomComplet) ?>"
+                                data-matricule="<?= e((string) ($row['matricule'] ?? '')) ?>">
                                 <td>
                                     <span class="fw-medium">
                                         <?= e(full_name($row['last_name'], $row['post_name'], $row['first_name'])) ?>
@@ -178,3 +198,9 @@ $locked   = $session !== null && (int) $session['is_locked'] === 1;
         </form>
     <?php endif; ?>
 <?php endif; ?>
+
+<?php
+/* L'appel hors connexion. Chargé UNIQUEMENT sur cet écran : le reste
+   du produit n'a rien à faire d'une file d'attente locale. */
+?>
+<?= script_tag('assets/js/attendance-offline.js') ?>

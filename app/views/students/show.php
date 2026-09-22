@@ -116,6 +116,46 @@ $relationshipLabels = [
         </p>
 
         <?php
+        /*
+         * LA PHOTO DE L'ÉLÈVE (phase 9A).
+         *
+         * `photo_path` existait depuis la phase 1 sans qu'aucun écran ne
+         * l'écrive. La carte d'élève a rendu le manque visible.
+         *
+         * La photo n'est JAMAIS servie par une URL publique : le fichier
+         * vit hors de la racine web, et la route /eleves/{id}/photo
+         * vérifie la session avant d'envoyer le moindre octet.
+         */
+        ?>
+        <?php if (can('student.edit') && route_exists('/eleves/{id}/photo')): ?>
+            <button type="button" class="btn btn-sm btn-outline-secondary mt-1"
+                    data-bs-toggle="collapse" data-bs-target="#bloc-photo">
+                <i class="bi bi-camera me-1"></i>
+                <?= $student['photo_path'] !== null ? 'Changer la photo' : 'Ajouter une photo' ?>
+            </button>
+        <?php endif; ?>
+
+        <?php
+        // DÉLIVRER UN DOCUMENT (phase 9A).
+        //
+        // Le lien vit ici parce que c'est ici qu'on en a besoin : un
+        // parent se présente au guichet, le secrétariat ouvre le dossier
+        // de l'enfant. L'obliger à passer par un écran « Documents » et
+        // à y rechercher l'élève ajouterait deux étapes à un geste
+        // quotidien.
+        //
+        // Il n'apparaît que s'il existe une inscription pour l'année en
+        // cours : un document atteste d'une scolarité, et sans
+        // inscription il n'y a rien à attester.
+        ?>
+        <?php if (can('document.generate') && $currentEnrollment !== null && route_exists('/documents')): ?>
+            <a class="btn btn-sm btn-outline-primary mt-1"
+               href="<?= e(url('/documents/delivrer/' . (int) $currentEnrollment['id'])) ?>">
+                <i class="bi bi-patch-check me-1"></i> Délivrer un document
+            </a>
+        <?php endif; ?>
+
+        <?php
         // L'ACCÈS DE L'ÉLÈVE À SON PROPRE ESPACE (phase 6B).
         //
         // Le mot de passe initial s'affiche une seule fois : c'est
@@ -156,6 +196,78 @@ $relationshipLabels = [
         </div>
     <?php endif; ?>
 </div>
+
+<?php
+/*
+ * LA PHOTO DE L'ÉLÈVE (phase 9A).
+ *
+ * Le bloc se déplie depuis le bouton de l'en-tête, et s'ouvre de
+ * lui-même quand une photo existe déjà — on vient ici pour la voir au
+ * moins autant que pour la changer.
+ *
+ * L'ancre #bloc-photo est visée depuis l'écran de délivrance, quand la
+ * carte est refusée faute de photo : le secrétariat arrive directement
+ * au bon endroit plutôt que de chercher dans la page.
+ */
+?>
+<?php if (can('student.view') && route_exists('/eleves/{id}/photo')): ?>
+    <div class="collapse<?= $student['photo_path'] !== null ? ' show' : '' ?>" id="bloc-photo">
+        <div class="card mb-4">
+            <div class="card-body d-flex flex-wrap gap-3 align-items-start">
+
+                <div style="width:110px;">
+                    <?php if ($student['photo_path'] !== null): ?>
+                        <img src="<?= e(url('/eleves/' . (int) $student['id'] . '/photo')) ?>"
+                             alt="Photo de l'élève"
+                             style="width:110px;height:140px;object-fit:cover;
+                                    border:1px solid #cbd5e1;border-radius:.25rem;">
+                    <?php else: ?>
+                        <div style="width:110px;height:140px;background:#f1f5f9;
+                                    border:1px dashed #cbd5e1;border-radius:.25rem;
+                                    display:flex;align-items:center;justify-content:center;">
+                            <i class="bi bi-person" style="font-size:2rem;color:#94a3b8;"></i>
+                        </div>
+                    <?php endif; ?>
+                </div>
+
+                <?php if (can('student.edit')): ?>
+                    <div class="flex-grow-1" style="min-width:260px;">
+                        <form method="post" enctype="multipart/form-data"
+                              action="<?= e(url('/eleves/' . (int) $student['id'] . '/photo')) ?>">
+                            <?= csrf_field() ?>
+                            <label class="form-label small fw-medium" for="photo">
+                                Photo d'identité
+                            </label>
+                            <div class="input-group input-group-sm">
+                                <input type="file" class="form-control" id="photo" name="photo"
+                                       accept="image/jpeg,image/png,image/webp" required>
+                                <button type="submit" class="btn btn-primary">Enregistrer</button>
+                            </div>
+                            <div class="form-text">
+                                JPEG, PNG ou WebP, 5 Mo au maximum. Elle sert à la carte
+                                d'élève. Elle reste dans cet espace : elle n'a
+                                <strong>pas d'adresse publique</strong> et n'est visible
+                                que des comptes autorisés de l'établissement.
+                            </div>
+                        </form>
+
+                        <?php if ($student['photo_path'] !== null): ?>
+                            <form method="post" class="mt-2"
+                                  data-confirm="Retirer la photo de cet élève ? Les cartes déjà délivrées ne seront pas modifiées, mais leur emplacement photo restera vide à la réimpression."
+                                  action="<?= e(url('/eleves/' . (int) $student['id'] . '/photo/retirer')) ?>">
+                                <?= csrf_field() ?>
+                                <button type="submit" class="btn btn-sm btn-link text-danger p-0">
+                                    Retirer la photo
+                                </button>
+                            </form>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
+            </div>
+        </div>
+    </div>
+<?php endif; ?>
 
 <div class="row g-4">
 

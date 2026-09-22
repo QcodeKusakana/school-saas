@@ -238,3 +238,69 @@ function platform_scope_cli(callable $work)
         platform_scope_depth(platform_scope_depth() - 1);
     }
 }
+
+/**
+ * L'éditeur est-il actuellement DANS une école cliente ?
+ *
+ * POURQUOI CETTE FONCTION VIT DANS LE NOYAU ET NON DANS LE MODULE
+ * ===============================================================
+ * Elle est lue par le BANDEAU, qui vit dans le layout : il se rend donc
+ * sur chaque page de l'application, quel que soit le module de la route.
+ *
+ * Placée dans `modules/platform/services.php`, elle était introuvable
+ * partout ailleurs — le routeur ne charge que le module de la route.
+ * Mesuré en recette : après être entré dans une école, le bandeau était
+ * ABSENT du tableau de bord. Le seul signal disant « vous êtes chez un
+ * client » manquait précisément sur les écrans du client.
+ *
+ * C'est la troisième fois que ce motif se présente (gabarit de bulletin,
+ * barre latérale, puis ici). Le charger depuis le gabarit aurait corrigé
+ * ce cas ; le déplacer supprime la classe.
+ *
+ * > Une vue de layout ne doit dépendre d'aucun module.
+ *
+ * La double condition n'est pas redondante : un compte d'école a bien un
+ * `school_id`, mais il est chez lui — le bandeau ne le concerne pas.
+ */
+function platform_visiting_school(): ?array
+{
+    if (!platform_is_user()) {
+        return null;
+    }
+
+    $user     = auth_user();
+    $schoolId = $user['visiting_school_id'] ?? null;
+
+    if ($schoolId === null) {
+        return null;
+    }
+
+    // L'ÉCOLE ARCHIVÉE RESTE VISIBLE DANS LE BANDEAU — audit 7B1.
+    //
+    // Cette requête filtrait `deleted_at IS NULL`. Une école archivée
+    // PENDANT la visite faisait donc disparaître le bandeau… sans
+    // sortir l'éditeur : le contexte restait sur l'école, et plus rien
+    // ne le lui disait. Le seul signal disant « vous êtes chez un
+    // client » s'éteignait alors que la visite continuait.
+    //
+    // > Un bandeau qui disparaît avant la visite qu'il annonce est pire
+    // > que pas de bandeau : il donne l'illusion d'être sorti.
+    //
+    // On rend donc l'école quoi qu'il arrive, avec un drapeau que la
+    // vue affiche. Fermer la visite ici serait écrire depuis une
+    // lecture — c'est à l'éditeur de cliquer « Quitter ».
+    $school = db_one(
+        'SELECT id, code, name, status, deleted_at
+           FROM schools WHERE id = :id LIMIT 1',
+        ['id' => (int) $schoolId],
+        true
+    );
+
+    if ($school === null) {
+        return null;   // l'école a été effacée pour de bon
+    }
+
+    $school['archived'] = $school['deleted_at'] !== null;
+
+    return $school;
+}

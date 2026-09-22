@@ -4,7 +4,7 @@
  *
  *   php database/migrate.php            Applique les migrations en attente
  *   php database/migrate.php --status   Liste sans rien exécuter
- *   php database/migrate.php --seed     Applique aussi les seeds non joués
+ *   php database/migrate.php --seed     Sans objet, conservé par compatibilité
  *   php database/migrate.php --baseline Marque les fichiers comme appliqués
  *                                       SANS les exécuter
  *
@@ -36,7 +36,9 @@ require __DIR__ . '/runner.php';
 
 $options    = getopt('', ['status', 'seed', 'baseline', 'help']);
 $statusOnly = isset($options['status']);
-$withSeeds  = isset($options['seed']);
+// `--seed` reste accepté par `getopt` pour ne pas faire échouer les
+// procédures écrites, mais il ne pilote plus rien : un seed jamais joué
+// est appliqué comme tout autre fichier. Voir la boucle d'état.
 $baseline   = isset($options['baseline']);
 
 if (isset($options['help'])) {
@@ -46,7 +48,8 @@ if (isset($options['help'])) {
     --------------------------
       php database/migrate.php            Applique les migrations en attente
       php database/migrate.php --status   Affiche l'état sans rien exécuter
-      php database/migrate.php --seed     Applique aussi les seeds non joués
+      php database/migrate.php --seed     Sans objet : les seeds jamais
+                                          joués sont toujours appliqués
       php database/migrate.php --baseline Marque les fichiers comme appliqués
                                           SANS les exécuter
 
@@ -107,10 +110,29 @@ $pending  = [];
 $modified = [];
 
 foreach ($catalog as $file) {
-    if ($file['kind'] === 'seed' && !$withSeeds) {
-        continue;
-    }
-
+    // UN SEED JAMAIS APPLIQUÉ N'EST PAS OPTIONNEL.
+    //
+    // Mesuré sur une base vierge : `php database/migrate.php` sautait
+    // les deux seeds, puis la migration 001b échouait sur
+    // « Column 'cycle_id' cannot be null » — elle cherchait un cycle
+    // que le seed aurait dû insérer. Autrement dit, la commande
+    // documentée dans la recette ne pouvait PAS construire une base
+    // depuis zéro, et l'erreur ne nommait pas la vraie cause.
+    //
+    //   > Un produit qui ne s'installe pas depuis zéro n'a jamais été
+    //   > installé, il a seulement été migré.
+    //
+    // `seeds/001` et `seeds/002` ne portent aucune donnée de
+    // démonstration : cycles, niveaux, plans, rôles, permissions. Sans
+    // eux le produit n'a pas un seul rôle. La démonstration, elle, vit
+    // dans `seed_demo.php` et n'est jamais jouée automatiquement.
+    //
+    // Le registre reste le seul juge du rejeu : un seed déjà appliqué
+    // est ignoré comme n'importe quel fichier, et une base existante
+    // voit ses seeds reconnus par `runner_autobaseline()`. `--seed`
+    // devient donc sans objet ; le drapeau reste accepté pour ne pas
+    // casser les procédures écrites, et `install.php` — qui n'a jamais
+    // sauté les seeds — se comporte désormais comme cette commande.
     if (!is_file($file['path'])) {
         continue;
     }

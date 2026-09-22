@@ -658,3 +658,38 @@ a:hover { color: var(--brand); }
     .timeline::before { background: #999; }
     .progress { display: none; }
 }
+
+
+/* ---------------------------------------------------------------------
+   BANDEAU DE VISITE — l'éditeur travaille dans une école cliente.
+   Volontairement voyant : c'est la seule chose qui distingue la console
+   de l'éditeur des écrans d'un établissement. Un bandeau discret ne
+   remplirait pas son office.
+   --------------------------------------------------------------------- */
+.platform-banner {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem 1rem;
+    align-items: center;
+    justify-content: space-between;
+    padding: .55rem 1.25rem;
+    background: #7c2d12;
+    color: #fff;
+    font-size: .875rem;
+    line-height: 1.4;
+}
+
+.platform-banner__text {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    min-width: 0;
+}
+
+.platform-banner strong { font-weight: 600; }
+
+.platform-banner__form { margin: 0; flex-shrink: 0; }
+
+/* Une école archivée pendant la visite : plus rouge encore, parce que
+   la seule action raisonnable est d'en sortir. */
+.platform-banner--archived { background: #991b1b; }

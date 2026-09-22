@@ -60,19 +60,25 @@ $isPlatform = $user['school_id'] === null;
 
             <p class="nav-heading">Plateforme</p>
 
-            <?php if (can('platform.school.view')): ?>
+            <?php if (can('platform.school.view') && route_exists('/plateforme/ecoles')): ?>
                 <a class="nav-item <?= nav_active('/plateforme/ecoles') ?>" href="<?= e(url('/plateforme/ecoles')) ?>">
                     <i class="bi bi-buildings"></i><span>Établissements</span>
                 </a>
             <?php endif; ?>
 
-            <?php if (can('platform.subscription.manage')): ?>
+            <?php if (can('platform.subscription.manage') && route_exists('/plateforme/abonnements')): ?>
                 <a class="nav-item <?= nav_active('/plateforme/abonnements') ?>" href="<?= e(url('/plateforme/abonnements')) ?>">
                     <i class="bi bi-credit-card"></i><span>Abonnements</span>
                 </a>
             <?php endif; ?>
 
-            <?php if (can('platform.audit.view')): ?>
+            <?php if (can('platform.billing.manage') && route_exists('/plateforme/soldes')): ?>
+                <a class="nav-item <?= nav_active('/plateforme/soldes') ?>" href="<?= e(url('/plateforme/soldes')) ?>">
+                    <i class="bi bi-cash-coin"></i><span>Soldes</span>
+                </a>
+            <?php endif; ?>
+
+            <?php if (can('platform.audit.view') && route_exists('/plateforme/journal')): ?>
                 <a class="nav-item <?= nav_active('/plateforme/journal') ?>" href="<?= e(url('/plateforme/journal')) ?>">
                     <i class="bi bi-journal-text"></i><span>Journal global</span>
                 </a>
@@ -90,7 +96,7 @@ $isPlatform = $user['school_id'] === null;
                 </a>
             <?php endif; ?>
 
-            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view', 'teacher.view'])): ?>
+            <?php if (perm_any(['grade.view', 'attendance.view', 'evaluation.view', 'teacher.view', 'document.view'])): ?>
                 <p class="nav-heading">Pédagogie</p>
                 <?php if (can('grade.view') && route_exists('/notes')): ?>
                     <a class="nav-item <?= nav_active('/notes') ?>" href="<?= e(url('/notes')) ?>">
@@ -100,6 +106,11 @@ $isPlatform = $user['school_id'] === null;
                 <?php if (can('attendance.view') && route_exists('/presences')): ?>
                     <a class="nav-item <?= nav_active('/presences') ?>" href="<?= e(url('/presences')) ?>">
                         <i class="bi bi-calendar-check"></i><span>Présences</span>
+                    </a>
+                <?php endif; ?>
+                <?php if (can('document.view') && route_exists('/documents')): ?>
+                    <a class="nav-item <?= nav_active('/documents') ?>" href="<?= e(url('/documents')) ?>">
+                        <i class="bi bi-patch-check"></i><span>Documents</span>
                     </a>
                 <?php endif; ?>
                 <?php if (can('teacher.view') && route_exists('/enseignants')): ?>
@@ -136,7 +147,7 @@ $isPlatform = $user['school_id'] === null;
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (perm_any(['school.edit', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view'])): ?>
+            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
                 <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
@@ -157,7 +168,53 @@ $isPlatform = $user['school_id'] === null;
                     </a>
                 <?php endif; ?>
 
-                <?php if (can('school.edit') && route_exists('/ecole/parametres')): ?>
+                <?php if (can('email.view') && route_exists('/ecole/emails/journal')): ?>
+                    <a class="nav-item <?= nav_active('/ecole/emails') ?>"
+                       href="<?= e(url(can('email.manage') ? '/ecole/emails' : '/ecole/emails/journal')) ?>">
+                        <i class="bi bi-envelope-at"></i><span>Envoi d'e-mails</span>
+                    </a>
+                <?php endif; ?>
+
+                <?php
+                /*
+                 * SYNCHRONISATION — avec sa pastille, et elle se justifie.
+                 *
+                 * Un compteur dans la barre latérale coûte une requête à
+                 * chaque page : la règle du projet est de ne pas en
+                 * ajouter sans raison. Ici il y en a une. Un conflit non
+                 * arbitré, c'est un appel qu'un enseignant a bel et bien
+                 * fait et qui n'est nulle part dans le registre. Sans
+                 * pastille, personne ne va voir cet écran, et la saisie
+                 * se perd en silence.
+                 *
+                 *   > Ce qui attend un humain doit se voir sans qu'on
+                 *   > pense à aller le chercher.
+                 *
+                 * Le coût reste borné : un COUNT sur index
+                 * (school_id, resolution), et seulement pour les quelques
+                 * comptes qui portent `sync.view`.
+                 */
+                if (can('sync.view') && route_exists('/synchronisation')):
+                    $syncEnAttente = (int) db_value(
+                        'SELECT COUNT(*) FROM sync_conflicts
+                          WHERE school_id = :s AND resolution = \'pending\'',
+                        ['s' => tenant_id()],
+                        true
+                    );
+                    ?>
+                    <a class="nav-item <?= nav_active('/synchronisation') ?>"
+                       href="<?= e(url('/synchronisation')) ?>">
+                        <i class="bi bi-arrow-repeat"></i><span>Synchronisation</span>
+                        <?php if ($syncEnAttente > 0): ?>
+                            <span class="badge text-bg-danger ms-auto"><?= $syncEnAttente ?></span>
+                        <?php endif; ?>
+                    </a>
+                <?php endif; ?>
+
+                <?php /* La garde suit la permission de la ROUTE — .
+                   Les deux avaient divergé : un compte portant 
+                   sans  voyait un lien qui le refusait. */ ?>
+                <?php if (can('school.branding') && route_exists('/ecole/parametres')): ?>
                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
                         <i class="bi bi-gear"></i><span>Mon établissement</span>
                     </a>

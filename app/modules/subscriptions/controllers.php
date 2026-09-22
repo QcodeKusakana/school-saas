@@ -13,10 +13,22 @@ require_once __DIR__ . '/services.php';
 
 function ctrl_subscription_show(): void
 {
-    // L'invariant vaut aussi ici : une école qui n'a jamais rien écrit
-    // n'a pas encore d'abonnement, et l'écran doit montrer son essai
-    // plutôt qu'un vide inexplicable.
-    subscription_ensure();
+    // CET ÉCRAN NE CRÉE PLUS L'ESSAI — audit 7B1.
+    //
+    // Il appelait `subscription_ensure()`, au motif qu'une école sans
+    // abonnement devait voir son essai plutôt qu'un vide inexplicable.
+    // La console de l'éditeur a montré ce que cela coûtait : un éditeur
+    // qui OUVRE une école cliente et regarde cet écran lui démarrait un
+    // essai de 30 jours. Les 30 jours couraient donc depuis sa visite,
+    // et non depuis la première utilisation de l'école — qui, se
+    // connectant huit jours plus tard, n'en avait plus que 22.
+    //
+    // > Une consultation ne démarre pas une horloge commerciale.
+    //
+    // L'invariant reste tenu là où il doit l'être : sur le chemin
+    // d'ÉCRITURE (`subscription_can_add_student()` et
+    // `_can_add_staff_user()`), là où une écriture est de toute façon
+    // demandée. Et la vue sait dire « aucun abonnement enregistré ».
 
     view('subscriptions/show', [
         'title'        => 'Mon abonnement',

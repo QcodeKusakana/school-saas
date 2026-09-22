@@ -37,6 +37,11 @@ declare(strict_types=1);
 const TENANT_TABLES = [
     // Phase 1
     'school_settings',
+    // Phase 8A — messagerie. `email_messages.school_id` est NULLABLE :
+    // un message de l'editeur n'appartient a aucune ecole. Les lectures
+    // transversales passent par platform_scope(), comme partout.
+    'email_settings',
+    'email_messages',
     'school_cycles',
     'subscriptions',
     'subscription_payments',
@@ -68,6 +73,16 @@ const TENANT_TABLES = [
     // se recalcule pas.
     'bulletins',
     'bulletin_lines',
+
+    // Phase 9A — documents officiels.
+    //
+    // `documents` porte le garde-fou comme le reste, ET SURTOUT : la
+    // page publique de vérification cherche un jeton sans connaître
+    // l'école. Cette lecture-là doit donc passer par un périmètre nommé
+    // (`tenant_scope_identity`), exactement comme `users.username` ou
+    // `sync_devices.device_uuid` — jamais par un filtre oublié.
+    'documents',
+    'document_counters',
 
     // Journal d'audit : school_id vaut NULL pour les actions de la
     // plateforme, et l'identifiant de l'école pour toutes les autres.

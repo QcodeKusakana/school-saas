@@ -1,11 +1,15 @@
 # État du projet — School SaaS RDC
 
 **Emplacement** : `C:\laragon\www\school-saas` (dépôt Git déjà initialisé)
-**Version** : 0.4.2 — phases 1 à 6 terminées et auditées · phase 7A livrée et auditée · **garde-fou multi-école durci**
-**Dernière mise à jour** : 20/09/2026
-**Tests** : 635 verts sur base fraîche (12 suites)
+**Version** : 0.10.0 — phases 1 à 6 terminées et auditées · 7A, 7B1, 7B2, 7D, 8A, 8B1 et **9A livrées et auditées**
+**Dernière mise à jour** : 21/09/2026
+**Tests** : 998 verts sur base **reconstruite depuis zéro** en MySQL 8 (19 suites), plus 100 vérifications en navigateur réel et une recette d'installation
 
 **Environnement local constaté** : Laragon 6.0, Apache 2.4.54 **sur le port 8000** (pas 80), PHP 8.4.16 en FastCGI (mod_fcgid), MySQL 8.0.30.
+
+> ⚠️ **Le SQL doit être portable MySQL 8.** Tout ce qui est écrit ici est
+> éprouvé sur MySQL 8, moteur du poste de développement comme de l'hébergement
+> cible. Ne pas s'appuyer sur les tolérances de MariaDB.
 URL de travail : `http://school-saas.test:8000`
 
 > Ce document est maintenu dans le dépôt, à `docs-projet/etat-du-projet.md`,
@@ -23,9 +27,9 @@ URL de travail : `http://school-saas.test:8000`
 | 4 | **Pédagogie** | 4A Enseignants ✅ · 4B Notes ✅ · 4C Bulletins ✅ · 4D Présences ✅ | ✅ |
 | 5 | **Finances** | 5A Grille ✅ · 5B Encaissements ✅ · 5C Recouvrement ✅ · 5D Dépenses ✅ + audit + recette | ✅ |
 | 6 | **Portails** | 6A Portail parent ✅ + audit · 6B Espace élève ✅ + audit | ✅ |
-| 7 | **Abonnements** | 7A Offres et limites ✅ + audit · 7B Facturation SaaS ⏭ · 7C Mobile Money ⛔ | 🔵 en cours |
-| 8 | **Hors connexion** | PWA, Service Worker, IndexedDB, synchronisation | à venir |
-| 9 | **Modules avancés** | Communication, documents, rapports, archives, QR code | à venir |
+| 7 | **Abonnements & comptes** | 7A ✅ + audit · 7B1 ✅ + audit · 7B2 ✅ + audit · 7C Mobile Money ⛔ · **7D Utilisateurs ✅ + audit** | 🔵 en cours |
+| 8 | **Messagerie & hors connexion** | **8A Messagerie ✅ + audit** · **8B1 Hors connexion ✅ + audit** (PWA, Service Worker, IndexedDB, appel des présences) · 8B2 étendre aux autres écrans | 🔵 en cours |
+| 9 | **Modules avancés** | **9A Documents officiels + QR de vérification ✅** · 9B rapports, archives, communication | 🔵 en cours |
 | 10 | **Recette** | Tests d'acceptation, durcissement, mise en production | à venir |
 
 > Cette feuille de route est la référence. Ne pas la renuméroter : les
@@ -38,11 +42,35 @@ Documentation par module : `phase-2-referentiel.md`, `phase-3-eleves.md`,
 `phase-5a-frais.md`, `phase-5b-caisse.md`, `phase-5cd-recouvrement-depenses.md`,
 `audit-phase-5d.md`, `recette-finances.md`, `phase-6a-portail-parents.md`,
 `phase-6b-espace-eleve.md`, `audit-phase-6b.md`, `phase-7a-abonnements.md`,
-`audit-phase-7a.md`, `securite-perimetre-plateforme.md`.
+`audit-phase-7a.md`, `securite-perimetre-plateforme.md`,
+`phase-7b-console-editeur.md`, `audit-phase-7b1.md`, `phase-7b2-facturation.md`,
+`audit-phase-7b2.md`, `phase-7d-utilisateurs.md`, `audit-phase-7d.md`,
+`phase-8a-messagerie.md`, `audit-phase-8a.md`.
 
 ---
 
 ## Comment tester — procédure de recette
+
+### 0. Vérifier que le produit s'installe DEPUIS ZÉRO
+
+Avant toute livraison, sur un poste de développement :
+
+```
+bash tests/installation_zero.sh
+```
+
+Le script **détruit et reconstruit** la base configurée, rejoue la
+commande documentée telle quelle, puis vérifie que le référentiel est en
+place et qu'une école neuve peut être créée.
+
+> Une suite de tests ne peut pas attraper une installation cassée : elle
+> s'exécute sur la base déjà construite. Le 21/09/2026, le produit passait
+> 921 tests alors qu'**aucune école neuve n'aurait pu être installée** —
+> `migrate.php` sautait les seeds, et la migration 001b échouait sur une
+> erreur qui ne nommait pas la cause.
+>
+> **Un produit qui ne s'installe pas depuis zéro n'a jamais été installé,
+> il a seulement été migré.**
 
 ### 1. Appliquer les migrations
 
@@ -60,6 +88,20 @@ php database\migrate.php
 > pour toute école qui n'en a pas. Une école dépassant déjà 150 élèves ne pourra
 > plus en inscrire tant que son offre n'aura pas été changée en base.
 
+> **Les migrations 028 et 029 sont REJOUABLES** (corrigées le 21/09/2026).
+> Chaque `ALTER` est gardé par `information_schema` via
+> `SET @ddl / PREPARE / EXECUTE` — le seul motif portable MySQL 8 **et**
+> MariaDB, aucun des deux n'offrant `ADD COLUMN IF NOT EXISTS` de façon
+> portable. Une base arrêtée à mi-chemin se répare en relançant simplement
+> `php database\migrate.php`. Aucune donnée n'est supprimée ni modifiée.
+
+> **La migration 028 laisse `subscriptions.price_amount` à NULL sur les
+> abonnements existants** : leur tarif n'a jamais été figé, et l'inventer serait
+> un mensonge. Les écrans affichent « non figé », le service **refuse d'y
+> rattacher un versement**, et ils n'entrent dans aucun solde. Pour les remettre
+> en facturation, appliquer une offre depuis `/plateforme/ecoles/{id}` — le tarif
+> se fige alors sur la nouvelle période.
+
 ### 2. Lancer les tests automatisés
 
 ```
@@ -75,10 +117,39 @@ php tests\finance_isolation.php
 php tests\portal_isolation.php
 php tests\subscriptions_isolation.php
 php tests\platform_scope.php
+php tests\platform_console.php
+php tests\platform_billing.php
+php tests\users_isolation.php
+php tests\mail_isolation.php
+php tests\sync_isolation.php
+php tests\documents_isolation.php
+php tests\qrcode_decode.php
 ```
 
 Chaque suite se nettoie derrière elle (bloc `finally`) et sort en code 0 si
-tout passe. Total attendu : **635 tests verts**.
+tout passe. Total attendu : **998 tests verts**.
+
+#### Les vérifications qui exigent un vrai navigateur
+
+Certaines promesses ne se prouvent pas en PHP : un service worker, une
+file IndexedDB, une coupure réseau, une course entre deux requêtes. Avec
+le serveur de développement lancé **en multi-processus** :
+
+```
+set PHP_CLI_SERVER_WORKERS=6
+php -S 127.0.0.1:8099 -t public
+
+node tests\offline_browser.js  <motdepasse> 1   REM 13 attendus
+node tests\ecran_sync.js       <motdepasse>     REM 12 attendus
+node tests\documents_browser.js <motdepasse>    REM 25 attendus
+node tests\sonde_cache_sw.js   <motdepasse>     REM 0 entrée hors coquille
+bash tests/sonde_sync_course.sh <motdepasse>     REM aucune requête ne rompt
+```
+
+> `PHP_CLI_SERVER_WORKERS` n'est pas une commodité : sans lui, `php -S`
+> sert une requête à la fois et **toute sonde de concurrence rend vert
+> sans rien prouver**. La sonde de course refuse d'ailleurs de démarrer
+> sur un serveur mono-processus.
 
 ### 3. Peupler une école de démonstration puis parcourir l'application
 
@@ -122,6 +193,56 @@ Parcours de recette dans le navigateur :
 | `/abonnement` en enseignant ou en élève | **403**, et l'entrée de menu est absente |
 | Inscrire au-delà du plafond de l'offre | Refusé, message nommant l'offre et le plafond |
 | Encaisser avec le plafond atteint | **Passe** : une limite ne ferme jamais la caisse |
+| `/plateforme/ecoles` en super-administrateur | Le parc entier, avec offre et effectif |
+| Le même écran en direction | **403** |
+| « Ouvrir » sur une école | Un **bandeau rouge** apparaît sur toutes les pages |
+| Naviguer dans l'école, puis « Quitter » | Le bandeau disparaît, `/eleves` redevient inaccessible |
+| Appliquer une offre depuis la fiche | La précédente passe en `cancelled`, la nouvelle en `active` |
+| L'historique de la fiche | Les **deux** lignes y figurent |
+| Suspendre sans motif | Refusé |
+| `/plateforme/abonnements` | Uniquement ce qui expire, dépasse, ou manque d'offre |
+| Archiver l'école visitée (`deleted_at`) en base | Le bandeau **rougit** et dit « archivé » — il ne disparaît pas |
+| Ouvrir une 2ᵉ école sans quitter la 1ʳᵉ | Le journal porte **une sortie** pour la première |
+| `/abonnement` sur une école sans aucune offre | **Aucun** abonnement n'est créé par la consultation |
+| `/plateforme/soldes` en super-administrateur | Deux listes : ce qui est dû, **et les trop-perçus** |
+| Le même écran en direction | **403** |
+| Appliquer une offre avec un tarif négocié de 200 USD | Le tarif est **figé sur l'abonnement**, pas relu du catalogue |
+| Relever le tarif de l'offre au catalogue ensuite | Les dettes déjà engagées **ne bougent pas** |
+| Encaisser 560 000 CDF au taux 2 800 sur une dette en USD | **200,00 USD crédités**, écran « Soldé », taux figé |
+| Le même versement **sans** indiquer de taux | Refusé : « exige le taux de change du jour » |
+| Saisir deux fois la même référence chez le même prestataire | Le second envoi est **refusé** |
+| Monter en gamme en cours d'année | La période remplacée est facturée **au prorata**, pas deux fois |
+| Annuler un versement sans motif | Refusé — et la ligne n'est **jamais** supprimée |
+| Encaisser sur un abonnement sans tarif figé | Refusé : on n'encaisse pas sur une dette inconnue |
+| Ressaisir une référence **vivante** | Refusé, et le message dit **comment corriger** |
+| Annuler cette ligne, puis ressaisir la **même** référence | **Accepté** — la ligne annulée reste affichée avec son motif |
+| Archiver en base une école qui doit | Elle **reste** dans `/plateforme/soldes`, badge « archivée » |
+| `/utilisateurs` en secrétariat | **403** — et l'entrée de menu est absente |
+| La direction ouvre la fiche d'un administrateur d'école | « Hors de votre portée », aucun formulaire |
+| Elle poste quand même `roles[]=SCHOOL_ADMIN` | Refus nommant les **deux niveaux** ; rôles inchangés en base |
+| Elle poste la régénération de SON mot de passe | Refus ; le **condensat n'a pas bougé** |
+| Créer un compte | Identifiant et mot de passe affichés **une seule fois** |
+| Se connecter avec ce compte | **Toute** route mène à `/mot-de-passe/changer` |
+| Créer un homonyme | L'identifiant est **suffixé**, jamais dupliqué |
+| Désactiver le dernier compte capable de créer | Refusé, même pour l'éditeur |
+| Se désactiver soi-même | Refusé |
+| Décocher un rôle **non attribuable** | Il est **conservé**, et le message le dit |
+| Archiver un compte | La ligne reste en base ; la place se libère dans l'abonnement |
+| `/ecole/emails` en direction | **403** — `email.manage` n'est pas `school.edit` |
+| Enregistrer une configuration SMTP | Elle naît **inactive** ; le mot de passe est **chiffré** en base |
+| Envoyer avant l'essai | Rien ne part, et le motif est nommé |
+| Lancer l'essai | Il **active** la configuration — seul chemin possible |
+| Réenregistrer en laissant le mot de passe vide | Il est **conservé** |
+| Mot de passe oublié, compte avec adresse | Message reçu, **lien ouvrant**, changement, connexion |
+| Le même, compte inconnu | **Message identique** — aucune énumération possible |
+| Le lien, rouvert après usage | Refusé |
+| Couper le serveur SMTP | Message **écrit** quand même, rejeu à 1, 5, 15, 60 min, puis abandon |
+| Un message sensible abandonné | Son corps a **disparu** ; le rejeu est refusé et dit quoi faire |
+| **Deux passages du travail périodique en même temps** | **Un seul envoi** — à rejouer à deux processus contre un vrai serveur SMTP |
+| Adresse d'expédition d'un autre domaine que le serveur | **Averti**, pas refusé : un relais légitime existe |
+| Un compte cumulant secrétariat **et** administration | Hors de portée d'une direction : c'est le rôle le PLUS HAUT qui compte |
+| Le refus hiérarchique | Nomme le recours : l'éditeur de la plateforme |
+| **Deux désactivations simultanées** du dernier carré d'administrateurs | **Une seule passe** — à rejouer à deux processus, comme l'interblocage 5B |
 
 ---
 
@@ -148,9 +269,120 @@ n'exécutaient pas :
 | Phase 6B | PARENT et ELEVE atteignaient `/presences`, l'écran d'appel du personnel ; un cache statique non clé faisait hériter à l'enseignant la réponse du tuteur ; **les comptes de familles étaient irrécupérables** — le message renvoyait vers un écran qui n'existe pas |
 | Phase 7A (livraison) | Une jauge « Comptes du personnel » **rougissait à 100 %** en annonçant un blocage que rien ne porte : aucune porte n'appelle `subscription_can_add_staff_user()` |
 | **Garde-fou** | Le contrôle testait la **mention** du mot `school_id`, pas son filtre : `SELECT school_id, COUNT(*) FROM students GROUP BY school_id` rendait 124 élèves de toutes les écoles sans une alerte — la forme exacte d'un tableau de bord éditeur, et celle d'une fuite. Le drapeau `db_query(…, true)` était une échappatoire sur l'honneur. Deux défauts de production au passage : une écriture de mot de passe sans filtre d'école, un décompte transversal derrière un simple `if` |
+| **Terrain (21/09)** | La migration 028 s'est **arrêtée à mi-chemin** sur la base du développeur, laissant `price_amount` en place sans s'enregistrer : le passage suivant butait sur « Duplicate column name ». Deux causes derrière une : une migration non idempotente, et un moteur de développement (MariaDB) différent du moteur réel (MySQL 8). Les deux sont corrigées |
+| **Audit 8A** | **Le même message partait deux fois.** Deux passages du travail périodique lancés à la même seconde lisaient tous deux la ligne « en attente » et l'envoyaient tous deux — le serveur de test a bien reçu deux exemplaires. Une tâche cron qui déborde sur la suivante suffit. Corrigé par une réservation atomique (`rowCount()` désigne le gagnant). Et un expéditeur d'un autre domaine que le serveur passait **en silence**, alors que le SPF ne le couvrira pas |
+| **Phase 8A** | Première version de `mail_attempt()` : lecture `WHERE id = :id` sans filtre d'école. **Le garde-fou l'a refusée**, à juste titre — un identifiant deviné aurait suffi à lire le corps d'un message d'une autre école, et ces corps portent des liens de réinitialisation. La fonction prend désormais la LIGNE, pas un identifiant |
+| **Audit 7D** | Le contrôle « il reste un compte capable de créer » était une **lecture suivie d'une écriture**. Deux désactivations simultanées, lancées par l'éditeur sur deux directions, passaient toutes les deux : **zéro porte ouverte, école enfermée dehors**. Mesuré à deux processus. Le verrou devait porter sur TOUS les candidats, cible comprise — l'exclure donnait deux ensembles disjoints qui ne s'attendaient jamais |
+| **Phase 7D** | `roles.level` promettait depuis la phase 1 qu'« un rôle ne peut gérer qu'un rôle de niveau strictement inférieur ». **Aucune ligne ne l'appliquait** — faute d'écran qui attribue un rôle. Le module est cet écran, et il porte enfin la règle, y compris contre le contournement en deux temps : régénérer le mot de passe d'un supérieur pour prendre sa place |
+| **Audit 7B2** | Une **référence annulée restait consommée à jamais** : après une erreur de frappe corrigée par annulation, le vrai versement Mobile Money — qui porte exactement une référence — devenait inenregistrable. Et **archiver une école effaçait sa dette** de `/plateforme/soldes` : le défaut du bandeau de la 7B1, transposé à l'argent |
+| **Audit 7B1** | Le bandeau **disparaissait sous l'éditeur** quand l'école était archivée pendant la visite : contexte maintenu, signal éteint. Changer d'école laissait **deux entrées et aucune sortie** au journal. Et ouvrir l'écran d'abonnement **démarrait un essai de 30 jours** — les jours couraient depuis la visite de l'éditeur, pas depuis la première utilisation de l'école |
+| **Phase 7B1** | La visite d'une école ne tenait **pas une requête** : posée en session, `auth_user()` la remplaçait par NULL au rechargement — le bandeau annonçait l'école, `tenant_id()` valait NULL. Et le bandeau lui-même **ne s'affichait pas** hors du module plateforme : le seul signal disant « vous êtes chez un client » manquait sur les écrans du client |
 | **Audit 7A** | L'écran lisait **deux abonnements** : la carte annonçait « Réseau — résilié — 300 jours » à une école payant une offre Essentiel active. La jauge comptait l'année **courante** quand la limite compte l'année **visée** : « 2 places libres » là où l'inscription refusait. Et l'absence d'abonnement s'affichait comme un **plafond de zéro élève** |
 
 ### Règles tirées de ces audits
+
+> **Un code qu'on n'a pas relu avec un autre outil que le sien n'est pas
+> un code vérifié, c'est un dessin.** Vaut pour tout format binaire
+> qu'un humain ne sait pas lire à l'œil.
+
+> **Un code présent n'est pas un code lisible ; seule la taille imprimée
+> en décide.** Mesuré à 300 ppp : 0,32 mm par module passait chez zbar,
+> pas chez OpenCV. Il faut rendre à la résolution d'impression et relire.
+
+> **Une image ne devrait pas deviner la place qu'on lui laisse ; c'est la
+> page qui la lui donne.** Un `max-width: 100%` dans le SVG lui-même a
+> rendu huit codes illisibles — un pourcentage sans parent ne vaut rien.
+
+> **Un vecteur qui ne regarde que la matrice ne voit pas le rendu.**
+
+> **Un coefficient deviné n'est pas un calcul, c'est un vœu.** Mesurer
+> coûte une minute.
+
+> **Une mesure fausse accuse un produit sain.**
+
+> **Un gabarit qui impose sa forme à tout ce qu'il enveloppe finit par
+> déformer ce qu'il devait servir.**
+
+> **Une variable de gabarit qui porte le nom d'une variable du moteur ne
+> vaut rien, et ne prévient pas.** `view_capture()` fait
+> `extract($data, EXTR_SKIP)` : une clé `data` n'écrase pas la locale du
+> noyau. Des documents se sont imprimés entièrement vides, sans erreur.
+
+> **Une vérification qui ne regarde que le gabarit ne dit rien sur les
+> données.** Chercher une phrase du modèle passe même quand tous les
+> champs sont vides.
+
+> **Un message qui demande une action que le produit ne permet pas est
+> une impasse.** Pire qu'une fonctionnalité manquante : il envoie
+> l'utilisateur chercher ce qui n'existe pas.
+
+> **Un chemin qu'on n'a jamais rendu n'est pas un chemin, c'est une
+> supposition.**
+
+> **Une sonde qui dépend de l'état laissé par une autre n'est pas
+> indépendante** — et celle qui bascule un état au lieu de l'exiger
+> dépend de l'ordre dans lequel on la joue.
+
+> **Un aperçu qui ne se distingue pas de l'original n'est pas un aperçu,
+> c'est un blanc-seing.**
+
+> **Un vecteur figé ne prouve pas qu'un code se scanne ; il prouve qu'il
+> n'a pas changé depuis le jour où on l'a prouvé.** C'est ce qui permet
+> à une épreuve d'outil externe de rester jouable sur un poste nu.
+
+> **Un contrôle qu'on n'a pas pu jouer n'est ni un succès ni un
+> échec — et la sortie doit le NOMMER.** Une suite qui rougit faute
+> d'outil installé confond « le code est faux » avec « l'outil manque
+> ici » ; une suite qui verdit en silence ne prouve rien.
+
+> **Un seul décodeur ne suffit pas : son échec peut être le sien.**
+> Mesuré : OpenCV a refusé un QR valide, et aussi celui produit par la
+> bibliothèque de référence. Avec un seul outil, ce refus aurait fait
+> « corriger » un encodeur correct jusqu'à le casser.
+
+> **Un polynôme symétrique sur le petit cas ne prouve rien sur le
+> grand.** Un test unitaire sur n = 1 validait un Reed-Solomon construit
+> à l'envers.
+
+> **Un document qui change après avoir été signé n'est pas un document,
+> c'est un affichage.**
+
+> **Sans révocation, « valide » est une promesse qu'on ne peut plus
+> reprendre.**
+
+> **Une vérification qui ne dit pas ce qu'elle ne vérifie pas donne une
+> confiance qu'elle n'a pas gagnée.**
+
+> **Un cache qui n'énumère pas ce qu'il garde garde tout** — et un
+> cache-d'abord qui garde tout finit par répondre à la place du serveur.
+> Une ressource entre en cache par APPARTENANCE déclarée, jamais parce
+> qu'elle est arrivée par un GET.
+
+> **L'unicité se démontre par l'index, pas par une lecture qui la
+> précède.** Un `SELECT` avant l'`INSERT` écarte le cas ordinaire ; il ne
+> sérialise rien.
+
+> **Un état transitoire rendu comme un verdict fait mentir l'appelant sur
+> ce que le serveur a fait.**
+
+> **Un lot qui tombe entier pour une ligne** fait payer aux autres la
+> faute d'une seule.
+
+> **Une sonde qui ne coupe pas vraiment, ou qui ne concourt pas vraiment,
+> ne prouve rien — et elle rend vert.** `setOffline` laisse passer la
+> boucle locale ; `php -S` sérialise sans `PHP_CLI_SERVER_WORKERS`. La
+> précondition s'inscrit DANS la sonde.
+
+> **`navigator.onLine` annonce qu'une interface est active, pas que le
+> serveur répond.** On met en file sur l'ÉCHEC RÉEL, jamais sur un drapeau.
+
+> **Un second chemin d'écriture est un second jeu de règles**, et c'est
+> toujours le plus permissif qui finit par être emprunté. La
+> synchronisation REJOUE le service métier, elle ne réécrit pas les tables.
+
+> **Un produit qui ne s'installe pas depuis zéro n'a jamais été installé,
+> il a seulement été migré.** Une suite de tests s'exécute sur la base
+> déjà construite : elle ne verra jamais une installation cassée.
 
 > **Une restriction d'accès ne vaut que si TOUTES les portes la portent.**
 
@@ -245,6 +477,102 @@ n'exécutaient pas :
 > **Un `if` n'est pas un périmètre.** Une restriction portée par une condition
 > de contrôleur ne se voit pas depuis la requête qu'elle protège.
 
+> **Un invariant qu'aucune requête ne sait vérifier n'est pas un invariant,
+> c'est une intention.** Si le schéma ne peut pas le porter, le service le
+> tient — et une requête doit pouvoir le contredire.
+
+> **Une visite qui peut se faire sans laisser de trace n'est pas une visite
+> tracée.** L'état qui l'autorise appartient à la base, pas à la session.
+
+> **Une vue de layout ne doit dépendre d'aucun module.** Le routeur ne charge
+> que le module de la route ; ce qui se rend sur chaque page vit dans le noyau.
+
+> **Un bandeau qui disparaît avant la visite qu'il annonce est pire que pas de
+> bandeau** : il donne l'illusion d'être sorti.
+
+> **Une trace qui note les entrées sans les sorties ne date rien.** « Jusqu'à
+> quand avez-vous eu accès à nos données ? » est une question à laquelle un
+> journal doit savoir répondre.
+
+> **Lire une file ne réserve rien.** Tant que deux lecteurs peuvent repartir
+> avec la même ligne, la file n'en est pas une. La réservation est l'UPDATE
+> lui-même : `rowCount()` désigne le gagnant.
+
+> **Une échéance repoussée vaut mieux qu'un état « en cours ».** L'état
+> resterait collé si le travail était tué ; l'échéance expire d'elle-même et
+> rien ne se coince.
+
+> **Ce qu'on ne peut pas vérifier, on le dit.** Le produit ne sait pas si le
+> SPF du domaine couvre l'expéditeur : il avertit au lieu de refuser, et au
+> lieu de se taire.
+
+> **Un envoi qui n'a pas été écrit avant d'être tenté est un envoi qu'on ne
+> saura pas rejouer.** En RDC la coupure est la règle : écrire d'abord, tenter
+> ensuite.
+
+> **Une clé rangée à côté de ce qu'elle protège ne protège rien.** La clé de
+> chiffrement vit dans `config.local.php`, hors du dépôt ET hors de la base.
+
+> **Un secret qu'on VÉRIFIE se hache ; un secret qu'on PRÉSENTE se chiffre.**
+> Un mot de passe d'utilisateur et un mot de passe de serveur SMTP n'ont pas
+> le même traitement, et les confondre casse l'un ou l'autre.
+
+> **Un produit qui « envoie » des messages que personne ne reçoit est pire
+> qu'un produit qui n'en envoie pas** : l'école croit avoir prévenu les
+> familles. D'où le refus de `mail()`, qui ne s'authentifie pas, et
+> l'activation par essai réussi uniquement.
+
+> **Un compteur qui protège d'un état final ne vaut que verrouillé.** La leçon
+> de la 5B transposée : ce n'est pas l'argent qu'on protège ici, c'est la
+> capacité de rouvrir la porte.
+
+> **Un verrou qui exclut la cible ne sérialise rien.** Deux transactions qui
+> verrouillent des ensembles disjoints ne s'attendent jamais. Le verrou porte
+> sur TOUS les candidats, la cible comprise.
+
+> **On ne retire pas un rôle qu'on ne pourrait pas redonner.** Un remplacement
+> total efface ce qui n'est pas coché ; si l'acteur ne peut pas réattribuer ce
+> rôle, l'opération est à sens unique — exactement ce que la hiérarchie interdit.
+
+> **Une permission semée sans écran n'est pas une fonctionnalité en attente,
+> c'est une porte qu'on croit fermée.** Les cinq `user.*` existaient depuis la
+> phase 1 ; pendant tout ce temps, les comptes du personnel naissaient en base
+> et aucun ne pouvait être fermé.
+
+> **Un garde-fou contre le doublon qui interdit AUSSI la correction ne protège
+> pas la comptabilité : il la force à mentir.** L'éditeur n'a plus alors que le
+> choix entre inventer une fausse référence et ne rien enregistrer.
+
+> **Archiver une école range son dossier ; cela n'éteint pas sa dette.** Un
+> filtre `deleted_at IS NULL` sur un écran d'argent crée une incitation
+> perverse : archiver le mauvais payeur fait disparaître ce qu'il doit.
+
+> **On ne facture pas une période qu'on n'a pas servie, et on ne facture pas
+> deux fois la même.** Clôturer puis rouvrir un abonnement est la manœuvre
+> normale d'un changement d'offre : facturer chaque ligne à son tarif plein fait
+> payer deux années à une école qui monte en gamme en janvier.
+
+> **Un écran qui ne montre que ce qui nous est dû n'est pas une comptabilité,
+> c'est un rappel de facture.** Un trop-perçu engage l'éditeur autant qu'une
+> dette : il doit du service ou un remboursement.
+
+> **Une migration qu'on ne peut pas rejouer après un échec partiel n'est pas une
+> migration, c'est un piège** — et il se referme sur le serveur de production,
+> celui où personne ne peut improviser. Le runner n'enregistre pas une migration
+> interrompue, mais il ne défait pas non plus ce qu'elle a déjà écrit : le
+> passage suivant retombe sur « Duplicate column » et la base reste bloquée.
+
+> **Un moteur de développement qui n'est pas celui de production ne valide
+> rien.** Toutes les migrations avaient été éprouvées sur MariaDB seul ; la 028
+> s'est cassée chez le développeur, sur MySQL 8, dans un état qu'aucune base
+> neuve ne reproduit. Le conteneur de développement tourne désormais sur
+> **MySQL 8**, comme Laragon et comme cPanel.
+
+> **Une consultation ne démarre pas une horloge commerciale.** L'audit 7A avait
+> posé « une lecture ne doit pas écrire » et laissé passer cette violation :
+> elle était sans conséquence tant que seule l'école ouvrait son propre écran.
+> La console n'a pas créé le défaut, elle a rendu visible un défaut dormant.
+
 ---
 
 ## Décisions d'architecture actées
@@ -271,6 +599,24 @@ n'exécutaient pas :
 | **`max_users`** | Ne compte **que le personnel** | 600 élèves produisent jusqu'à 1 200 comptes de familles ; ouvrir le portail ne doit pas coûter une montée de gamme |
 | **Limite atteinte** | Refuse la **création**, jamais la lecture ni l'encaissement | Une limite qui coupe la caisse empêche l'école de payer |
 | **Absence d'abonnement** | Un **état nommé** à l'écran, un refus net en interne | Zéro n'est pas un plafond d'offre |
+| **Changement d'offre** | **Clôturer puis ouvrir**, sous verrou — jamais muter | L'historique répond à « depuis quand payons-nous ce tarif ? » |
+| **Résiliation** | Par changement d'OFFRE, jamais par changement de statut | Sans abonnement en cours, l'école se verrait rouvrir un essai gratuit |
+| **Visite de l'éditeur** | `users.visiting_school_id` — un état de la BASE | Une session bricolée ne doit pas permettre d'entrer sans trace |
+| **Hiérarchie des rôles** | On n'attribue, et on ne touche, qu'un niveau **strictement inférieur** | Sinon une direction se fabrique un administrateur, puis se fait promouvoir |
+| **Identifiant de connexion** | Construit sur le nom, suffixé, **jamais saisi ni modifiable** | `uq_users_username` est globale au produit ; un identifiant est une identité |
+| **Mot de passe initial** | Tiré au sort, affiché **une seule fois**, jamais journalisé | Un mot de passe choisi par l'administrateur est un mot de passe qu'il connaît |
+| **Suppression d'un compte** | **Jamais** — désactivation, suspension ou archivage | `audit_logs.user_id` pointe dessus : un journal sans auteur ne prouve rien |
+| **Envoi d'e-mails** | Client SMTP **maison**, ni bibliothèque ni `mail()` | Pas de Composer sur cPanel ; `mail()` ne s'authentifie pas et finit en indésirables |
+| **Serveur d'envoi** | **Par école**, en base ; celui de la plateforme dans `config.local.php` | Un message doit partir du domaine de l'école, sinon le SPF échoue |
+| **Mot de passe SMTP** | **Chiffré** (sodium), clé hors base et hors dépôt | Il se relit en clair au moment de la connexion : le hachage est impossible |
+| **Activation d'une configuration** | Uniquement par un **essai réussi** ; toute modification désactive | Une case « actif » laisserait l'école se croire joignable sans l'être |
+| **Corps d'un message sensible** | **Chiffré** au repos, **effacé** à l'envoi comme à l'abandon | Le lien de réinitialisation EST le secret que `password_resets` protège |
+| **Tarif d'un abonnement** | **Figé** sur `subscriptions.price_amount` à l'ouverture | Le catalogue est un modèle de départ, jamais la source d'une dette déjà engagée |
+| **Tarif négocié** | L'emporte sur le catalogue ; **0 est une valeur** (école pilote, partenariat) | Distinguer « gratuit » de « non renseigné » évite de facturer un partenaire |
+| **Abonnement sans tarif figé** | Affiché « non figé », **inencaissable**, hors solde | Inventer une dette est pire que l'avouer |
+| **Période remplacée** | Facturée **au prorata** des jours servis ; clôturée avant son 1ᵉʳ jour = **zéro** | Une correction de saisie n'est pas une période vendue |
+| **Facturation SaaS** | `platform.billing.manage`, distincte de `platform.subscription.manage` | Négocier une offre et constater qu'elle est payée sont deux pouvoirs différents |
+| **Versement SaaS en attente** | Ne compte dans **aucun** solde | Tant que l'opérateur n'a pas confirmé, l'argent n'est pas arrivé |
 | **Identité hors connexion** | `BIGINT AUTO_INCREMENT` + `client_uuid` UNIQUE | Index compacts, idempotence à la synchro |
 | **Hébergement cible** | cPanel mutualisé | Pas de Composer, **pas de bibliothèque PDF**, exports en CSV |
 | **Framework** | PHP procédural structuré | Séparation controllers/services/repositories |
@@ -280,7 +626,7 @@ n'exécutaient pas :
 
 ---
 
-## Le principe du figeage — appliqué huit fois
+## Le principe du figeage — appliqué dix fois
 
 Une donnée qui sert de **preuve** ne se recalcule pas : elle se fige au
 moment où elle engage l'établissement.
@@ -295,6 +641,8 @@ moment où elle engage l'établissement.
 | 5B | Somme remise, **taux**, somme créditée | l'encaissement | Un reçu doit rester vérifiable sans connaître le cours du jour |
 | 5D | L'exercice entier | la clôture | Des chiffres remis au promoteur ne se réécrivent plus |
 | 6A | Le **détail** d'un bulletin : cote, libellé de branche, domaine, ordre, maximum | la publication | Le bulletin rouvert par la famille doit être celui qu'elle a reçu, à la ligne près |
+| 7B2 | `subscriptions.price_amount` / `price_currency` | l'ouverture de l'abonnement | Relever un tarif au catalogue ne réécrit pas ce qu'une école devait l'an dernier |
+| 7B2 | `subscription_payments.exchange_rate` | le versement SaaS | Même raison qu'en 5B : une quittance doit rester vérifiable dix ans plus tard |
 
 **Corollaire appris en 5A** : tout gel a besoin d'une échappatoire, mais elle
 doit être explicite, motivée, tracée, et **annoncer sa conséquence avant de la
@@ -349,7 +697,8 @@ compteur. Voir `securite-perimetre-plateforme.md`.
   **schema.sql → seeds → migrations**.
 - `schema_migrations` avec empreintes SHA-256, `--status`, `--seed`,
   `--baseline`.
-- **27 migrations** appliquées. Tables : **57**.
+- **30 migrations** appliquées, dont les **028, 029 et 030 rejouables**. Tables : **59**.
+- Suite complète vérifiée sur **MySQL 8.0** : 878 verts, 0 échec.
 - Référentiel RDC complet (4 cycles, 15 niveaux, MAT_1 → HUM_4), 5 domaines
   officiels, 6 sous-domaines attestés, 14 postes de dépense.
 - **9 rôles**, ~75 permissions, hiérarchie par `roles.level`.
@@ -419,49 +768,51 @@ compteur. Voir `securite-perimetre-plateforme.md`.
     `preg_match('/\bschool_id\b/')` était satisfait par la colonne dans un
     SELECT, un commentaire, une chaîne. Analyser du SQL demande au minimum d'en
     retirer commentaires et littéraux, et de vérifier la POSITION du jeton.
-27. **Une règle métier terminée par `abort()` n'est pas testable** —
+27. **Le routeur passe les paramètres d'URL UN PAR UN**, jamais en tableau :
+    `$route['handler'](...$params)`. Un contrôleur déclarant `array $params`
+    lève un TypeError — invisible aux tests, qui appellent les services.
+28. **Une règle métier terminée par `abort()` n'est pas testable** —
     `platform_require()` imprimait une page 403 et arrêtait le processus ; la
     décision n'était observable qu'au navigateur. Séparer la DÉCISION
     (`platform_refusal()`, qui rend un motif ou `null`) de son RENDU.
 
 ---
 
-## Prochaine étape — phase 7B : facturation SaaS et console éditeur
+## Prochaine étape
 
-La 7A est livrée **et auditée**. Voir `phase-7a-abonnements.md` et
-`audit-phase-7a.md`.
+La **8B1 (hors connexion)** est livrée **et auditée**. Voir
+`phase-8b1-hors-connexion.md`.
 
-Le **préalable de sécurité est posé** (20/09/2026) : le garde-fou distingue
-désormais une lecture transversale légitime d'une fuite, et `platform_scope()`
-est la seule porte. Voir `securite-perimetre-plateforme.md`. La console peut
-être écrite sans que chaque requête soit un pari.
+Ce qui a été tranché, et qui engage la suite :
 
-Ce que la 7B demandera, relevé avant de coder :
+1. **Un seul écran descend : l'appel des présences.** Il se fait debout
+   devant une classe, il ne touche ni à l'argent ni à un document
+   officiel, et il se corrige. Bulletins, caisse et inscriptions restent
+   en ligne — la page de repli le dit franchement plutôt que de le
+   laisser croire.
+2. **L'arbitrage est humain, jamais automatique.** L'appareil envoie ce
+   qu'il avait VU (`seen_updated_at`) ; si le serveur a changé depuis, un
+   conflit s'ouvre et la direction tranche sur un écran qui montre les
+   deux versions. **L'horloge de l'appareil n'arbitre rien.**
+3. **Ce qui descend est réduit au strict nécessaire** : identifiant
+   d'inscription, nom, matricule. Rien d'autre. IndexedDB n'est pas
+   chiffré et l'appareil est souvent partagé — ce sont des mineurs.
 
-- **Une console éditeur** (`/plateforme/…`) : la permission
-  `platform.subscription.manage` existe déjà et la barre latérale la teste, mais
-  **aucune route ne la sert**. Aujourd'hui, changer l'offre d'une école se fait
-  en base. Cette console doit être la **seule** à créer un abonnement : c'est
-  elle qui garantira qu'une école n'en a jamais deux « en cours » (voir la dette).
-- **`subscription_payments` est créée et inutilisée** : c'est la table de la
-  facturation SaaS.
-- **Aucune notification d'échéance** — et rien n'envoie d'e-mail dans le produit
-  (voir les questions ouvertes ci-dessous). Un abonnement qui expire sans
-  prévenir est une résiliation subie.
-- **`max_storage_mb` n'est mesuré nulle part** : le catalogue l'affiche, aucun
-  code ne l'évalue.
+**8B2**, si elle se fait, devra répondre aux mêmes trois questions pour
+chaque nouveau type : quel service rejoue l'écriture, quel champ sert de
+`seen_updated_at`, et qui arbitre. Rien n'oblige à l'ouvrir : l'appel
+était le seul usage dont la coupure empêche vraiment de travailler.
 
-La **7C (Mobile Money)** est bloquée tant que les identifiants du prestataire ne
-sont pas fournis.
+La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
 
 ---
 
 ## Questions ouvertes — décisions attendues du développeur
 
-1. **Aucun envoi d'e-mail n'est câblé.** Le lien de réinitialisation ne
-   s'affiche qu'en mode debug. En production, « mot de passe oublié » ne
-   fonctionne **pour personne**, personnel compris. À trancher : SMTP cPanel ou
-   service tiers. **À régler avant la mise en production.**
+1. ~~Aucun envoi d'e-mail n'est câblé.~~ **Réglé en 8A** : SMTP par école,
+   file d'attente et rejeu. Reste à décider si l'éditeur propose aussi un
+   service tiers (meilleure délivrabilité, coût récurrent) en alternative au
+   SMTP cPanel ; la couche le permet sans toucher aux appels métier.
 2. **Il n'existe pas de module Utilisateurs** (lister, désactiver, réattribuer
    un rôle). Aucun écran ne crée de compte du personnel : ils naissent en base.
    Cela mérite sa propre phase — avant ou après la 7B, au choix.
@@ -470,6 +821,13 @@ sont pas fournis.
 4. **`fee.manage` permet encore au comptable de fixer les tarifs.**
 5. **`student.view` reste accordé à PARENT** — décision de la phase 3, devenue
    discutable depuis que le portail existe.
+6. **Quand l'éditeur ouvre une école cliente, il y a l'accès COMPLET** —
+   il conserve toutes ses permissions. C'était déjà vrai avant la console ;
+   celle-ci le rend simplement praticable, tracé et visible. Un accès en
+   lecture seule serait défendable (l'éditeur n'a pas à corriger une cote),
+   mais empêcherait le dépannage et demande de filtrer les permissions par
+   contexte. **Les données concernées sont celles de mineurs : la question
+   n'est pas seulement technique.**
 
 ---
 
@@ -490,7 +848,13 @@ sont pas fournis.
 - **Rien n'interdit deux abonnements « en cours » simultanés.** MySQL ne sait pas
   exprimer un `UNIQUE` conditionnel sur `status IN ('trial','active','past_due')`.
   `subscription_current()` prend le plus lointain : un arbitrage raisonnable, pas
-  une garantie. À traiter par la console éditeur de la 7B.
+  une garantie. **La migration 029 montre le motif qui le résoudra** : une colonne
+  générée `STORED` qui ne porte la valeur que sur les lignes concernées, indexée
+  en UNIQUE — plusieurs NULL cohabitent dans un index unique.
+- **`ends_on` antérieur à `starts_on` est accepté par le schéma** et facturé au
+  tarif plein. Aucun écran ne produit cette donnée ; une contrainte
+  `CHECK (ends_on >= starts_on)` fermerait la question, à poser avec les autres
+  invariants de schéma.
 - **Le plafond d'élèves n'est pas verrouillé transactionnellement.** Le contrôle
   est une lecture suivie d'une écriture. Vérifié par exécution : deux guichets
   simultanés à une place de la limite ne la franchissent pas — mais grâce au
@@ -524,14 +888,75 @@ sont pas fournis.
   internat) utilise un jour le portail.
 - **Les bulletins publiés avant la migration 023** n'ont pas de détail figé :
   l'écran le dit et invite à republier la classe.
-- **La limite de comptes du personnel n'est appliquée nulle part** :
-  `subscription_can_add_staff_user()` n'a aucune porte qui l'appelle, faute de
-  module Utilisateurs. Sans fuite commerciale aujourd'hui — rien ne crée de
-  compte du personnel — mais la règle dort. Elle est verrouillée par un test,
-  prête pour le jour où cette porte existera.
+- ~~La limite de comptes du personnel n'est appliquée nulle part~~ —
+  **réglé en 7D** : `users_service_create()` est la porte qui l'appelle.
+- **Aucun écran de gestion des RÔLES eux-mêmes** : `role.manage` est semée sans
+  écran, créer un rôle maison se fait encore en base. Les rôles système
+  suffisent aujourd'hui.
+- **Un compte du personnel n'est pas relié à sa fiche enseignant** : créer l'un
+  ne crée pas l'autre, et les deux coexistent sans se connaître.
+- **L'identifiant de connexion ne se change jamais**, même après une faute de
+  frappe sur le nom. Volontaire, mais la faute reste visible pour toujours.
+- **Le plafond de comptes du personnel n'est pas verrouillé** : deux créations
+  simultanées à une place de la limite peuvent la franchir d'une unité. Même
+  arbitrage que pour le plafond d'élèves — commercialement anodin,
+  contrairement à l'enfermement, lui corrigé.
+- **La dernière porte se mesure sur `user.create` seul.** Une école dont le
+  dernier compte porterait `user.create` sans `user.edit` pourrait créer un
+  compte sans pouvoir lui attribuer de rôle. Aucun rôle système n'est dans ce
+  cas.
+- **Deux administrateurs d'école ne peuvent rien l'un sur l'autre** (`level >=`
+  refuse). Si l'unique administrateur part sans passer la main, seul l'éditeur
+  peut fermer son compte. Le message de refus le dit désormais.
 - **`max_storage_mb` n'est mesuré nulle part.**
-- **Le changement d'offre passe par la base** : pas de console éditeur avant la
-  7B.
+- **Aucun rappel d'échéance d'abonnement n'est câblé** : la couche d'envoi
+  existe depuis la 8A, le déclencheur non.
+- **Les identifiants d'un nouveau compte ne partent pas par e-mail** : la
+  remise en main propre reste la règle, à rebrancher maintenant que l'envoi
+  existe.
+- **Aucun suivi de rebond** : une adresse morte restera « envoyé ».
+- **Au moins une fois, pas exactement une fois** : si le travail périodique est
+  tué entre l'envoi effectif et l'écriture du résultat, le message repartira à
+  l'expiration de la réservation. Un exactement-une-fois demanderait que le
+  serveur destinataire dédoublonne sur `Message-ID`, ce sur quoi on ne peut pas
+  compter.
+- **Le lot de 25 n'est pas adapté à la durée réelle d'un envoi** : sur un
+  serveur lent, un passage peut dépasser la minute du cron. La réservation
+  empêche le doublon, pas l'empilement de travaux.
+- **La rotation de la clé de chiffrement n'est pas outillée** : la changer rend
+  illisibles les mots de passe SMTP enregistrés. Les écrans le disent et
+  invitent à ressaisir, mais un script de rechiffrement manque.
+- **Pas de purge de `email_messages`** : le journal grandit indéfiniment. À
+  traiter avec les archives (phase 9).
+- **Aucune quittance imprimable pour un versement SaaS.** La caisse scolaire
+  émet des reçus numérotés ; la facturation de l'éditeur n'a ni document ni
+  séquence. Une école qui paie son abonnement n'a pas de justificatif — à
+  traiter avant la mise en service commerciale.
+- **Aucun rappel d'échéance.** L'éditeur doit ouvrir `/plateforme/soldes` de
+  lui-même. Dépend de l'envoi d'e-mails, toujours non câblé.
+- **La proration se calcule sur `cancelled_at`**, qui est la date à laquelle
+  l'offre a été remplacée. Une résiliation antidatée — l'école a cessé le
+  service il y a un mois — n'est pas représentable : il faudrait une date de
+  fin de service distincte de la date d'enregistrement.
+- **Le statut `refunded` existe dans l'énumération et n'est jamais posé** : un
+  remboursement se constate aujourd'hui par une annulation motivée.
+- **Les abonnements antérieurs à la migration 028 n'ont pas de tarif figé** :
+  ils sont signalés à l'écran et exclus des soldes. Appliquer une offre les
+  remet en facturation.
+- **`/plateforme/journal` n'existe pas** : `platform.audit.view` est semée, le
+  lien est masqué par `route_exists()`. Phase 9.
+- **Le catalogue d'offres se modifie en base** : `platform.plan.manage` n'a pas
+  d'écran. Créer une offre est rare et engage tout le parc.
+- **`platform.impersonate` et `platform.school.create` sont semées et sans
+  écran** : créer une école se fait encore en base.
+- **La liste du parc n'est pas paginée** : une requête, pas de N+1, mais à mille
+  écoles la page sera longue.
+- **`visiting_school_id` n'est pas effacée si `users.school_id` change.** Un
+  compte d'école promu compte de plateforme atterrirait dans l'école restée
+  dans cette colonne. Théorique — aucun écran ne modifie `school_id` — mais le
+  futur module Utilisateurs devra l'effacer en même temps.
+- **Rien ne borne la durée d'une visite** : la colonne survit à la déconnexion.
+  Une expiration automatique, ou une sortie à la déconnexion, serait plus propre.
 - **`tenant_extract_tables()` ne comprend ni les sous-requêtes imbriquées ni les
   CTE.** Une table multi-école citée dans un `WITH` échapperait à l'extraction.
   Non exploité — aucune CTE dans le dépôt — mais à vérifier avant d'en écrire une.

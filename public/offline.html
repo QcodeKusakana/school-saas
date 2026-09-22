@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex, nofollow">
+    <meta name="theme-color" content="#0f3d3e">
+    <title>Hors connexion — School SaaS</title>
+    <link rel="stylesheet" href="/assets/vendor/bootstrap/css/bootstrap.min.css">
+    <link rel="stylesheet" href="/assets/css/app.css">
+</head>
+<body class="bg-light">
+<!--
+    LA PAGE DE REPLI NE MENT PAS.
+
+    Elle ne prétend pas que la page demandée est disponible, et elle ne
+    propose pas de « réessayer » en boucle. Elle dit ce qui reste
+    possible sans réseau — l'appel des présences déjà téléchargé — et
+    ce qui ne l'est pas.
+
+    Un produit qui laisse croire qu'il fonctionne hors ligne alors que
+    tout dépend du serveur est pire qu'un produit franchement en ligne :
+    l'école découvre la panne au pire moment.
+-->
+<div class="container" style="max-width:560px;padding:48px 16px;">
+
+    <h1 class="h4 mb-3">Vous êtes hors connexion</h1>
+
+    <p class="text-secondary">
+        Cette page a besoin du serveur, et il n'est pas joignable pour le moment.
+        Rien n'est perdu : ce que vous avez saisi hors connexion est conservé sur
+        cet appareil et partira dès le retour du réseau.
+    </p>
+
+    <div class="card mb-3">
+        <div class="card-header fw-medium">Ce qui reste possible</div>
+        <div class="card-body">
+            <ul class="mb-0 small">
+                <li>
+                    <strong>L'appel des présences</strong>, pour les classes que vous
+                    avez ouvertes au moins une fois avec du réseau.
+                </li>
+                <li>La consultation des listes d'élèves déjà téléchargées.</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header fw-medium">Ce qui exige le réseau</div>
+        <div class="card-body">
+            <ul class="mb-0 small">
+                <li>Les bulletins, la caisse, les paiements et les rapports.</li>
+                <li>Toute inscription ou modification d'un dossier d'élève.</li>
+                <li>L'envoi de messages.</li>
+            </ul>
+            <p class="small text-secondary mt-2 mb-0">
+                Ces écrans touchent à de l'argent ou à des documents officiels :
+                les traiter à l'aveugle produirait des divergences que personne
+                ne saurait arbitrer.
+            </p>
+        </div>
+    </div>
+
+    <p class="small text-secondary mb-3">
+        La page se rouvrira d'elle-même dès que la connexion reviendra.
+    </p>
+
+    <a class="btn btn-outline-primary" href="/presences">Aller à l'appel des présences</a>
+
+</div>
+
+<script src="/assets/js/offline-retry.js"></script>
+</body>
+</html>

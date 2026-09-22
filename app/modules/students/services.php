@@ -878,3 +878,153 @@ function students_service_change_status(int $studentId, string $status, string $
 
     return ['ok' => true, 'message' => $labels[$status] . '.'];
 }
+
+// =====================================================================
+//  LA PHOTO DE L'ÉLÈVE (phase 9A)
+// =====================================================================
+
+/**
+ * Enregistre la photo d'un élève.
+ *
+ * POURQUOI CETTE FONCTION EXISTE
+ * ===============================
+ * `students.photo_path` existait depuis la phase 1 et RIEN ne l'écrivait.
+ * La carte d'élève de la phase 9A a rendu le manque visible : son refus
+ * disait « ajoutez une photo au dossier » alors qu'aucun écran ne le
+ * permettait.
+ *
+ *   > Un message qui demande une action que le produit ne permet pas
+ *   > est une impasse.
+ *
+ * OÙ LE FICHIER ATTERRIT, ET POURQUOI PAS DANS `public/`
+ * =======================================================
+ * `upload_store()` écrit dans `storage/uploads`, hors de la racine web.
+ * Ce n'est pas une contrainte à contourner, c'est la protection
+ * elle-même : une photo déposée dans `public/` serait lisible par toute
+ * personne devinant son URL, sans session, et indexable.
+ *
+ *   > Une photo d'élève servie par URL publique est une photo d'élève
+ *   > indexable.
+ *
+ * Elle est donc servie par une route contrôlée — `student_photo_stream()`
+ * — qui vérifie la session, l'école et la permission avant d'envoyer le
+ * moindre octet.
+ *
+ * @param array<string, mixed> $file Une entrée de $_FILES
+ * @return array{ok: bool, message: string}
+ */
+function students_service_set_photo(int $studentId, array $file): array
+{
+    if (!can('student.edit')) {
+        return ['ok' => false, 'message' => 'Vous n\'avez pas le droit de modifier ce dossier.'];
+    }
+
+    $student = students_repo_find($studentId);
+
+    if ($student === null) {
+        return ['ok' => false, 'message' => 'Élève introuvable dans cet établissement.'];
+    }
+
+    // `kind = image` borne les extensions ET les types MIME réels : un
+    // PDF renommé en .jpg est refusé par le contrôle de contenu.
+    $stored = upload_store($file, 'photos/' . tenant_require(), 'image');
+
+    if (!$stored['ok']) {
+        return ['ok' => false, 'message' => (string) $stored['error']];
+    }
+
+    $ancienne = $student['photo_path'] !== null ? (string) $student['photo_path'] : null;
+
+    tenant_update('students', ['photo_path' => $stored['path']], 'id = :id', ['id' => $studentId]);
+
+    // L'ANCIENNE EST SUPPRIMÉE APRÈS l'écriture, jamais avant : si la
+    // mise à jour échouait, le dossier pointerait sur un fichier qui
+    // n'existe plus, et l'élève n'aurait plus de photo du tout.
+    if ($ancienne !== null && $ancienne !== $stored['path']) {
+        upload_delete($ancienne);
+    }
+
+    audit_log('student.photo_set', 'students', $studentId, null, [
+        'path' => $stored['path'],
+    ], 'Photo de l\'élève enregistrée');
+
+    return ['ok' => true, 'message' => 'Photo enregistrée.'];
+}
+
+/**
+ * Retire la photo d'un élève.
+ *
+ * @return array{ok: bool, message: string}
+ */
+function students_service_remove_photo(int $studentId): array
+{
+    if (!can('student.edit')) {
+        return ['ok' => false, 'message' => 'Vous n\'avez pas le droit de modifier ce dossier.'];
+    }
+
+    $student = students_repo_find($studentId);
+
+    if ($student === null) {
+        return ['ok' => false, 'message' => 'Élève introuvable dans cet établissement.'];
+    }
+
+    if ($student['photo_path'] === null) {
+        return ['ok' => false, 'message' => 'Cet élève n\'a pas de photo.'];
+    }
+
+    $ancienne = (string) $student['photo_path'];
+
+    tenant_update('students', ['photo_path' => null], 'id = :id', ['id' => $studentId]);
+    upload_delete($ancienne);
+
+    audit_log('student.photo_removed', 'students', $studentId, null, [
+        'path' => $ancienne,
+    ], 'Photo de l\'élève retirée');
+
+    // LES CARTES DÉJÀ DÉLIVRÉES NE SONT PAS TOUCHÉES. Elles portent le
+    // chemin figé au moment de la délivrance ; le fichier ayant disparu,
+    // leur emplacement photo reste vide à la réimpression. C'est une
+    // limite connue, documentée en phase 9A : le figeage conserve le
+    // CHEMIN de l'image, pas l'image.
+    return ['ok' => true, 'message' => 'Photo retirée.'];
+}
+
+/**
+ * Envoie le fichier de la photo, après contrôle.
+ *
+ * Le chemin vient de la BASE, jamais de l'URL : l'appelant ne fournit
+ * qu'un identifiant d'élève, déjà borné à son école. Une traversée de
+ * répertoire est donc impossible par construction, et `upload_path()`
+ * la rendrait impossible une seconde fois.
+ *
+ * @return array{ok: bool, path?: string, mime?: string, message?: string}
+ */
+function students_service_photo_file(int $studentId): array
+{
+    $student = students_repo_find($studentId);
+
+    if ($student === null || $student['photo_path'] === null) {
+        return ['ok' => false, 'message' => 'Aucune photo.'];
+    }
+
+    $chemin = storage_path('uploads/' . ltrim((string) $student['photo_path'], '/'));
+    $reel   = realpath($chemin);
+    $base   = realpath(storage_path('uploads'));
+
+    // Ceinture et bretelles : même si un chemin aberrant entrait en base,
+    // il ne sortirait pas du dossier des téléversements.
+    if ($reel === false || $base === false || !str_starts_with($reel, $base . DIRECTORY_SEPARATOR)) {
+        log_warning('Photo hors périmètre', ['student' => $studentId, 'path' => $chemin]);
+
+        return ['ok' => false, 'message' => 'Fichier introuvable.'];
+    }
+
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mime  = (string) $finfo->file($reel);
+
+    if (!in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)) {
+        return ['ok' => false, 'message' => 'Fichier illisible.'];
+    }
+
+    return ['ok' => true, 'path' => $reel, 'mime' => $mime];
+}

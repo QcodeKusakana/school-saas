@@ -24,6 +24,12 @@ $user = auth_user();
     <link rel="stylesheet" href="<?= e(asset('assets/vendor/bootstrap/css/bootstrap.min.css')) ?>">
     <link rel="stylesheet" href="<?= e(asset('assets/vendor/bootstrap-icons/font/bootstrap-icons.min.css')) ?>">
     <link rel="stylesheet" href="<?= e(asset('assets/css/app.css')) ?>">
+    <!-- PWA (phase 8B) : le manifeste et l'icône. Le service worker
+         s'enregistre depuis offline.js, jamais en ligne — la CSP
+         stricte interdit le script en attribut. -->
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/assets/img/icon-192.png" sizes="192x192" type="image/png">
+    <link rel="apple-touch-icon" href="/assets/img/icon-192.png">
 </head>
 <body>
 
@@ -34,6 +40,8 @@ $user = auth_user();
     <div class="app-main">
 
         <?php partial('partials/topbar', ['user' => $user]); ?>
+
+        <?php partial('partials/platform_banner'); ?>
 
         <main class="app-content">
             <?php partial('partials/flash'); ?>
@@ -57,5 +65,6 @@ $user = auth_user();
 
 <?= script_tag('assets/vendor/bootstrap/js/bootstrap.bundle.min.js') ?>
 <?= script_tag('assets/js/app.js') ?>
+<?= script_tag('assets/js/offline.js') ?>
 </body>
 </html>

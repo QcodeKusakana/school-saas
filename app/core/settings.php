@@ -26,34 +26,62 @@ function school_setting(string $key, mixed $default = null): mixed
     return array_key_exists($key, $settings) ? $settings[$key] : $default;
 }
 
-/** Tous les paramètres de l'établissement courant, déjà typés. */
+/**
+ * Tous les paramètres de l'établissement courant, déjà typés.
+ *
+ * LE CACHE EST INDEXÉ PAR ÉCOLE, ET CE N'EST PAS UN DÉTAIL
+ * =========================================================
+ * Il ne l'était pas : un `static $cache` unique, que `tenant_set()`
+ * n'invalidait pas. Tant qu'une requête HTTP ne sert qu'une école, le
+ * défaut ne se voit pas. Mais trois chemins changent d'école DANS la
+ * même exécution :
+ *
+ *   · la console éditeur, qui ouvre une école cliente (`platform_scope`) ;
+ *   · les traitements en ligne de commande, qui bouclent sur les écoles ;
+ *   · la synchronisation hors connexion, qui rejoue des files par école.
+ *
+ * Sur ces chemins, l'école B lisait les paramètres de l'école A : format
+ * de matricule, seuil de réussite, et depuis la phase 9A la VILLE et la
+ * TUTELLE figées au bas d'un document signé. Un document de l'école B
+ * pouvait donc porter l'identité de l'école A.
+ *
+ *   > Un cache qui survit au changement de périmètre n'est plus un
+ *   > cache, c'est une fuite qui a l'air d'une optimisation.
+ *
+ * Le tableau reste borné : une entrée par école réellement ouverte
+ * pendant l'exécution, c'est-à-dire une en requête HTTP normale.
+ */
 function school_settings_all(bool $refresh = false): array
 {
-    static $cache = null;
+    /** @var array<int, array<string, mixed>> $cache */
+    static $cache = [];
+
+    $schoolId = tenant_id();
 
     if ($refresh) {
-        $cache = null;
+        // On ne vide que l'école courante : une écriture chez B n'a
+        // aucune raison de faire relire A.
+        unset($cache[(int) $schoolId]);
     }
 
-    if ($cache !== null) {
-        return $cache;
+    if ($schoolId === null) {
+        return [];
     }
 
-    if (tenant_id() === null) {
-        return $cache = [];
+    if (array_key_exists($schoolId, $cache)) {
+        return $cache[$schoolId];
     }
 
-    $rows  = tenant_all('school_settings');
-    $cache = [];
+    $valeurs = [];
 
-    foreach ($rows as $row) {
-        $cache[$row['setting_key']] = school_setting_cast(
+    foreach (tenant_all('school_settings') as $row) {
+        $valeurs[$row['setting_key']] = school_setting_cast(
             $row['setting_value'],
             (string) $row['setting_type']
         );
     }
 
-    return $cache;
+    return $cache[$schoolId] = $valeurs;
 }
 
 /**

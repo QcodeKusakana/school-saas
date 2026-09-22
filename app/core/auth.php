@@ -214,7 +214,23 @@ function auth_user(bool $refresh = false): ?array
 
     // Le contexte multi-école est réétabli à chaque requête depuis la base,
     // et non depuis la session : une session altérée ne peut pas changer d'école.
-    tenant_set($row['school_id'] !== null ? (int) $row['school_id'] : null);
+    //
+    // LA VISITE DE L'ÉDITEUR OBÉIT À LA MÊME RÈGLE (phase 7B).
+    // Un compte de la plateforme porte school_id NULL ; l'école qu'il a
+    // ouverte est lue dans `users.visiting_school_id`, une colonne que
+    // seul le service habilité écrit — jamais la session. Sans cela,
+    // un cookie volé permettrait d'entrer dans une école SANS passer
+    // par la route auditée, et la trace ne protégerait plus de rien.
+    //
+    // La colonne n'a d'effet que si school_id est NULL : renseignée par
+    // erreur sur un compte d'école, elle est ignorée.
+    $contextSchool = $row['school_id'] !== null
+        ? (int) $row['school_id']
+        : (isset($row['visiting_school_id']) && $row['visiting_school_id'] !== null
+            ? (int) $row['visiting_school_id']
+            : null);
+
+    tenant_set($contextSchool);
 
     return $user = $row;
 }

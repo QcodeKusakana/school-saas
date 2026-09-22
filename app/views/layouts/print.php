@@ -19,9 +19,28 @@
  * en lot, archivage automatique), ce sera une décision à prendre pour
  * elle-même, pas un effet de bord.
  *
+ * DEUX RÉGLAGES, POUR NE PAS FORCER TOUS LES DOCUMENTS DANS LE MÊME
+ * MOULE
+ * ======================================================================
+ * `$retour` — la destination du bouton de retour. Elle valait `/notes`
+ * en dur : correct pour un bulletin, faux pour une attestation, qui
+ * renvoyait le secrétariat dans les notes.
+ *
+ * `$sansFeuille` — une carte d'élève n'est pas une feuille A4. La poser
+ * au milieu d'une page blanche de 21 cm donnerait une carte perdue au
+ * centre d'un document qu'on imprimerait en entier.
+ *
+ *   > Un gabarit qui impose sa forme à tout ce qu'il enveloppe finit
+ *   > par déformer ce qu'il devait servir.
+ *
  * @var string $content
+ * @var string $retour
+ * @var bool   $sansFeuille
  */
 declare(strict_types=1);
+
+$retour      = $retour      ?? '/notes';
+$sansFeuille = $sansFeuille ?? false;
 ?>
 <!doctype html>
 <html lang="fr">
@@ -36,6 +55,12 @@ declare(strict_types=1);
     <link rel="stylesheet" href="<?= e(asset('assets/css/app.css')) ?>">
     <style>
         body { background: #f1f5f9; }
+
+        /* UN QR NE DOIT PAS IMPOSER SA TAILLE.
+           Le générateur produit un SVG avec ses dimensions propres ;
+           c'est la page qui décide de la place qu'elle lui laisse. */
+        .qr-a4     { width: 2.6cm; height: 2.6cm; }
+        .qr-a4 svg { width: 100%; height: 100%; display: block; }
 
         .sheet {
             background: #fff;
@@ -64,7 +89,7 @@ declare(strict_types=1);
 <body>
 
 <div class="no-print d-flex justify-content-between align-items-center gap-2">
-    <a href="<?= e(url('/notes')) ?>" class="btn btn-sm btn-outline-secondary">
+    <a href="<?= e(url($retour)) ?>" class="btn btn-sm btn-outline-secondary">
         <i class="bi bi-arrow-left me-1"></i> Retour
     </a>
     <button type="button" class="btn btn-sm btn-primary" data-print>
@@ -74,9 +99,13 @@ declare(strict_types=1);
 
 <?php partial('partials/flash'); ?>
 
-<div class="sheet">
+<?php if ($sansFeuille): ?>
     <?= $content ?>
-</div>
+<?php else: ?>
+    <div class="sheet">
+        <?= $content ?>
+    </div>
+<?php endif; ?>
 
 <?= script_tag('assets/js/app.js') ?>
 </body>

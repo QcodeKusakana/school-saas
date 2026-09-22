@@ -483,3 +483,59 @@ function ctrl_students_quick_search(): void
         'url'       => url('/eleves/' . (int) $s['id']),
     ], $result['rows']));
 }
+
+/**
+ * Enregistre la photo de l'élève.
+ */
+function ctrl_students_set_photo(string $id): void
+{
+    $out = students_service_set_photo((int) $id, input_file('photo') ?? []);
+
+    $out['ok'] ? flash_success($out['message']) : flash_error($out['message']);
+
+    redirect('/eleves/' . (int) $id);
+}
+
+/**
+ * Retire la photo de l'élève.
+ */
+function ctrl_students_remove_photo(string $id): void
+{
+    $out = students_service_remove_photo((int) $id);
+
+    $out['ok'] ? flash_success($out['message']) : flash_error($out['message']);
+
+    redirect('/eleves/' . (int) $id);
+}
+
+/**
+ * Sert la photo de l'élève — DERRIÈRE L'AUTHENTIFICATION.
+ *
+ * Les fichiers vivent dans `storage/uploads`, hors de la racine web.
+ * Cette route est le seul chemin vers eux, et elle passe par `auth`,
+ * `school` et `student.view` comme n'importe quel écran du dossier.
+ *
+ * `Cache-Control: private` empêche un cache partagé (proxy d'école,
+ * cybercafé) de conserver la photo d'un mineur et de la resservir à la
+ * session suivante.
+ */
+function ctrl_students_photo(string $id): void
+{
+    $out = students_service_photo_file((int) $id);
+
+    if (!$out['ok']) {
+        http_response_code(404);
+        exit;
+    }
+
+    header('Content-Type: ' . $out['mime']);
+    header('Content-Length: ' . (string) filesize($out['path']));
+    header('Cache-Control: private, max-age=3600');
+    header('X-Content-Type-Options: nosniff');
+    // Une image servie en pièce jointe ne s'exécute pas si le type est
+    // mal deviné par un navigateur ancien.
+    header('Content-Disposition: inline; filename="photo.' . pathinfo($out['path'], PATHINFO_EXTENSION) . '"');
+
+    readfile($out['path']);
+    exit;
+}
