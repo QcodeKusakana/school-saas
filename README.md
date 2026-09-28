@@ -129,10 +129,31 @@ et les outils d'installation restés en ligne.
 > elle décrivait trois points déjà réglés depuis des phases entières, et taisait
 > celui qui empêchait une installation neuve de réinitialiser un mot de passe.
 
+### Sauvegarde et restauration
+
+```powershell
+php database\backup.php                     Archive complète (base + fichiers déposés)
+php database\backup.php --lister            Les sauvegardes présentes
+php database\restore.php <archive> --verifier   Contrôle, sans rien écrire
+php database\restore.php <archive>          Restauration (demande confirmation)
+```
+
+L'archive porte la base, les fichiers déposés et un **manifeste** : date,
+migrations appliquées, et une empreinte par table. La restauration s'en sert
+pour refuser une archive plus récente que le code, puis pour **vérifier**,
+table par table, que la base rendue est celle qui a été prise.
+
+> Une sauvegarde jamais restaurée est une croyance, pas une protection.
+> `--verifier` permet de s'en assurer sans attendre le sinistre.
+
+Planifiez `backup.php` (tâche cron, ou le planificateur de l'hébergeur). Le
+contrôle avant mise en service refuse de valider une installation dont la
+dernière sauvegarde date de plus de sept jours.
+
 Restent hors de sa portée, à traiter à la main :
 
-- [ ] Sauvegarde automatique de la base configurée
 - [ ] Certificat HTTPS valide et renouvellement automatique
+- [ ] Copie des sauvegardes hors du serveur (un disque qui meurt emporte les deux)
 
 ---
 

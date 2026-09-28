@@ -260,6 +260,7 @@ foreach ([
     'app.debug', 'session.cookie_secure', 'app.url', 'Clé de chiffrement',
     'Compte MySQL', 'Migrations appliquées', 'Établissement de démonstration',
     'Serveur d\'envoi', 'storage/ hors racine web', 'public/diagnostic.php',
+    'Sauvegarde',
 ] as $sujet) {
     check('Contrôlé : ' . $sujet, controle($controles, $sujet) !== null);
 }
@@ -456,6 +457,24 @@ try {
     }
     check('… et il passe alors en bloquant', $niveauDiag === 'bloquant');
     unlink($decor . '/public/diagnostic.php');
+
+    // Le décor n'a aucune sauvegarde : le contrôle doit le dire.
+    check('Sait dire non : aucune sauvegarde',
+        decor_etat(decor_mesurer($decor), 'Sauvegarde') === 'echec');
+
+    if (!is_dir($decor . '/storage/backups')) {
+        mkdir($decor . '/storage/backups', 0o775, true);
+    }
+
+    file_put_contents($decor . '/storage/backups/school-saas-essai.zip', 'PK');
+    check('Une sauvegarde récente le satisfait',
+        decor_etat(decor_mesurer($decor), 'Sauvegarde') === 'ok');
+
+    // Une sauvegarde trop ancienne ne vaut pas mieux qu'une intention.
+    touch($decor . '/storage/backups/school-saas-essai.zip', time() - 40 * 86400);
+    check('Sait dire non : sauvegarde vieille de 40 jours',
+        decor_etat(decor_mesurer($decor), 'Sauvegarde') === 'echec');
+    unlink($decor . '/storage/backups/school-saas-essai.zip');
 
     file_put_contents($decor . '/database/seed_demo.php', "<?php\n");
     check('Sait dire non : seed_demo.php laissé en ligne',

@@ -1002,9 +1002,78 @@ qui vérifie que ses verdicts correspondent à la configuration réellement
 lue — un contrôle qui répondrait « ✓ » par construction ne contrôlerait
 rien.
 
+## Sauvegarde et restauration (phase 10B)
+
+```
+php database/backup.php                          Archive : base + fichiers déposés
+php database/restore.php <archive> --verifier    Contrôle, sans rien écrire
+php database/restore.php <archive>               Restauration, sur confirmation
+```
+
+L'export est en **PHP pur**, et c'est délibéré : `mysqldump` exposerait le mot
+de passe de la base dans la liste des processus, et n'est pas garanti sur un
+hébergement mutualisé. Un seul chemin de code, donc un seul chemin éprouvé.
+
+Trois pièges de ce schéma sont traités nommément : les **cinq colonnes
+`varbinary`** qui portent des adresses IP compactées (écrites comme du texte,
+elles reviendraient corrompues en silence), la **colonne générée**
+`subscription_payments.reference_live` qui ne s'insère pas, et les **clés
+étrangères** qui interdisent tout ordre d'insertion naïf.
+
+La restauration **vérifie** : elle recalcule l'empreinte de chaque table avec
+la fonction même qui l'a produite, et refuse une archive venue d'une version
+plus récente du produit.
+
+> Une sauvegarde jamais restaurée est une croyance, pas une protection.
+
+`tests/backup_restore.php` (39 tests) prend une base complète, la **détruit**,
+la rend, et compare les 61 empreintes. Il éprouve aussi que la vérification
+sait dire NON — un seul champ modifié, sans changement du nombre de lignes.
+
 Restent hors de sa portée :
 
-- [ ] Sauvegarde automatique de la base
+- [ ] Planifier `backup.php` (cron / planificateur de l'hébergeur)
+- [ ] **Copier les sauvegardes hors du serveur** — un disque qui meurt emporte
+      la base et ses sauvegardes
 - [ ] Certificat HTTPS valide et renouvellement automatique
-- [ ] **Écrire la procédure d'effacement d'une école** (RGPD) — aujourd'hui
-      impossible, voir la dette ci-dessus
+- [x] **La procédure d'effacement d'une école** — livrée en phase 10C,
+      `php database/erase_school.php <CODE>` (voir ci-dessous)
+
+---
+
+## Effacement d'un établissement (phase 10C)
+
+```
+php database/erase_school.php ECO-000007 --simuler   Montre, n'écrit rien
+php database/erase_school.php ECO-000007             Efface, sur confirmation
+```
+
+**Ce n'est pas un bouton, et c'est délibéré.** Un bouton qui détruit un
+établissement est un bouton qu'on clique par erreur, et qu'une session volée
+clique très volontiers.
+
+> Ce qui ne se rattrape pas ne s'expose pas à un clic.
+
+Ce que le schéma imposait, et qu'un `DELETE FROM schools` ignore :
+
+- **42 tables sont en `ON DELETE CASCADE`** depuis `schools`. Un simple DELETE
+  emporterait `subscriptions` et `subscription_payments` — la comptabilité de
+  l'**éditeur**, qu'aucun droit à l'effacement ne concerne et qu'une obligation
+  comptable impose de garder. Elle est donc **archivée avant**, dans
+  `billing_archive`, sans une donnée personnelle.
+- **`audit_logs` n'a aucune clé étrangère vers `schools`** : ses lignes
+  *survivraient* au CASCADE. Or `audit_log('user.update', …)` y écrit nom,
+  prénom et adresse en clair. Elles sont effacées explicitement.
+
+> Un effacement qui épargne le journal n'efface rien.
+
+Conditions, toutes vérifiées **avant la moindre écriture** : établissement
+résilié, sauvegarde de moins de 24 h **contenant cet établissement**, code
+retapé à la main, motif d'au moins 10 caractères.
+
+Ce qui survit : les écritures comptables, une ligne dans `school_erasures`
+(code, nom, motif, opérateur, sauvegarde, décomptes) et **une** entrée au
+journal de la plateforme, qui dit qu'un effacement a eu lieu sans dire sur qui.
+
+`tests/school_erasure.php` (44 tests) efface une école pour de bon et vérifie
+que **l'école voisine ne perd pas une ligne**.

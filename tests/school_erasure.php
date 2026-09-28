@@ -1,0 +1,521 @@
+<?php
+/**
+ * Phase 10C — l'effacement d'un établissement.
+ *
+ * CE QUE CES TESTS PROTÈGENT
+ * --------------------------
+ *  · l'effacement est REFUSÉ tant que l'école n'est pas résiliée ;
+ *  · il est REFUSÉ sans sauvegarde, et sans que cette école y figure ;
+ *  · il est REFUSÉ si le code n'est pas retapé, ou le motif trop court ;
+ *  · le journal de l'école part AUSSI — il n'a aucune clé étrangère
+ *    vers `schools` et survivrait au CASCADE, avec les noms et les
+ *    adresses qu'il porte ;
+ *  · la comptabilité de l'éditeur SURVIT, sans donnée personnelle ;
+ *  · une trace survit, et elle ne nomme aucun élève ;
+ *  · les fichiers déposés partent avec la base ;
+ *  · ET SURTOUT : l'école voisine ne perd pas une ligne.
+ *
+ * Sur un décor jetable — on détruit une école pour prouver qu'on sait
+ * la détruire proprement, jamais sur la base de travail.
+ *
+ * Usage : php tests/school_erasure.php
+ */
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/app/bootstrap.php';
+
+$pass = 0;
+$fail = 0;
+
+function check(string $label, bool $ok, string $detail = ''): void
+{
+    global $pass, $fail;
+    $ok ? $pass++ : $fail++;
+    printf("  %s %s%s\n", $ok ? '✓' : '✗', $label, $detail !== '' ? " — {$detail}" : '');
+}
+
+echo "\n  PHASE 10C — L'EFFACEMENT D'UN ÉTABLISSEMENT\n";
+echo "  ══════════════════════════════════════════════════════════\n";
+
+$base   = 'school_saas_recette_effacement';
+$racine = sys_get_temp_dir() . '/effacement-' . bin2hex(random_bytes(6));
+
+function serveur(): PDO
+{
+    return new PDO(
+        'mysql:host=' . (string) config('database.host')
+        . ';port=' . (int) config('database.port', 3306) . ';charset=utf8mb4',
+        (string) config('database.user'),
+        (string) config('database.password'),
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
+    );
+}
+
+function base_decor(string $base): PDO
+{
+    return new PDO(
+        'mysql:host=' . (string) config('database.host')
+        . ';port=' . (int) config('database.port', 3306)
+        . ';dbname=' . $base . ';charset=utf8mb4',
+        (string) config('database.user'),
+        (string) config('database.password'),
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
+    );
+}
+
+function lancer(string $racine, string $script, array $args = [], string $entree = ''): array
+{
+    $commande = 'php ' . escapeshellarg($racine . '/database/' . $script);
+
+    foreach ($args as $a) {
+        $commande .= ' ' . escapeshellarg($a);
+    }
+
+    $processus = proc_open(
+        $commande,
+        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $tuyaux
+    );
+
+    if (!is_resource($processus)) {
+        return ['sortie' => '', 'erreur' => 'proc_open a échoué', 'code' => -1];
+    }
+
+    fwrite($tuyaux[0], $entree);
+    fclose($tuyaux[0]);
+
+    $sortie = (string) stream_get_contents($tuyaux[1]);
+    $erreur = (string) stream_get_contents($tuyaux[2]);
+
+    fclose($tuyaux[1]);
+    fclose($tuyaux[2]);
+
+    return ['sortie' => $sortie, 'erreur' => $erreur, 'code' => proc_close($processus)];
+}
+
+function effacer_dossier(string $chemin): void
+{
+    if (!is_dir($chemin)) {
+        return;
+    }
+
+    $entrees = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($chemin, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+
+    foreach ($entrees as $entree) {
+        $entree->isDir() ? rmdir($entree->getPathname()) : unlink($entree->getPathname());
+    }
+
+    rmdir($chemin);
+}
+
+/** Crée un établissement complet dans le décor. @return array{id:int,code:string,uuid:string} */
+function creer_ecole(PDO $db, string $code, string $nom, string $slug): array
+{
+    $uuid = sprintf('%s-%s-4%s-a%s-%s',
+        bin2hex(random_bytes(4)), bin2hex(random_bytes(2)),
+        substr(bin2hex(random_bytes(2)), 1), substr(bin2hex(random_bytes(2)), 1),
+        bin2hex(random_bytes(6)));
+
+    $db->prepare(
+        "INSERT INTO schools (uuid, code, slug, name, school_type, status, default_currency, created_at)
+         VALUES (:uuid, :code, :slug, :nom, 'prive', 'active', 'CDF', NOW())"
+    )->execute(['uuid' => $uuid, 'code' => $code, 'slug' => $slug, 'nom' => $nom]);
+
+    return ['id' => (int) $db->lastInsertId(), 'code' => $code, 'uuid' => $uuid];
+}
+
+/** Pose des données représentatives : journal, comptabilité, fichiers. */
+function garnir(PDO $db, string $racine, int $ecoleId, string $etiquette): void
+{
+    // Une entrée de journal PORTANT UN NOM ET UNE ADRESSE — exactement ce
+    // que `audit_log('user.update', …)` écrit dans le produit.
+    $db->prepare(
+        "INSERT INTO audit_logs (school_id, action, entity_type, entity_id, new_values, description, created_at)
+         VALUES (:s, 'user.update', 'users', 1, :v, :d, NOW())"
+    )->execute([
+        's' => $ecoleId,
+        // CHAQUE ÉCOLE PORTE UN NOM DISTINCT.
+        // Première version : les deux journaux portaient « Espérance
+        // KABILA ». L'assertion cherchait donc un nom qui appartenait
+        // AUSSI à l'école survivante, et accusait un effacement correct.
+        //
+        //   > Une sonde qui cherche une trace partagée ne mesure pas
+        //   > l'effacement, elle mesure le voisinage.
+        'v' => json_encode(['last_name' => 'KABILA-' . mb_strtoupper($etiquette),
+                            'first_name' => 'Espérance',
+                            'email' => 'esperance.' . $etiquette . '@exemple.cd'], JSON_UNESCAPED_UNICODE),
+        'd' => 'Modification du compte de Espérance KABILA-' . mb_strtoupper($etiquette),
+    ]);
+
+    // Un abonnement et un paiement : la comptabilité de l'éditeur.
+    $db->prepare(
+        "INSERT INTO subscriptions (school_id, plan_id, status, billing_cycle,
+                                    price_amount, price_currency, starts_on, ends_on, created_at)
+         VALUES (:s, 1, 'active', 'yearly', 120.00, 'USD', '2026-01-01', '2026-12-31', NOW())"
+    )->execute(['s' => $ecoleId]);
+
+    $abonnement = (int) $db->lastInsertId();
+
+    $db->prepare(
+        "INSERT INTO subscription_payments (school_id, subscription_id, amount, currency,
+                                            method, provider, reference, status, paid_at)
+         VALUES (:s, :a, 120.00, 'USD', 'mobile_money', 'mpesa', :r, 'confirmed', NOW())"
+    )->execute(['s' => $ecoleId, 'a' => $abonnement, 'r' => 'REF-' . $etiquette]);
+
+    // Un fichier déposé.
+    $dossier = $racine . '/storage/uploads/photos/' . $ecoleId;
+    mkdir($dossier, 0o775, true);
+    file_put_contents($dossier . '/eleve.png', random_bytes(256));
+}
+
+// --- Le décor -----------------------------------------------------------
+mkdir($racine . '/app/config', 0o775, true);
+mkdir($racine . '/app/core', 0o775, true);
+mkdir($racine . '/storage/backups', 0o775, true);
+mkdir($racine . '/storage/uploads', 0o775, true);
+
+copy(BASE_PATH . '/app/config/config.php', $racine . '/app/config/config.php');
+copy(BASE_PATH . '/app/core/helpers.php',  $racine . '/app/core/helpers.php');
+copy(BASE_PATH . '/app/core/logger.php',   $racine . '/app/core/logger.php');
+
+$copier = static function (string $de, string $vers) use (&$copier): void {
+    if (!is_dir($vers)) {
+        mkdir($vers, 0o775, true);
+    }
+
+    foreach (scandir($de) ?: [] as $e) {
+        if ($e === '.' || $e === '..') {
+            continue;
+        }
+
+        is_dir($de . '/' . $e) ? $copier($de . '/' . $e, $vers . '/' . $e)
+                               : copy($de . '/' . $e, $vers . '/' . $e);
+    }
+};
+
+$copier(BASE_PATH . '/database', $racine . '/database');
+
+file_put_contents(
+    $racine . '/app/config/config.local.php',
+    "<?php\ndeclare(strict_types=1);\nreturn [\n"
+    . "    'app' => ['env' => 'local', 'debug' => true, 'url' => 'http://recette.test'],\n"
+    . "    'database' => ['host' => " . var_export((string) config('database.host'), true)
+    . ", 'port' => " . (int) config('database.port', 3306)
+    . ", 'name' => " . var_export($base, true)
+    . ", 'user' => " . var_export((string) config('database.user'), true)
+    . ", 'password' => " . var_export((string) config('database.password'), true) . "],\n"
+    . "    'security' => ['encryption_key' => " . var_export(base64_encode(random_bytes(32)), true) . "],\n"
+    . "];\n"
+);
+
+try {
+    try {
+        $serveur = serveur();
+        $serveur->exec("DROP DATABASE IF EXISTS `{$base}`");
+        $serveur->exec("CREATE DATABASE `{$base}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    } catch (PDOException $e) {
+        check('Le compte MySQL peut créer la base de recette', false, $e->getMessage());
+        echo "\n  Accordez : GRANT ALL ON `school\\_saas\\_recette\\_%`.* TO '"
+            . (string) config('database.user') . "'@'localhost';\n\n";
+        effacer_dossier($racine);
+        exit(1);
+    }
+
+    $install = lancer($racine, 'install.php', [], "editeur.recette\nediteur@exemple.cd\nRecette2026Ab\n");
+
+    check('Le décor est installé', str_contains($install['sortie'], 'Installation terminée'));
+
+    $db = base_decor($base);
+
+    // =================================================================
+    //  DEUX ÉCOLES : celle qu'on efface, et celle qui doit survivre
+    // =================================================================
+
+    echo "\n  Deux établissements, dont un seul doit disparaître\n";
+
+    $partante = creer_ecole($db, 'ECO-900001', 'École qui s\'en va', 'ecole-partante');
+    $voisine  = creer_ecole($db, 'ECO-900002', 'École voisine', 'ecole-voisine');
+
+    garnir($db, $racine, $partante['id'], 'partante');
+    garnir($db, $racine, $voisine['id'], 'voisine');
+
+    check('Les deux établissements sont en place',
+        (int) $db->query("SELECT COUNT(*) FROM schools WHERE code LIKE 'ECO-9000%'")->fetchColumn() === 2);
+
+    /** Compte les lignes d'une école, toutes tables portant school_id. */
+    $inventaire = static function (PDO $db, int $id) use ($base): int {
+        $tables = $db->prepare(
+            "SELECT table_name FROM information_schema.columns
+              WHERE table_schema = :b AND column_name = 'school_id'"
+        );
+        $tables->execute(['b' => $base]);
+
+        $total = 0;
+
+        foreach ($tables->fetchAll(PDO::FETCH_COLUMN) as $table) {
+            $c = $db->prepare('SELECT COUNT(*) FROM `' . $table . '` WHERE school_id = :s');
+            $c->execute(['s' => $id]);
+            $total += (int) $c->fetchColumn();
+        }
+
+        return $total;
+    };
+
+    $avantVoisine = $inventaire($db, $voisine['id']);
+
+    check('L\'école voisine porte des données', $avantVoisine > 0, $avantVoisine . ' ligne(s)');
+
+    // =================================================================
+    //  LES REFUS — avant toute écriture
+    // =================================================================
+
+    echo "\n  Les refus\n";
+
+    $active = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('Une école ACTIVE : refusé',
+        $active['code'] !== 0 && str_contains($active['erreur'], 'pas résilié'));
+
+    // On résilie, comme la console de l'éditeur le ferait.
+    $db->exec("UPDATE schools SET status = 'cancelled' WHERE code = 'ECO-900001'");
+
+    $sansSauvegarde = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('Sans sauvegarde : refusé',
+        $sansSauvegarde['code'] !== 0
+        && str_contains($sansSauvegarde['erreur'], 'Aucune sauvegarde'));
+
+    // Une sauvegarde prise AVANT l'inscription de l'école ne vaut pas.
+    // On en fabrique une qui ne contient pas son identifiant.
+    file_put_contents($racine . '/storage/backups/vieille.zip', 'PK pas une archive');
+
+    $mauvaise = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('Une archive illisible : refusée',
+        $mauvaise['code'] !== 0 && str_contains($mauvaise['erreur'], 'archive illisible'));
+
+    unlink($racine . '/storage/backups/vieille.zip');
+
+    // La vraie sauvegarde.
+    $sauvegarde = lancer($racine, 'backup.php');
+
+    check('La sauvegarde est prise', $sauvegarde['code'] === 0);
+
+    // Une archive vieille de trois jours n'est plus un retour crédible.
+    $archives = glob($racine . '/storage/backups/*.zip') ?: [];
+    touch($archives[0], time() - 3 * 86400);
+
+    $vieille = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('Une sauvegarde de trois jours : refusée',
+        $vieille['code'] !== 0 && str_contains($vieille['erreur'], 'heure(s)'));
+
+    touch($archives[0], time());
+
+    // =================================================================
+    //  LA SIMULATION N'ÉCRIT RIEN
+    // =================================================================
+
+    echo "\n  La simulation\n";
+
+    $avantPartante = $inventaire($db, $partante['id']);
+    $simulation    = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('La simulation aboutit', $simulation['code'] === 0,
+        $simulation['erreur'] !== '' ? trim($simulation['erreur']) : '');
+
+    check('Elle montre ce qui sera effacé',
+        str_contains($simulation['sortie'], 'CE QUI SERA EFFACÉ'));
+
+    check('… et ce qui sera gardé',
+        str_contains($simulation['sortie'], 'CE QUI SERA GARDÉ'));
+
+    check('Elle dit n\'avoir rien écrit',
+        str_contains($simulation['sortie'], 'rien n\'a été écrit'));
+
+    check('… et elle n\'a effectivement rien écrit',
+        $inventaire($db, $partante['id']) === $avantPartante,
+        $avantPartante . ' ligne(s) avant comme après');
+
+    // =================================================================
+    //  LES REFUS DE CONFIRMATION
+    // =================================================================
+
+    echo "\n  La confirmation\n";
+
+    $mauvaisCode = lancer($racine, 'erase_school.php', ['ECO-900001'], "ECO-000999\n");
+
+    check('Un code mal retapé : refusé',
+        $mauvaisCode['code'] !== 0 && str_contains($mauvaisCode['sortie'], 'Code incorrect'));
+
+    $motifCourt = lancer($racine, 'erase_school.php', ['ECO-900001'], "ECO-900001\ncourt\n");
+
+    check('Un motif trop court : refusé',
+        $motifCourt['code'] !== 0 && str_contains($motifCourt['sortie'], 'Motif trop court'));
+
+    check('… et rien n\'a bougé', $inventaire($db, $partante['id']) === $avantPartante);
+
+    // =================================================================
+    //  L'EFFACEMENT
+    // =================================================================
+
+    echo "\n  L'effacement\n";
+
+    $photo = $racine . '/storage/uploads/photos/' . $partante['id'] . '/eleve.png';
+    $photoVoisine = $racine . '/storage/uploads/photos/' . $voisine['id'] . '/eleve.png';
+
+    check('Le fichier de l\'école partante existe', is_file($photo));
+
+    $effacement = lancer(
+        $racine,
+        'erase_school.php',
+        ['ECO-900001'],
+        "ECO-900001\nRésiliation du contrat à la demande de l'établissement\nediteur.recette\n"
+    );
+
+    check('L\'effacement aboutit', $effacement['code'] === 0,
+        $effacement['erreur'] !== '' ? trim($effacement['erreur']) : '');
+
+    check('Il se déclare terminé', str_contains($effacement['sortie'], 'Effacement terminé'));
+
+    $db = base_decor($base);
+
+    check('L\'établissement a disparu',
+        (int) $db->query("SELECT COUNT(*) FROM schools WHERE code = 'ECO-900001'")->fetchColumn() === 0);
+
+    check('… et toutes ses lignes avec lui',
+        $inventaire($db, $partante['id']) === 0,
+        $inventaire($db, $partante['id']) . ' ligne(s) restante(s)');
+
+    // LE PIÈGE : `audit_logs` n'a AUCUNE clé étrangère vers `schools`.
+    // Sans un effacement explicite, ses lignes survivraient au CASCADE —
+    // avec les noms et les adresses qu'elles portent.
+    check('Le journal de l\'école est parti',
+        (int) $db->prepare('SELECT COUNT(*) FROM audit_logs WHERE school_id = ?')
+            ->execute([$partante['id']]) !== null
+        && (int) $db->query('SELECT COUNT(*) FROM audit_logs WHERE school_id = '
+            . $partante['id'])->fetchColumn() === 0);
+
+    $resteNom = (int) $db->query(
+        "SELECT COUNT(*) FROM audit_logs
+          WHERE new_values LIKE '%esperance.partante@exemple.cd%'
+             OR description LIKE '%KABILA-PARTANTE%'"
+    )->fetchColumn();
+
+    check('Aucun nom ni adresse de cette école ne subsiste au journal', $resteNom === 0);
+
+    // Et le contrôle symétrique, qui donne son sens au précédent : le
+    // nom de l'école VOISINE, lui, doit être toujours là.
+    $resteVoisine = (int) $db->query(
+        "SELECT COUNT(*) FROM audit_logs
+          WHERE new_values LIKE '%esperance.voisine@exemple.cd%'
+             OR description LIKE '%KABILA-VOISINE%'"
+    )->fetchColumn();
+
+    check('… tandis que celui de l\'école voisine est intact', $resteVoisine === 1,
+        $resteVoisine . ' entrée(s)');
+
+    check('Les fichiers déposés sont partis', !is_file($photo));
+    check('… et leur dossier aussi',
+        !is_dir($racine . '/storage/uploads/photos/' . $partante['id']));
+
+    // =================================================================
+    //  CE QUI DOIT SURVIVRE
+    // =================================================================
+
+    echo "\n  Ce qui survit\n";
+
+    $comptable = $db->query(
+        "SELECT * FROM billing_archive WHERE school_code = 'ECO-900001'"
+    )->fetchAll();
+
+    check('La comptabilité de l\'éditeur est archivée', count($comptable) === 1);
+
+    if ($comptable !== []) {
+        check('… avec le montant et la devise',
+            (float) $comptable[0]['amount'] === 120.00 && $comptable[0]['currency'] === 'USD');
+        check('… avec la référence du paiement',
+            $comptable[0]['reference'] === 'REF-partante');
+        check('… et le nom de l\'établissement, personne morale',
+            $comptable[0]['school_name'] === 'École qui s\'en va');
+    }
+
+    $trace = $db->query(
+        "SELECT * FROM school_erasures WHERE school_code = 'ECO-900001'"
+    )->fetchAll();
+
+    check('Une trace de l\'effacement subsiste', count($trace) === 1);
+
+    if ($trace !== []) {
+        check('… avec le motif', str_contains((string) $trace[0]['reason'], 'Résiliation du contrat'));
+        check('… avec l\'opérateur, gardé en texte',
+            $trace[0]['erased_by_username'] === 'editeur.recette');
+        check('… avec la sauvegarde qui l\'a précédé',
+            str_ends_with((string) $trace[0]['backup_archive'], '.zip'));
+
+        $comptes = json_decode((string) $trace[0]['counts'], true);
+        check('… et le décompte de ce qui est parti',
+            is_array($comptes) && ($comptes['journal'] ?? 0) >= 1);
+    }
+
+    $journalPlateforme = $db->query(
+        "SELECT * FROM audit_logs WHERE action = 'school.erase' AND school_id IS NULL"
+    )->fetchAll();
+
+    check('Le journal de la PLATEFORME garde l\'événement', count($journalPlateforme) === 1);
+
+    if ($journalPlateforme !== []) {
+        check('… et il ne nomme aucun élève',
+            !str_contains((string) $journalPlateforme[0]['description'], 'KABILA')
+            && !str_contains((string) ($journalPlateforme[0]['new_values'] ?? ''), 'KABILA'));
+    }
+
+    // =================================================================
+    //  L'ÉCOLE VOISINE — LE CONTRÔLE QUI PRIME
+    // =================================================================
+
+    echo "\n  L'école voisine\n";
+
+    check('Elle est toujours là',
+        (int) $db->query("SELECT COUNT(*) FROM schools WHERE code = 'ECO-900002'")->fetchColumn() === 1);
+
+    check('Elle n\'a pas perdu une ligne',
+        $inventaire($db, $voisine['id']) === $avantVoisine,
+        $inventaire($db, $voisine['id']) . ' contre ' . $avantVoisine);
+
+    check('Son journal est intact',
+        (int) $db->query('SELECT COUNT(*) FROM audit_logs WHERE school_id = '
+            . $voisine['id'])->fetchColumn() === 1);
+
+    check('Ses fichiers sont intacts', is_file($photoVoisine));
+
+    check('Sa comptabilité n\'a pas été archivée',
+        (int) $db->query("SELECT COUNT(*) FROM billing_archive WHERE school_code = 'ECO-900002'")
+            ->fetchColumn() === 0);
+
+    // =================================================================
+    //  ON N'EFFACE PAS DEUX FOIS
+    // =================================================================
+
+    $rejeu = lancer($racine, 'erase_school.php', ['ECO-900001', '--simuler']);
+
+    check('Un second effacement du même code : refusé',
+        $rejeu['code'] !== 0 && str_contains($rejeu['erreur'], 'Aucun établissement'));
+} finally {
+    try {
+        serveur()->exec("DROP DATABASE IF EXISTS `{$base}`");
+    } catch (Throwable) {
+        // La base n'a peut-être jamais existé.
+    }
+
+    effacer_dossier($racine);
+}
+
+check('Le décor jetable est nettoyé', !is_dir($racine));
+
+printf("\n  %d test(s) réussi(s), %d échec(s)\n\n", $pass, $fail);
+
+exit($fail > 0 ? 1 : 0);

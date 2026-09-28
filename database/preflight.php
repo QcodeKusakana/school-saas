@@ -524,6 +524,30 @@ verdict(BLOQUANT, 'storage/ hors racine web', !$dansLaRacineWeb,
     $dansLaRacineWeb ? 'DANS public/' : 'hors de public/',
     'La racine web doit pointer sur public/, jamais sur la racine du projet.');
 
+// --- Une sauvegarde, et pas seulement l'intention d'en faire ---------
+//
+// La liste en prose portait « sauvegarde automatique de la base
+// configurée ». On ne peut pas mesurer une intention. On peut mesurer
+// s'il EXISTE une sauvegarde, et de quand elle date.
+//
+//   > Une sauvegarde qu'on prévoit de faire protège exactement autant
+//   > qu'aucune sauvegarde.
+//
+// Ce contrôle ne dit pas qu'elle est restaurable : c'est
+// `php database/restore.php <archive> --verifier` qui le dit, et rien
+// d'autre ne le dira à sa place.
+$sauvegardes = glob(BASE_PATH . '/storage/backups/*.{zip,sql}', GLOB_BRACE) ?: [];
+$derniere    = $sauvegardes !== [] ? max(array_map('filemtime', $sauvegardes)) : null;
+$jours       = $derniere !== null ? (int) floor((time() - $derniere) / 86400) : null;
+
+verdict(BLOQUANT, 'Sauvegarde', $derniere !== null && $jours !== null && $jours <= 7,
+    $derniere === null
+        ? 'AUCUNE dans storage/backups/'
+        : count($sauvegardes) . ' présente(s), la plus récente il y a ' . $jours . ' jour(s)',
+    'php database/backup.php — puis planifiez-la (tâche cron, ou le '
+    . 'planificateur de votre hébergeur). Contrôlez qu\'elle est restaurable '
+    . 'avec : php database/restore.php <archive> --verifier');
+
 foreach (['app', 'database', 'storage'] as $dossier) {
     $ht = BASE_PATH . '/' . $dossier . '/.htaccess';
 
@@ -570,6 +594,29 @@ function restituer(array $rapport, bool $asJson): never
     }
 
     echo "\n  Contrôle avant mise en service — " . date('d/m/Y H:i') . "\n";
+
+    // CE QUE L'INSTALLATION SE DÉCLARE ÊTRE.
+    //
+    // Sur une machine de développement, huit points bloquants sont la
+    // BONNE réponse : debug allumé, pas de HTTPS, école de démonstration
+    // en place. Rendus sans un mot, ils ressemblent pourtant à une
+    // alarme — et un développeur qui voit huit croix rouges chaque
+    // semaine finit par ne plus les lire.
+    //
+    //   > Un avertissement qu'on apprend à ignorer ne protège plus
+    //   > personne.
+    //
+    // Le code de sortie, lui, ne bouge pas : la question posée reste
+    // « cette installation peut-elle être ouverte au public ». Seule la
+    // lecture change.
+    $env = (string) config('app.env', '');
+
+    echo $env === 'production'
+        ? "  Cette installation se déclare EN PRODUCTION (app.env).\n"
+        : "  Cette installation se déclare « " . ($env !== '' ? $env : 'non renseigné')
+          . " » (app.env) : les points ci-dessous sont\n"
+          . "  ce qu'il faudra corriger AVANT la mise en ligne, pas une panne du jour.\n";
+
     echo "  ────────────────────────────────────────────────────────────────\n\n";
 
     foreach ($rapport as $ligne) {
