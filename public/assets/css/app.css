@@ -693,3 +693,41 @@ a:hover { color: var(--brand); }
 /* Une école archivée pendant la visite : plus rouge encore, parce que
    la seule action raisonnable est d'en sortir. */
 .platform-banner--archived { background: #991b1b; }
+
+/* =====================================================================
+   PHASE 9C — RAPPORTS
+   =====================================================================
+
+   L'export « PDF » du cahier des charges, c'est l'impression navigateur.
+   Elle n'a rien d'un pis-aller : un directeur qui imprime un état
+   d'effectifs pour sa tutelle veut du papier, et le navigateur sait
+   produire un PDF depuis dix ans.
+
+   Ce qui doit disparaître à l'impression, ce sont les commandes ; ce qui
+   doit apparaître, c'est l'en-tête d'édition — nom de l'école, objet du
+   rapport, date. Sans lui, une feuille posée sur un bureau ne dit ni
+   d'où elle vient ni de quand elle date.
+   ===================================================================== */
+
+.print-only { display: none; }
+
+@media print {
+    .no-print { display: none !important; }
+    .print-only { display: block !important; }
+
+    /* Les en-têtes de colonnes se répètent en haut de chaque page :
+       un tableau d'effectifs sur trois feuilles est illisible sans. */
+    thead { display: table-header-group; }
+    tr, .card { page-break-inside: avoid; }
+
+    /* Sans cela, les navigateurs suppriment les fonds à l'impression,
+       et la ligne de totaux se confond avec les autres. */
+    .table tfoot tr,
+    .table-report-total {
+        background: #e2e8f0 !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+    }
+}
+
+.table-report-total { background: #f1f5f9; font-weight: 600; }

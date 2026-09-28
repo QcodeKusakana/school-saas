@@ -155,6 +155,58 @@ function mail_server_for_message(?int $schoolId): ?array
 // ---------------------------------------------------------------------
 
 /**
+ * Ce qui sera ÉCRIT EN BASE pour ce corps de message.
+ *
+ * LE CORPS SENSIBLE EST CHIFFRÉ AU REPOS.
+ * Un lien de réinitialisation EST le secret que `password_resets`
+ * protège en n'en stockant que le haché. Le recopier en clair ici
+ * annulerait cette protection pendant toute l'attente en file.
+ *
+ * SANS CLÉ, ON N'ÉCRIT PAS — ET ON NE LÈVE PAS NON PLUS.
+ *
+ * `crypto_encrypt()` lève, délibérément : aucun repli en clair. Mais
+ * `mail_queue()` est appelée depuis `/mot-de-passe/oublie`, une route
+ * ouverte à tout visiteur. Une exception non rattrapée y devient une
+ * erreur 500 publique — mesuré sur une installation conforme au
+ * README, avant que le modèle de configuration ne porte la clé.
+ *
+ * Le refus reste entier : rien n'est écrit, surtout pas en clair. Il
+ * emprunte simplement le contrat que `mail_queue()` possède déjà pour
+ * « ce destinataire n'a pas d'adresse » — un cas normal du produit,
+ * que l'appelant sait traiter sans rien révéler au visiteur.
+ *
+ *   > Une protection qui s'exprime par un plantage public protège la
+ *   > donnée et livre le produit.
+ *
+ * Fonction séparée pour être ÉPROUVÉE : `$hasKey` est un paramètre, si
+ * bien qu'un test joue la décision réellement livrée sans avoir à
+ * démonter la configuration du serveur qui l'exécute.
+ *
+ * @return array{ok: bool, text: ?string, html: ?string, error: string}
+ */
+function mail_body_storage(string $text, ?string $html, bool $sensitive, bool $hasKey): array
+{
+    if (!$sensitive) {
+        return ['ok' => true, 'text' => $text, 'html' => $html, 'error' => ''];
+    }
+
+    if (!$hasKey) {
+        return ['ok' => false, 'text' => null, 'html' => null,
+                'error' => 'Aucune clé de chiffrement n\'est configurée sur ce serveur : '
+                    . 'ce message contient un secret et il est exclu de l\'enregistrer '
+                    . 'en clair. Renseignez security.encryption_key dans '
+                    . 'app/config/config.local.php.'];
+    }
+
+    return [
+        'ok'    => true,
+        'text'  => crypto_encrypt($text),
+        'html'  => ($html !== null && $html !== '') ? crypto_encrypt($html) : $html,
+        'error' => '',
+    ];
+}
+
+/**
  * Écrit un message dans la file, puis tente immédiatement de l'envoyer.
  *
  * @param array{to: string, to_name?: ?string, subject: string, text: string,
@@ -182,14 +234,20 @@ function mail_queue(array $message): array
     $text = (string) ($message['text'] ?? '');
     $html = $message['html'] ?? null;
 
-    // LE CORPS SENSIBLE EST CHIFFRÉ AU REPOS.
-    // Un lien de réinitialisation EST le secret que `password_resets`
-    // protège en n'en stockant que le haché. Le recopier en clair ici
-    // annulerait cette protection pendant toute l'attente en file.
-    $storedText = $sensitive ? crypto_encrypt($text) : $text;
-    $storedHtml = ($sensitive && $html !== null && $html !== '')
-        ? crypto_encrypt((string) $html)
-        : $html;
+    $corps = mail_body_storage($text, $html, $sensitive, crypto_available());
+
+    if (!$corps['ok']) {
+        log_error(
+            'Message sensible refusé : ' . $corps['error']
+            . ' Objet : ' . (string) ($message['subject'] ?? '')
+        );
+
+        return ['ok' => false, 'queued' => false, 'sent' => false, 'id' => null,
+                'error' => $corps['error']];
+    }
+
+    $storedText = $corps['text'];
+    $storedHtml = $corps['html'];
 
     $id = db_insert('email_messages', [
         'uuid'            => str_uuid(),

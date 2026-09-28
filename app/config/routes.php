@@ -477,3 +477,35 @@ route('POST', '/journal/purger', 'audit', 'ctrl_audit_purge', ['auth', 'school',
 // Le journal global de l'éditeur. La lecture est inter-écoles : le
 // contrôleur l'ouvre dans `platform_scope()`, qui exige l'habilitation.
 route('GET', '/plateforme/journal', 'platform', 'ctrl_platform_audit', ['auth', 'perm:platform.audit.view']);
+
+// ---------------------------------------------------------------------
+//  PHASE 9C — LES RAPPORTS
+//
+// `report.academic` et `report.export` dormaient depuis la phase 1.
+//
+// L'EXPORT PORTE SA PROPRE PERMISSION, et elle n'est pas dans la route :
+// consulter un rapport et en sortir un fichier ne sont pas le même
+// geste, mais c'est la MÊME route qui fait les deux, selon `?export=csv`.
+// Le contrôle vit donc dans le contrôleur, `reports_require_export()`,
+// juste avant l'envoi. Mettre `perm:report.export` sur la route
+// fermerait aussi la consultation.
+route('GET', '/rapports',            'reports', 'ctrl_reports_headcount',  ['auth', 'school', 'perm:report.academic']);
+route('GET', '/rapports/effectifs',  'reports', 'ctrl_reports_headcount',  ['auth', 'school', 'perm:report.academic']);
+route('GET', '/rapports/resultats',  'reports', 'ctrl_reports_results',    ['auth', 'school', 'perm:report.academic']);
+route('GET', '/rapports/assiduite',  'reports', 'ctrl_reports_attendance', ['auth', 'school', 'perm:report.academic']);
+
+// ---------------------------------------------------------------------
+//  PHASE 9D — L'ANNÉE SCOLAIRE
+//
+// `academic_year.view`, `.manage` et `.close` dormaient depuis la phase
+// 1. Pendant ce temps, QUATORZE gardes dans SEPT modules refusaient
+// d'écrire sur une année `closed` — un état qu'aucun écran ne savait
+// poser. Et une école ne pouvait pas créer sa deuxième année autrement
+// qu'en base : la plateforme ne passait pas son premier mois de juillet.
+route('GET',  '/annees',                'years', 'ctrl_years_index',       ['auth', 'school', 'perm:academic_year.view']);
+route('POST', '/annees',                'years', 'ctrl_years_create',      ['auth', 'school', 'perm:academic_year.manage']);
+route('POST', '/annees/{id}',           'years', 'ctrl_years_update',      ['auth', 'school', 'perm:academic_year.manage']);
+route('POST', '/annees/{id}/courante',  'years', 'ctrl_years_set_current', ['auth', 'school', 'perm:academic_year.manage']);
+route('POST', '/annees/{id}/cloturer',  'years', 'ctrl_years_close',       ['auth', 'school', 'perm:academic_year.close']);
+route('POST', '/annees/{id}/rouvrir',   'years', 'ctrl_years_reopen',      ['auth', 'school', 'perm:academic_year.close']);
+route('POST', '/annees/{id}/supprimer', 'years', 'ctrl_years_delete',     ['auth', 'school', 'perm:academic_year.manage']);

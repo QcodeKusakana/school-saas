@@ -109,15 +109,30 @@ Bootstrap 5.3 servi localement · responsive téléphone / tablette / ordinateur
 
 ## Mise en production
 
-Avant toute mise en ligne :
+```powershell
+php database\preflight.php
+```
 
-- [ ] `app.debug` à **`false`** dans `config.local.php`
-- [ ] `session.cookie_secure` à **`true`** (exige HTTPS)
-- [ ] Racine web pointant sur `public/`
-- [ ] `storage/` inscriptible (chmod 775) et **non accessible** depuis le web
-- [ ] `config.local.php` absent du dépôt Git
+Le contrôle **mesure** l'installation : configuration réellement lue, base
+réellement interrogée, fichiers réellement présents. Il distingue ce qui est
+**bloquant** — mettre en ligne dans cet état expose les données ou laisse une
+fonction essentielle hors service — de ce qui est **recommandé**. Il sort en
+code 0 s'il ne reste aucun bloquant, 1 sinon ; `--json` rend la même chose à un
+script de déploiement.
+
+Il couvre notamment `app.debug`, `session.cookie_secure`, `app.url`, la clé de
+chiffrement, le compte MySQL, les migrations (appliquées **et non modifiées
+depuis**), l'établissement de démonstration, le serveur d'envoi, la racine web
+et les outils d'installation restés en ligne.
+
+> Ce contrôle a remplacé une liste de cases à cocher. Confrontée au produit,
+> elle décrivait trois points déjà réglés depuis des phases entières, et taisait
+> celui qui empêchait une installation neuve de réinitialiser un mot de passe.
+
+Restent hors de sa portée, à traiter à la main :
+
 - [ ] Sauvegarde automatique de la base configurée
-- [ ] Mot de passe MySQL dédié à l'application, jamais `root`
+- [ ] Certificat HTTPS valide et renouvellement automatique
 
 ---
 

@@ -47,6 +47,42 @@ if (isset($options['help'])) {
 $fresh   = isset($options['fresh']);
 $withDemo = isset($options['demo']);
 
+// ---------------------------------------------------------------------
+// LA CLÉ DE CHIFFREMENT, AVANT DE TOUCHER À LA BASE
+// ---------------------------------------------------------------------
+//
+// Mesuré, en suivant le README à la lettre : sans cette clé, le produit
+// s'installe sans un mot d'avertissement, puis « mot de passe oublié »
+// répond HTTP 500 — pour tout le monde, dès le premier jour, parce que
+// le corps du message porte le lien de réinitialisation et qu'il est
+// chiffré au repos.
+//
+// Le contrôle est ici, avant la première écriture, et pas dans une
+// liste à cocher : une école qui découvre le manque le jour où un
+// directeur a perdu son mot de passe le découvre trop tard.
+//
+//   > Un prérequis qu'on vérifie après l'installation n'est pas un
+//   > prérequis, c'est un regret.
+//
+// On refuse, et on donne la ligne à coller. Le fichier du déployeur
+// n'est pas modifié : ce qu'il a écrit lui appartient.
+$rawKey     = trim((string) config('security.encryption_key', ''));
+$decodedKey = $rawKey !== '' ? base64_decode($rawKey, true) : false;
+
+if ($rawKey === '' || $decodedKey === false || strlen($decodedKey) !== 32) {
+    fwrite(STDERR, "\n  ✗ Clé de chiffrement absente ou invalide.\n\n");
+    fwrite(STDERR, "    Elle protège le mot de passe SMTP de chaque école et les messages\n");
+    fwrite(STDERR, "    portant un lien de réinitialisation. Sans elle, « mot de passe\n");
+    fwrite(STDERR, "    oublié » ne fonctionne pour personne.\n\n");
+    fwrite(STDERR, "    Ajoutez ceci dans app/config/config.local.php, puis relancez :\n\n");
+    fwrite(STDERR, "      'security' => [\n");
+    fwrite(STDERR, "          'encryption_key' => '" . base64_encode(random_bytes(32)) . "',\n");
+    fwrite(STDERR, "      ],\n\n");
+    fwrite(STDERR, "    (cette clé vient d'être tirée au hasard pour vous ; elle ne se\n");
+    fwrite(STDERR, "     partage pas entre environnements et ne va jamais dans Git)\n\n");
+    exit(1);
+}
+
 $dbHost = (string) config('database.host');
 $dbPort = (int) config('database.port', 3306);
 $dbName = (string) config('database.name');

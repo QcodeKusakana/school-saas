@@ -122,21 +122,14 @@ function audit_repo_apply_filters(array $filtres, array &$where, array &$params)
 /**
  * Une date de filtre, ou `null` si elle n'est pas exploitable.
  *
- * On exige la forme exacte `Y-m-d` ET une date réellement existante :
- * `checkdate` refuse le 31 février, que `strtotime` accepterait en le
- * reportant au 3 mars.
+ * La règle a été remontée dans le noyau (`date_filtre()`) le jour où le
+ * module Rapports en a eu besoin à l'identique : deux copies de la même
+ * règle divergent toujours. Ce nom reste comme porte d'entrée du
+ * module et comme point d'ancrage des tests.
  */
 function audit_date_valide(mixed $valeur): ?string
 {
-    $texte = trim((string) $valeur);
-
-    if ($texte === '' || preg_match('/^\d{4}-\d{2}-\d{2}$/', $texte) !== 1) {
-        return null;
-    }
-
-    [$a, $m, $j] = array_map('intval', explode('-', $texte));
-
-    return checkdate($m, $j, $a) ? $texte : null;
+    return date_filtre($valeur);
 }
 
 /**

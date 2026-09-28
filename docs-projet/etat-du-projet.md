@@ -978,18 +978,33 @@ La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
 
 ---
 
-## Avant mise en production (phase 10)
+## Avant mise en production (phase 10A)
 
-- [ ] `app.debug` à `false`
-- [ ] `session.cookie_secure` à `true` (HTTPS)
-- [ ] Racine web sur `public/`
-- [ ] **Câbler l'envoi d'e-mails** — sans lui, « mot de passe oublié » ne
-      fonctionne pour personne
-- [ ] **Supprimer `public/diagnostic.php`**
-- [ ] **Supprimer `database/seed_demo.php`**
-- [ ] `config.local.php` hors dépôt Git
-- [ ] `app.url` renseigné avec l'URL publique réelle
-- [ ] Utilisateur MySQL dédié, jamais `root`
+```
+php database/preflight.php
+```
+
+**Cette liste était en prose. Elle a été exécutée.** Sur onze lignes, trois
+décrivaient un produit qui n'existait plus : l'envoi d'e-mails était câblé
+depuis la phase 8A, `config.local.php` était dans `.gitignore` depuis la
+phase 1, et `public/diagnostic.php` se refuse lui-même hors mode debug et
+hors machine locale. Pendant ce temps, elle ne disait rien du manque qui
+empêchait réellement une installation neuve de fonctionner.
+
+> Une liste de contrôle qu'on n'exécute pas décrit le produit du jour où on
+> l'a écrite.
+
+`database/preflight.php` mesure 26 points, sépare le **bloquant** du
+**recommandé**, nomme un remède pour chaque échec et sort en code 1 tant
+qu'un bloquant subsiste. `--json` le rend exploitable par un script de
+déploiement. Il est verrouillé par `tests/preflight_mise_en_service.php`,
+qui vérifie que ses verdicts correspondent à la configuration réellement
+lue — un contrôle qui répondrait « ✓ » par construction ne contrôlerait
+rien.
+
+Restent hors de sa portée :
+
 - [ ] Sauvegarde automatique de la base
+- [ ] Certificat HTTPS valide et renouvellement automatique
 - [ ] **Écrire la procédure d'effacement d'une école** (RGPD) — aujourd'hui
       impossible, voir la dette ci-dessus

@@ -147,7 +147,7 @@ $isPlatform = $user['school_id'] === null;
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view', 'audit.view'])): ?>
+            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view', 'audit.view', 'report.academic', 'academic_year.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
                 <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
@@ -225,6 +225,52 @@ $isPlatform = $user['school_id'] === null;
                 <?php if (can('school.branding') && route_exists('/ecole/parametres')): ?>
                     <a class="nav-item <?= nav_active('/ecole') ?>" href="<?= e(url('/ecole/parametres')) ?>">
                         <i class="bi bi-gear"></i><span>Mon établissement</span>
+                    </a>
+                <?php endif; ?>
+
+                <?php
+                /*
+                 * LES ANNÉES SCOLAIRES — phase 9D.
+                 *
+                 * Trois permissions dormaient depuis la phase 1 pendant
+                 * que quatorze gardes, dans sept modules, refusaient
+                 * d'écrire sur une année clôturée — un état qu'aucun
+                 * écran ne savait poser.
+                 *
+                 * Le lien porte une pastille quand AUCUNE année n'est
+                 * courante : dans cet état, les écrans d'inscription, de
+                 * classes et de finances sont muets, et rien d'autre ne
+                 * le dirait.
+                 */
+                if (can('academic_year.view') && route_exists('/annees')):
+                    $sansAnnee = !db_exists(
+                        'SELECT 1 FROM academic_years
+                          WHERE school_id = :s AND is_current = 1 LIMIT 1',
+                        ['s' => tenant_id()],
+                        true
+                    );
+                    ?>
+                    <a class="nav-item <?= nav_active('/annees') ?>" href="<?= e(url('/annees')) ?>">
+                        <i class="bi bi-calendar3"></i><span>Années scolaires</span>
+                        <?php if ($sansAnnee): ?>
+                            <span class="badge text-bg-danger ms-auto">!</span>
+                        <?php endif; ?>
+                    </a>
+                <?php endif; ?>
+
+                <?php
+                /*
+                 * LES RAPPORTS — phase 9C.
+                 *
+                 * `report.academic` dormait elle aussi depuis la phase 1.
+                 * Le lien pointe sur les effectifs : c'est l'état que la
+                 * tutelle réclame le plus souvent, et les onglets mènent
+                 * aux deux autres.
+                 */
+                if (can('report.academic') && route_exists('/rapports')):
+                    ?>
+                    <a class="nav-item <?= nav_active('/rapports') ?>" href="<?= e(url('/rapports')) ?>">
+                        <i class="bi bi-bar-chart-line"></i><span>Rapports</span>
                     </a>
                 <?php endif; ?>
 
