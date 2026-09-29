@@ -116,6 +116,16 @@ function ctrl_students_show(string $id): void
               ORDER BY s.order_number, o.order_number',
             ['school_id' => tenant_require()]
         ),
+        // LES PIÈCES DU DOSSIER (11D) — chargées seulement pour qui peut
+        // les voir. Une pièce de mineur n'a pas à transiter par le
+        // gabarit d'un compte qui ne pourra pas l'ouvrir.
+        'pieces'       => can('student.document')
+            ? (static function () use ($studentId): array {
+                require_once APP_PATH . '/modules/students/documents.php';
+
+                return student_documents_all($studentId);
+            })()
+            : [],
     ], 'app');
 }
 
@@ -537,5 +547,79 @@ function ctrl_students_photo(string $id): void
     header('Content-Disposition: inline; filename="photo.' . pathinfo($out['path'], PATHINFO_EXTENSION) . '"');
 
     readfile($out['path']);
+    exit;
+}
+
+// =====================================================================
+//  LES PIÈCES DU DOSSIER (phase 11D)
+// =====================================================================
+
+/** Range une pièce au dossier de l'élève. */
+function ctrl_students_document_store(string $id): void
+{
+    csrf_verify();
+
+    require_once APP_PATH . '/modules/students/documents.php';
+
+    $resultat = student_documents_store(
+        (int) $id,
+        (string) input('type', ''),
+        (string) input('label', ''),
+        (array) ($_FILES['piece'] ?? [])
+    );
+
+    $resultat['ok'] ? flash_success($resultat['message']) : flash_error($resultat['message']);
+
+    redirect('/eleves/' . (int) $id);
+}
+
+/** Retire une pièce — la ligne et le fichier. */
+function ctrl_students_document_delete(string $id): void
+{
+    csrf_verify();
+
+    require_once APP_PATH . '/modules/students/documents.php';
+
+    $piece = student_documents_find((int) $id);
+    $eleve = $piece !== null ? (int) $piece['student_id'] : 0;
+
+    $resultat = student_documents_delete((int) $id, (string) input('motif', ''));
+
+    $resultat['ok'] ? flash_success($resultat['message']) : flash_error($resultat['message']);
+
+    redirect($eleve > 0 ? '/eleves/' . $eleve : '/eleves');
+}
+
+/**
+ * Sert le fichier d'une pièce.
+ *
+ * EN PIÈCE JOINTE, JAMAIS EN LIGNE.
+ * Un PDF rendu dans l'onglet exécute son JavaScript dans plusieurs
+ * lecteurs, et hérite alors de l'origine du site — donc de la session
+ * de celui qui l'ouvre. `attachment` ferme cette porte, au prix d'un
+ * téléchargement au lieu d'un aperçu. Pour des pièces de mineurs
+ * déposées par des tiers, le prix est juste.
+ */
+function ctrl_students_document_download(string $id): void
+{
+    require_once APP_PATH . '/modules/students/documents.php';
+
+    $fichier = student_documents_file((int) $id);
+
+    if (!$fichier['ok']) {
+        abort(404, (string) ($fichier['message'] ?? 'Pièce introuvable.'));
+    }
+
+    audit_log('student.document.read', 'student_documents', (int) $id, null, null,
+        'Pièce du dossier téléchargée');
+
+    header('Content-Type: ' . $fichier['mime']);
+    header('Content-Length: ' . (string) filesize((string) $fichier['path']));
+    header('Content-Disposition: attachment; filename="' . $fichier['nom'] . '"');
+    header('X-Content-Type-Options: nosniff');
+    // Une pièce de mineur n'a rien à faire dans un cache partagé.
+    header('Cache-Control: private, no-store');
+
+    readfile((string) $fichier['path']);
     exit;
 }

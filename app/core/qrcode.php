@@ -141,6 +141,53 @@ function qr_svg(string $texte, int $module = 4, int $marge = 4, string $titre = 
 }
 
 /**
+ * Le plancher pratique d'un lecteur mobile, en millimètres par module.
+ *
+ * Ce n'est pas une constante de la norme : c'est un CHOIX, fondé sur ce
+ * qu'un téléphone d'entrée de gamme accroche à bout de bras sur du
+ * papier ordinaire. La documentation d'usage la plus courante place ce
+ * plancher autour de 0,4 mm ; en RDC, où l'appareil du parent n'est pas
+ * un modèle récent, on ne descend pas en dessous.
+ */
+const QR_MODULE_MIN_MM = 0.40;
+
+/**
+ * La taille d'impression MINIMALE, en millimètres, pour que ce code
+ * reste lisible.
+ *
+ * ════════════════════════════════════════════════════════════════════
+ *  PRODUIRE UN CODE N'EST PAS LE RENDRE LISIBLE
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * Constaté par sonde, après la phase 11C : à 17 mm — la taille des
+ * documents de la 9A — le code reste net tant que `app.url` vaut
+ * « http://localhost:8080 », 38 caractères. Avec l'adresse réelle d'un
+ * établissement congolais :
+ *
+ *   https://scolarite.complexe-scolaire-saint-joseph.gombe.cd/v/…
+ *
+ * l'URL passe à 74 caractères, la version du code monte, et chaque
+ * module tombe à 0,38 mm. Le code est toujours PRODUIT — aucune erreur,
+ * aucun avertissement — et un téléphone de parent ne l'accroche plus.
+ *
+ *   > Un code produit n'est pas un code lisible, et rien dans le
+ *   > fichier SVG ne dit la différence.
+ *
+ * Le défaut ne se voit jamais en développement : l'adresse locale y est
+ * la plus courte qu'on puisse avoir. Il n'apparaît qu'après impression,
+ * chez le client.
+ *
+ * @param string $texte Ce que le code encodera.
+ * @param int    $marge Marge silencieuse, en modules (comme `qr_svg`).
+ */
+function qr_taille_impression_mm(string $texte, int $marge = 4): float
+{
+    $modules = count(qr_matrix($texte)) + 2 * $marge;
+
+    return round($modules * QR_MODULE_MIN_MM, 1);
+}
+
+/**
  * La matrice booléenne du code — `true` = module sombre.
  *
  * @return array<int, array<int, bool>>

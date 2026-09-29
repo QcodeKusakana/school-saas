@@ -51,12 +51,30 @@ function ctrl_dashboard_index(): void
         true // table globale : schools ne porte pas de colonne school_id
     );
 
+    // LE TABLEAU DE BORD NE MONTRE QUE CE QUE L'ON POURRAIT OUVRIR.
+    //
+    // Constaté par sonde : `enseignant.demo` y lisait l'offre
+    // d'abonnement de son école, ses jours restants, le nombre de
+    // comptes et la liste des tâches d'administration — alors que
+    // `/abonnement` et `/utilisateurs` lui répondent 403, et que la
+    // phase 7A avait explicitement décidé que l'abonnement n'est pas
+    // son affaire.
+    //
+    //   > Une porte fermée à trois endroits et ouverte sur le tableau
+    //   > de bord n'est pas fermée.
+    //
+    // Le défaut date de la phase 1 et dormait depuis : il a fallu la
+    // question que pose la 11B — « que voit un compte dont on vient de
+    // retirer tous les droits ? » — pour aller regarder.
+    //
+    // On ne CHARGE pas non plus ce qu'on ne montrera pas : une requête
+    // épargnée, et rien à filtrer par oubli dans la vue.
     view('dashboard/index', [
         'school'       => $school,
         'currentYear'  => dashboard_current_year(),
-        'usersCount'   => tenant_count('users', 'deleted_at IS NULL'),
+        'usersCount'   => can('user.view') ? tenant_count('users', 'deleted_at IS NULL') : null,
         'activeCycles' => dashboard_active_cycles(),
-        'subscription' => dashboard_subscription(),
+        'subscription' => can('subscription.view') ? dashboard_subscription() : null,
         'setupSteps'   => dashboard_setup_steps(),
     ], 'app');
 }
@@ -100,10 +118,17 @@ function dashboard_subscription(): ?array
  *
  * Guide l'administrateur d'une nouvelle école plutôt que de le laisser
  * devant un tableau de bord vide. Chaque entrée : libellé, état, lien.
+ *
+ * CHAQUE ÉTAPE EST GARDÉE PAR LA PERMISSION DE L'ÉCRAN QU'ELLE OUVRE.
+ * Proposer « Créer les comptes du personnel » à un enseignant, c'est
+ * l'envoyer sur un 403 — et lui apprendre au passage que l'école n'a
+ * qu'un compte.
  */
 function dashboard_setup_steps(): array
 {
     $schoolId = tenant_require();
+
+    $etapes = [];
 
     $hasLogo   = (bool) db_value(
         'SELECT logo_path FROM schools WHERE id = :id',
@@ -115,32 +140,41 @@ function dashboard_setup_steps(): array
         'SELECT COUNT(*) FROM school_cycles WHERE school_id = :school_id AND is_active = 1',
         ['school_id' => $schoolId]
     ) > 0;
-    $hasUsers  = tenant_count('users', 'deleted_at IS NULL') > 1;
+    $hasUsers  = can('user.create') && tenant_count('users', 'deleted_at IS NULL') > 1;
 
-    return [
-        [
+    if (can('school.edit')) {
+        $etapes[] = [
             'label' => 'Compléter la fiche de l\'établissement',
             'done'  => $hasLogo,
             'url'   => '/ecole/parametres',
             'hint'  => 'Logo, coordonnées, numéro SERNIE — repris sur les bulletins et attestations.',
-        ],
-        [
+        ];
+
+        $etapes[] = [
             'label' => 'Activer les cycles enseignés',
             'done'  => $hasCycles,
             'url'   => '/ecole/cycles',
             'hint'  => 'Maternelle, primaire, CTEB, humanités : n\'activez que ceux que vous dispensez.',
-        ],
-        [
+        ];
+    }
+
+    if (can('academic_year.manage')) {
+        $etapes[] = [
             'label' => 'Créer l\'année scolaire',
             'done'  => $hasYear,
             'url'   => '/annees-scolaires',
             'hint'  => 'Toute donnée pédagogique est rattachée à une année scolaire.',
-        ],
-        [
+        ];
+    }
+
+    if (can('user.create')) {
+        $etapes[] = [
             'label' => 'Créer les comptes du personnel',
             'done'  => $hasUsers,
             'url'   => '/utilisateurs',
             'hint'  => 'Direction, secrétariat, comptable, enseignants.',
-        ],
-    ];
+        ];
+    }
+
+    return $etapes;
 }

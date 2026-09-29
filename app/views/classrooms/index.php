@@ -113,6 +113,13 @@ foreach ($classrooms as $classroom) {
                             <td class="text-end">
                                 <a href="<?= e(url('/classes/' . (int) $classroom['id'])) ?>"
                                    class="btn btn-sm btn-outline-secondary">Liste</a>
+                                <?php if (can('teacher.view')): ?>
+                                    <a href="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition')) ?>"
+                                       class="btn btn-sm btn-outline-secondary"
+                                       title="Répartition des enseignants">
+                                        <i class="bi bi-person-video3"></i>
+                                    </a>
+                                <?php endif; ?>
                                 <?php if (can('classroom.manage')): ?>
                                     <button class="btn btn-sm btn-outline-secondary" type="button"
                                             data-bs-toggle="collapse"

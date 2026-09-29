@@ -280,13 +280,17 @@ print(lu)
     await pa.goto(BASE + '/verifier/ZZZZ-ZZZZ-ZZZZ');
     await pa.waitForLoadState('networkidle');
 
+    // Le libellé dit « pièce » depuis la phase 11C : la même page sert
+    // désormais les documents ET les reçus de paiement. L'assertion suit
+    // le produit, elle ne fige pas un mot qui a changé pour de bonnes
+    // raisons.
     check('un code inconnu ne confirme rien',
-        /Aucun document ne correspond/i.test(await pa.locator('body').innerText()));
+        /Aucune pièce ne correspond/i.test(await pa.locator('body').innerText()));
 
     // Un jeton mal formé non plus, et sans erreur serveur.
     await pa.goto(BASE + '/verifier/nimportequoi');
     check('un code mal formé est traité proprement',
-        /Aucun document ne correspond/i.test(await pa.locator('body').innerText()));
+        /Aucune pièce ne correspond/i.test(await pa.locator('body').innerText()));
 
     // =================================================================
     titre('RÉVOQUER');

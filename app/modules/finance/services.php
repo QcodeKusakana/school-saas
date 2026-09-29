@@ -1216,10 +1216,19 @@ function finance_service_record_payment(int $enrollmentId, array $input, array $
     // SELECT … FOR UPDATE d'un autre guichet.
     finance_ensure_receipt_counter((string) $year['code']);
 
+    // LE JETON EST TIRÉ AVANT LA TRANSACTION.
+    // Son tirage interroge `documents` et `payments` pour écarter une
+    // collision : deux lectures qui n'ont rien à faire à l'intérieur
+    // d'une transaction d'encaissement, où elles poseraient des verrous
+    // sur des lignes étrangères au versement — le motif qui a produit
+    // l'interblocage de la phase 5B.
+    require_once APP_PATH . '/modules/finance/verification.php';
+    $verifyToken = receipt_new_token();
+
     db_transaction(static function () use (
         $schoolId, $enrollmentId, $year, $input, $method, $paidOn,
         $tenderedCurrency, $tendered, $creditedCurrency, $credited, $rate,
-        $allocations, &$outcome
+        $allocations, $verifyToken, &$outcome
     ): void {
         [$receiptNo, $seq] = finance_next_receipt((string) $year['code']);
 
@@ -1228,6 +1237,7 @@ function finance_service_record_payment(int $enrollmentId, array $input, array $
             'enrollment_id'     => $enrollmentId,
             'receipt_no'        => $receiptNo,
             'receipt_seq'       => $seq,
+            'verify_token'      => $verifyToken,
             'paid_on'           => $paidOn,
             'tendered_currency' => $tenderedCurrency,
             'tendered_amount'   => number_format($tendered, finance_decimals($tenderedCurrency), '.', ''),

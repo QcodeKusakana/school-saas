@@ -162,6 +162,22 @@ if ($hasCycles === 0) {
 // =====================================================================
 //  COMPTES
 // =====================================================================
+// UN ADMINISTRATEUR D'ÉTABLISSEMENT — il manquait.
+//
+// L'école de démonstration n'avait qu'un DIRECTION. Or `role.manage`,
+// `school.edit` et `subscription.view` sont chez SCHOOL_ADMIN : sans lui,
+// aucun compte de l'école ne pouvait composer un rôle, et l'écran de la
+// phase 11B n'était atteignable que par l'éditeur entrant depuis sa
+// console. Une école livrée sans administrateur est une école où
+// personne ne peut s'organiser.
+//
+//   > Un pouvoir que le produit prévoit et qu'aucun compte livré ne
+//   > détient n'est pas prévu : il est absent.
+//
+// Le DIRECTION reste : les deux rôles ne se recouvrent pas, et c'est
+// justement la démonstration utile — le directeur CONSULTE les rôles,
+// l'administrateur les COMPOSE.
+$schoolAdminId = demo_user($schoolId, 'admin.demo', 'NGOY', 'Bernadette', 'F', 'SCHOOL_ADMIN');
 $adminId   = demo_user($schoolId, 'directeur.demo', 'KABAMBA', 'Thérèse', 'F', 'DIRECTION');
 $teacherId = demo_user($schoolId, 'enseignant.demo', 'MUKENDI', 'Joseph', 'M', 'ENSEIGNANT');
 
@@ -388,6 +404,177 @@ echo $publication['ok']
         . $classroomGroups[$firstGroup]['label'] . "\n"
     : "  ✗ Publication refusée : {$publication['message']}\n";
 
+
+// =====================================================================
+//  FINANCES — LA GRILLE, LES DETTES, ET DEUX ENCAISSEMENTS
+// =====================================================================
+//
+// LE MODULE LE PLUS GROS DU PRODUIT N'ÉTAIT PAS DÉMONTRABLE.
+//
+// La démonstration créait des élèves, des cotes et des bulletins, mais
+// aucun frais : `student_fees` et `payments` restaient vides. Un
+// prospect qui ouvrait « Finances » voyait des écrans vides et en
+// concluait que le module n'existait pas ; les recettes navigateur des
+// finances n'avaient rien à mesurer ; et le reçu — le seul document que
+// la famille emporte — n'existait nulle part pour être relu.
+//
+//   > Un module qu'aucune donnée de démonstration n'alimente n'est pas
+//   > un module démontrable : c'est un module supposé.
+//
+// TOUT PASSE PAR LES SERVICES RÉELS. Insérer les lignes à la main
+// produirait un jeu que le produit n'aurait jamais pu créer lui-même —
+// et masquerait précisément les défauts qu'une démonstration doit
+// révéler.
+require_once APP_PATH . '/modules/finance/services.php';
+
+$fraisDemo = [
+    ['code' => 'MINERVAL', 'name' => 'Minerval annuel', 'group_label' => 'Scolarité',
+     'currency' => 'USD', 'amount' => '120', 'scope' => 'school', 'is_mandatory' => 1,
+     'is_active' => 1],
+    ['code' => 'INSCRIPTION', 'name' => 'Frais d\'inscription', 'group_label' => 'Scolarité',
+     'currency' => 'USD', 'amount' => '25', 'scope' => 'school', 'is_mandatory' => 1,
+     'is_active' => 1],
+    ['code' => 'FOURNITURES', 'name' => 'Fournitures et manuels', 'group_label' => 'Divers',
+     'currency' => 'CDF', 'amount' => '45000', 'scope' => 'school', 'is_mandatory' => 0,
+     'is_active' => 1],
+];
+
+$fraisCrees = 0;
+
+foreach ($fraisDemo as $frais) {
+    $frais['academic_year_id'] = $yearId;
+
+    $existant = db_value(
+        'SELECT id FROM fees WHERE school_id = :s AND academic_year_id = :y AND code = :c',
+        ['s' => $schoolId, 'y' => $yearId, 'c' => $frais['code']]
+    );
+
+    if ($existant !== null) {
+        continue;
+    }
+
+    $resultat = finance_service_save_fee($frais);
+
+    $resultat['ok'] ? $fraisCrees++ : print("  ✗ Frais {$frais['code']} : {$resultat['message']}\n");
+}
+
+echo "  ✓ {$fraisCrees} frais ajouté(s) à la grille\n";
+
+// L'affectation transforme la grille en dettes nominatives.
+$affectation = finance_service_assign($yearId);
+
+echo $affectation['ok']
+    ? "  ✓ {$affectation['created']} dette(s) affectée(s) aux élèves inscrits\n"
+    : "  ✗ Affectation refusée : {$affectation['message']}\n";
+
+// DEUX ENCAISSEMENTS, DÉLIBÉRÉMENT DIFFÉRENTS.
+//
+//  · le premier solde une dette en USD, remise en USD ;
+//  · le second est remis en FRANCS sur une dette en USD, avec un taux
+//    figé — c'est le cas qui distingue ce produit d'un carnet à souches,
+//    et celui qu'une démonstration doit montrer.
+$aRegler = db_all(
+    'SELECT sf.id, sf.enrollment_id, sf.amount_due, sf.currency, sf.label
+       FROM student_fees sf
+      WHERE sf.school_id = :s AND sf.currency = :d
+        AND sf.is_cancelled = 0 AND sf.amount_due > 0
+      ORDER BY sf.enrollment_id, sf.id
+      LIMIT 2',
+    ['s' => $schoolId, 'd' => 'USD']
+);
+
+$encaisses = 0;
+
+foreach ($aRegler as $index => $dette) {
+    $duEnUsd = (float) $dette['amount_due'];
+
+    $verse = $index === 0
+        ? [
+            'tendered_currency' => 'USD',
+            'tendered_amount'   => $duEnUsd,
+            'credited_currency' => 'USD',
+            'method'            => 'cash',
+            'payer_name'        => 'KABEYA Marie, mère de l\'élève',
+        ]
+        : [
+            // 2 800 CDF pour 1 USD : un ordre de grandeur plausible en
+            // RDC. Le taux est FIGÉ sur le versement, pas relu du jour.
+            'tendered_currency' => 'CDF',
+            'tendered_amount'   => round($duEnUsd * 2800, 0),
+            'exchange_rate'     => 2800,
+            'credited_currency' => 'USD',
+            'method'            => 'mobile_money',
+            'reference'         => 'MP' . date('ymd') . str_pad((string) ($index + 1), 4, '0', STR_PAD_LEFT),
+            'payer_name'        => 'ILUNGA Patrick, père de l\'élève',
+        ];
+
+    $verse['paid_on'] = date('Y-m-d');
+
+    // Les affectations sont INDEXÉES PAR L'IDENTIFIANT DE LA DETTE.
+    // Une liste d'objets serait silencieusement ignorée : le versement
+    // partirait entièrement « en avance », et le reçu le dirait sans que
+    // personne ne comprenne pourquoi.
+    $paiement = finance_service_record_payment(
+        (int) $dette['enrollment_id'],
+        $verse,
+        [(int) $dette['id'] => $duEnUsd]
+    );
+
+    $paiement['ok'] ? $encaisses++ : print("  ✗ Encaissement : {$paiement['message']}\n");
+}
+
+echo "  ✓ {$encaisses} encaissement(s), dont un en francs au taux figé\n";
+
+
+// =====================================================================
+//  DOCUMENTS OFFICIELS — deux pièces délivrées
+// =====================================================================
+//
+// Même constat que pour les finances : le module des documents (9A)
+// existe, avec son numéro officiel, son figeage et son code de
+// vérification — et la démonstration n'en délivrait aucun. L'écran
+// « Documents » s'ouvrait vide, et la page publique `/verifier` n'avait
+// rien à confirmer.
+//
+// Deux pièces suffisent : une attestation de fréquentation, la plus
+// demandée d'une année, et un certificat de scolarité.
+//
+// PAS DE CARTE D'ÉLÈVE, et c'est le produit qui l'a décidé : il refuse
+// d'en délivrer une sans photo, « la carte ne pourrait pas l'identifier ».
+// Le refus est juste — une carte d'identité sans visage n'identifie
+// personne. Le jeu de démonstration s'y plie au lieu de le contourner
+// par un INSERT, ce qui aurait produit une pièce que le produit
+// n'aurait jamais acceptée d'émettre.
+require_once APP_PATH . '/modules/documents/services.php';
+
+$documentsDemo = 0;
+
+foreach ([
+    [0, 'attestation_frequentation'],
+    [1, 'certificat_scolarite'],
+] as [$rang, $type]) {
+    if (!isset($enrollments[$rang])) {
+        continue;
+    }
+
+    $inscription = (int) $enrollments[$rang]['id'];
+
+    $dejaLa = db_value(
+        'SELECT id FROM documents WHERE school_id = :s AND enrollment_id = :e AND type = :t',
+        ['s' => $schoolId, 'e' => $inscription, 't' => $type]
+    );
+
+    if ($dejaLa !== null) {
+        continue;
+    }
+
+    $delivre = document_service_issue($inscription, $type);
+
+    $delivre['ok'] ? $documentsDemo++ : print("  ✗ Document {$type} : {$delivre['message']}\n");
+}
+
+echo "  ✓ {$documentsDemo} document(s) officiel(s) délivré(s)\n";
+
 // =====================================================================
 //  RÉCAPITULATIF
 // =====================================================================
@@ -395,6 +582,7 @@ $firstEnrollment = (int) $enrollments[0]['id'];
 
 echo "\n  ──────────────────────────────────────────────\n";
 echo "  Comptes de test (mot de passe : " . DEMO_PASSWORD . ")\n\n";
+echo "    admin.demo        administre l'école : comptes, rôles, abonnement\n";
 echo "    directeur.demo    voit tout, publie les bulletins\n";
 echo "    enseignant.demo   ne voit que sa classe — c'est le compte\n";
 echo "                      qui prouve l'isolation du périmètre\n";
@@ -404,6 +592,9 @@ echo "    /notes/classe/{$classroomId}                 avancement de la saisie\n
 echo "    /bulletins/classe/{$classroomId}             classement et publication\n";
 echo "    /bulletins/{$firstEnrollment}                     bulletin imprimable (Ctrl+P)\n";
 echo "    /bulletins/parametres            absences et seuil de réussite\n";
+echo "    /finances                        situation générale de la caisse\n";
+echo "    /finances/frais                  la grille tarifaire\n";
+echo "    /documents                       les pièces délivrées, et leur code\n";
 
 echo "\n  Essai à faire pour vérifier le figeage\n\n";
 echo "    1. Noter le rang d'un élève sur /bulletins/classe/{$classroomId}\n";

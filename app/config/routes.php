@@ -363,6 +363,31 @@ route('POST', '/finances/depenses/{id}/annuler','finance', 'ctrl_finance_expense
 // des deux.
 
 route('GET',  '/plateforme/ecoles',       'platform', 'ctrl_platform_schools',       ['auth', 'perm:platform.school.view']);
+
+// --- Cycle de vie d'un établissement (11A) ---------------------------
+//
+// Trois permissions DISTINCTES, et ce n'est pas du zèle : ouvrir un
+// client, corriger son adresse et lui couper l'accès sont trois pouvoirs
+// de nature différente. Une permission qui les recouvrirait tous finirait
+// par accorder le plus dangereux des trois — la leçon de la recette
+// Finances, reprise en 7B2.
+//
+// `platform.school.suspend` porte aussi la RÉSILIATION, condition
+// d'entrée de l'effacement (10C). Jusqu'ici `schools.status` était un
+// état que `auth.php` faisait respecter et qu'aucun écran ne savait
+// poser.
+//
+// L'ORDRE COMPTE : le routeur retient le PREMIER motif qui correspond
+// (router.php, boucle de répartition). Déclarée après `/{id}`, la route
+// `/nouveau` serait avalée comme un identifiant et rendrait
+// « Établissement introuvable ».
+
+route('GET',  '/plateforme/ecoles/nouveau',        'platform', 'ctrl_platform_school_create_form', ['auth', 'perm:platform.school.create']);
+route('POST', '/plateforme/ecoles',                'platform', 'ctrl_platform_school_create',      ['auth', 'perm:platform.school.create']);
+route('GET',  '/plateforme/ecoles/{id}/modifier',  'platform', 'ctrl_platform_school_edit_form',   ['auth', 'perm:platform.school.edit']);
+route('POST', '/plateforme/ecoles/{id}/modifier',  'platform', 'ctrl_platform_school_update',      ['auth', 'perm:platform.school.edit']);
+route('POST', '/plateforme/ecoles/{id}/etat',      'platform', 'ctrl_platform_school_status',      ['auth', 'perm:platform.school.suspend']);
+
 route('GET',  '/plateforme/ecoles/{id}',  'platform', 'ctrl_platform_school_show',   ['auth', 'perm:platform.school.view']);
 route('POST', '/plateforme/ecoles/{id}/ouvrir', 'platform', 'ctrl_platform_enter_school', ['auth', 'perm:platform.school.view']);
 route('POST', '/plateforme/quitter',      'platform', 'ctrl_platform_leave_school',  ['auth', 'perm:platform.school.view']);
@@ -391,6 +416,23 @@ route('POST', '/plateforme/ecoles/{id}/versement/{paymentId}/annuler',   'platfo
 //   Phase 7C  — Mobile Money
 //   Phase 9   — journal global    /plateforme/journal
 // ---------------------------------------------------------------------
+
+// --- Rôles et permissions de l'établissement (11B) -------------------
+//
+// `role.view` consulte, `role.manage` compose. Deux permissions, parce
+// que voir qui peut quoi est un besoin courant de la direction, tandis
+// que redistribuer le pouvoir ne l'est pas.
+//
+// L'ORDRE COMPTE : `/roles/nouveau` doit précéder `/roles/{id}`, sinon
+// le routeur — qui retient le PREMIER motif — le prendrait pour un
+// identifiant. La leçon de la 11A.
+
+route('GET',  '/roles',            'roles', 'ctrl_roles_index',       ['auth', 'school', 'perm:role.view']);
+route('GET',  '/roles/nouveau',    'roles', 'ctrl_roles_create_form', ['auth', 'school', 'perm:role.manage']);
+route('POST', '/roles',            'roles', 'ctrl_roles_store',       ['auth', 'school', 'perm:role.manage']);
+route('GET',  '/roles/{id}',       'roles', 'ctrl_roles_edit_form',   ['auth', 'school', 'perm:role.view']);
+route('POST', '/roles/{id}',       'roles', 'ctrl_roles_update',      ['auth', 'school', 'perm:role.manage']);
+route('POST', '/roles/{id}/etat',  'roles', 'ctrl_roles_toggle',      ['auth', 'school', 'perm:role.manage']);
 
 // --- Documents officiels (9A) ----------------------------------------
 //
@@ -432,6 +474,20 @@ route('GET',  '/verifier/{token}', 'documents', 'ctrl_documents_verify', []);
 route('POST', '/eleves/{id}/photo',           'students', 'ctrl_students_set_photo',    ['auth', 'school', 'perm:student.edit']);
 route('POST', '/eleves/{id}/photo/retirer',   'students', 'ctrl_students_remove_photo', ['auth', 'school', 'perm:student.edit']);
 route('GET',  '/eleves/{id}/photo',           'students', 'ctrl_students_photo',        ['auth', 'school', 'perm:student.view']);
+
+// LES PIÈCES DU DOSSIER — phase 11D.
+//
+// `student.document` était semée depuis la phase 1 sans qu'aucune route
+// ne l'emploie : l'école déposait ses actes de naissance dans une
+// chemise en carton pendant que le produit annonçait un « dossier
+// numérique unique ».
+//
+// La permission garde les trois gestes, lecture comprise : une pièce de
+// mineur est plus sensible que la fiche qui la porte, et `student.view`
+// — que les enseignants détiennent — serait une porte trop large.
+route('POST', '/eleves/{id}/pieces',          'students', 'ctrl_students_document_store',    ['auth', 'school', 'perm:student.document']);
+route('GET',  '/pieces/{id}',                 'students', 'ctrl_students_document_download', ['auth', 'school', 'perm:student.document']);
+route('POST', '/pieces/{id}/retirer',         'students', 'ctrl_students_document_delete',   ['auth', 'school', 'perm:student.document']);
 
 // --- Aperçu d'un document (9A) ---------------------------------------
 //

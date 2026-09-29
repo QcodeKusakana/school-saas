@@ -36,13 +36,33 @@ function perm_all(bool $refresh = false): array
         return $permissions = [];
     }
 
+        // UN RÔLE D'UNE AUTRE ÉCOLE NE COMPTE PAS.
+        //
+        // Tant que tous les rôles étaient globaux (`school_id IS NULL`),
+        // ce filtre était sans objet. La phase 11B laisse une école
+        // composer les siens : une ligne de `user_roles` pointant vers
+        // le rôle d'un autre établissement donnerait alors ses
+        // permissions à quelqu'un qui n'y a rien à faire.
+        //
+        // `users_role_refusal()` empêche déjà qu'une telle ligne soit
+        // écrite (phase 7D). Mais une restauration venue d'une autre
+        // base, une reprise manuelle en SQL ou un défaut futur en
+        // produiraient une, et rien ici ne la verrait.
+        //
+        //   > Une défense qui se répète à deux niveaux survit à la
+        //   > disparition de l'un des deux.
+        //
+        // Le compte de plateforme (`school_id IS NULL`) ne porte que des
+        // rôles globaux : la condition le laisse passer.
     $rows = db_all(
         'SELECT DISTINCT p.code
            FROM user_roles ur
+           JOIN users u        ON u.id = ur.user_id
            JOIN roles r        ON r.id = ur.role_id AND r.is_active = 1
            JOIN role_permissions rp ON rp.role_id = r.id
            JOIN permissions p  ON p.id = rp.permission_id
-          WHERE ur.user_id = :user_id',
+          WHERE ur.user_id = :user_id
+            AND (r.school_id IS NULL OR r.school_id = u.school_id)',
         ['user_id' => (int) $userId],
         true // tables globales, hors périmètre du garde-fou multi-école
     );
@@ -108,11 +128,16 @@ function perm_roles(bool $refresh = false): array
         return $roles = [];
     }
 
+    // Même filtre que `perm_all()`, et pour la même raison : un rôle
+    // d'une autre école ne doit pas davantage donner son NIVEAU que ses
+    // permissions — `perm_level()` décide qui peut gérer qui.
     $rows = db_all(
         'SELECT r.code, r.level
            FROM user_roles ur
+           JOIN users u ON u.id = ur.user_id
            JOIN roles r ON r.id = ur.role_id AND r.is_active = 1
-          WHERE ur.user_id = :user_id',
+          WHERE ur.user_id = :user_id
+            AND (r.school_id IS NULL OR r.school_id = u.school_id)',
         ['user_id' => (int) $userId],
         true
     );

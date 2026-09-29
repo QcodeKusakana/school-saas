@@ -373,6 +373,22 @@ function document_next_number(string $type, string $yearCode): array
  * page publique inutile, puisqu'on pourrait fabriquer des jetons
  * valides sans posséder de document.
  */
+/**
+ * La forme d'un jeton — UNE SEULE DÉFINITION.
+ *
+ * Extraite de `document_service_verify()` quand la phase 11C a eu besoin
+ * de la même vérification pour les reçus. Deux expressions régulières
+ * jumelles finissent toujours par diverger, et celle-ci décide si une
+ * requête touche la base : la laisser se dédoubler aurait signifié, un
+ * jour, qu'un jeton valide pour un reçu ne l'est plus pour un document.
+ */
+function document_token_is_wellformed(string $token): bool
+{
+    $classe = '[' . DOCUMENT_TOKEN_ALPHABET . ']{4}';
+
+    return preg_match('/^' . $classe . '-' . $classe . '-' . $classe . '$/', strtoupper(trim($token))) === 1;
+}
+
 function document_new_token(): string
 {
     $alphabet = DOCUMENT_TOKEN_ALPHABET;
@@ -410,8 +426,7 @@ function document_service_verify(string $token): array
 
     // Un jeton mal formé ne touche même pas la base : c'est une erreur
     // de saisie ou un balayage, pas une recherche.
-    if (preg_match('/^[' . DOCUMENT_TOKEN_ALPHABET . ']{4}-[' . DOCUMENT_TOKEN_ALPHABET . ']{4}-['
-        . DOCUMENT_TOKEN_ALPHABET . ']{4}$/', $token) !== 1) {
+    if (!document_token_is_wellformed($token)) {
         return ['found' => false];
     }
 

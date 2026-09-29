@@ -1,9 +1,9 @@
 # État du projet — School SaaS RDC
 
 **Emplacement** : `C:\laragon\www\school-saas` (dépôt Git déjà initialisé)
-**Version** : 0.10.0 — phases 1 à 6 terminées et auditées · 7A, 7B1, 7B2, 7D, 8A, 8B1 et **9A livrées et auditées**
-**Dernière mise à jour** : 21/09/2026
-**Tests** : 998 verts sur base **reconstruite depuis zéro** en MySQL 8 (19 suites), plus 100 vérifications en navigateur réel et une recette d'installation
+**Version** : 0.11.0 — phases 1 à 6 terminées et auditées · 7A, 7B1, 7B2, 7D, 8A, 8B1, 9A, 9B, 9C, 9D, 10A, 10B, 10C, 11A et **11B livrées et auditées**
+**Dernière mise à jour** : 29/09/2026
+**Tests** : **1 621 verts** sur base **reconstruite depuis zéro** en MySQL 8 (31 suites), plus **275 vérifications en navigateur réel** (13 recettes) et une recette d'installation
 
 **Environnement local constaté** : Laragon 6.0, Apache 2.4.54 **sur le port 8000** (pas 80), PHP 8.4.16 en FastCGI (mod_fcgid), MySQL 8.0.30.
 
@@ -29,8 +29,9 @@ URL de travail : `http://school-saas.test:8000`
 | 6 | **Portails** | 6A Portail parent ✅ + audit · 6B Espace élève ✅ + audit | ✅ |
 | 7 | **Abonnements & comptes** | 7A ✅ + audit · 7B1 ✅ + audit · 7B2 ✅ + audit · 7C Mobile Money ⛔ · **7D Utilisateurs ✅ + audit** | 🔵 en cours |
 | 8 | **Messagerie & hors connexion** | **8A Messagerie ✅ + audit** · **8B1 Hors connexion ✅ + audit** (PWA, Service Worker, IndexedDB, appel des présences) · 8B2 étendre aux autres écrans | 🔵 en cours |
-| 9 | **Modules avancés** | **9A Documents officiels + QR de vérification ✅** · 9B rapports, archives, communication | 🔵 en cours |
-| 10 | **Recette** | Tests d'acceptation, durcissement, mise en production | à venir |
+| 9 | **Modules avancés** | **9A Documents officiels + QR ✅** · **9B Journal de la plateforme ✅** · **9C Rapports ✅** · **9D Année scolaire ✅** · 9E Registre des sortants ⬜ | 🔵 en cours |
+| 10 | **Mise en service** | **10A Durcissement + préflight exécutable ✅** · **10B Sauvegarde / restauration ✅** · **10C Effacement d'une école (RGPD) ✅** | ✅ |
+| 11 | **Administration du parc** | **11A Cycle de vie ✅** · **11B Rôles et permissions ✅** · **11C Reçus vérifiables ✅** · **11D Pièces du dossier ✅** · 11E emploi du temps, évaluations, communication, archives | 🔵 en cours |
 
 > Cette feuille de route est la référence. Ne pas la renuméroter : les
 > phases 6 à 10 ont déjà été citées sous ces numéros dans les décisions
@@ -45,7 +46,15 @@ Documentation par module : `phase-2-referentiel.md`, `phase-3-eleves.md`,
 `audit-phase-7a.md`, `securite-perimetre-plateforme.md`,
 `phase-7b-console-editeur.md`, `audit-phase-7b1.md`, `phase-7b2-facturation.md`,
 `audit-phase-7b2.md`, `phase-7d-utilisateurs.md`, `audit-phase-7d.md`,
-`phase-8a-messagerie.md`, `audit-phase-8a.md`.
+`phase-8a-messagerie.md`, `audit-phase-8a.md`, `phase-8b1-hors-connexion.md`,
+`audit-phase-8b1.md`, `phase-9a-documents.md`, `audit-phase-9a.md`,
+`phase-9b-journal.md`, `audit-phase-9b.md`, `phase-9c-rapports.md`,
+`audit-phase-9c.md`, `phase-9d-annee-scolaire.md`, `audit-phase-9d.md`,
+`phase-10a-durcissement.md`, `audit-phase-10a.md`, `audit-10a-windows.md`,
+`phase-10b-sauvegarde.md`, `audit-phase-10b.md`, `phase-10c-effacement.md`,
+`audit-phase-10c.md`, `phase-11a-cycle-de-vie-ecole.md`, `audit-phase-11a.md`,
+`phase-11b-roles-permissions.md`, `audit-phase-11b.md`,
+`phase-11c-recus-verifiables.md`, `phase-11d-pieces-dossier.md`.
 
 ---
 
@@ -124,6 +133,8 @@ php tests\mail_isolation.php
 php tests\sync_isolation.php
 php tests\documents_isolation.php
 php tests\qrcode_decode.php
+php tests\roles_isolation.php
+php tests\dashboard_perimetre.php
 ```
 
 Chaque suite se nettoie derrière elle (bloc `finally`) et sort en code 0 si
@@ -277,6 +288,9 @@ n'exécutaient pas :
 | **Audit 7B2** | Une **référence annulée restait consommée à jamais** : après une erreur de frappe corrigée par annulation, le vrai versement Mobile Money — qui porte exactement une référence — devenait inenregistrable. Et **archiver une école effaçait sa dette** de `/plateforme/soldes` : le défaut du bandeau de la 7B1, transposé à l'argent |
 | **Audit 7B1** | Le bandeau **disparaissait sous l'éditeur** quand l'école était archivée pendant la visite : contexte maintenu, signal éteint. Changer d'école laissait **deux entrées et aucune sortie** au journal. Et ouvrir l'écran d'abonnement **démarrait un essai de 30 jours** — les jours couraient depuis la visite de l'éditeur, pas depuis la première utilisation de l'école |
 | **Phase 7B1** | La visite d'une école ne tenait **pas une requête** : posée en session, `auth_user()` la remplaçait par NULL au rechargement — le bandeau annonçait l'école, `tenant_id()` valait NULL. Et le bandeau lui-même **ne s'affichait pas** hors du module plateforme : le seul signal disant « vous êtes chez un client » manquait sur les écrans du client |
+| **Audit 11C** | Le **code imprimé devenait illisible** dès qu'`app.url` portait l'adresse réelle d'une école : 0,38 mm par module au lieu de 0,46, sous le seuil qu'un téléphone d'entrée de gamme accroche. Produit sans erreur, invisible en développement, irrattrapable après impression. Le reçu calcule désormais sa taille ; la carte d'élève, qui ne peut pas grandir, est couverte par un contrôle du préflight |
+| **Phase 11C** | Le reçu — seul justificatif d'une famille — n'était **vérifiable par personne**. La fraude courante n'est pas le faux reçu mais le reçu AUTHENTIQUE remis sans enregistrer l'encaissement : l'école réclame alors une seconde fois à une famille qui a payé. Découvert au passage : ni les finances ni les documents n'avaient de données de démonstration — deux modules entiers indémontrables |
+| **Audit 11B** | Le **tableau de bord** montrait l'offre d'abonnement, les jours restants, le nombre de comptes et les tâches d'administration à un **enseignant** — à qui `/abonnement` et `/utilisateurs` répondent 403. Défaut de la phase 1, dormant. Un bandeau « Modules du logiciel — Phase 1 sur 10 » annonçait de surcroît aux écoles clientes que les élèves et les finances n'étaient pas faits. Et la procédure d'effacement **perdait les créances impayées** : l'inventaire en promettait une, l'archivage n'en gardait aucune |
 | **Audit 7A** | L'écran lisait **deux abonnements** : la carte annonçait « Réseau — résilié — 300 jours » à une école payant une offre Essentiel active. La jauge comptait l'année **courante** quand la limite compte l'année **visée** : « 2 places libres » là où l'inscription refusait. Et l'absence d'abonnement s'affichait comme un **plafond de zéro élève** |
 
 ### Règles tirées de ces audits
@@ -568,6 +582,58 @@ n'exécutaient pas :
 > neuve ne reproduit. Le conteneur de développement tourne désormais sur
 > **MySQL 8**, comme Laragon et comme cPanel.
 
+> **Une porte fermée à trois endroits et ouverte sur le tableau de bord
+> n'est pas fermée.** L'écran d'accueil n'exige que `auth` : il est le seul
+> du produit ouvert à tout compte connecté, donc le seul où un oubli de
+> périmètre ne se voit pas.
+
+> **Un repère de chantier laissé dans un produit vendu ne raconte pas le
+> produit, il raconte le chantier** — et il ment dès la phase suivante.
+
+> **Un inventaire qui ne compte pas ce que l'exécution écrira n'est pas un
+> inventaire, c'est une estimation.** La simulation annonçait une écriture
+> comptable archivée ; l'exécution en archivait zéro, sans que rien ne
+> signale la contradiction.
+
+> **Une créance impayée est une écriture comptable — et c'est même la seule
+> qui coûte quelque chose.** Effacer un client ne doit pas effacer sa dette,
+> à son bénéfice.
+
+> **Un cul-de-sac que le produit sait reconnaître doit être annoncé, pas
+> laissé deviner.** Un compte sans droits croit le logiciel cassé et appelle
+> l'éditeur, alors que seule son administration peut le débloquer.
+
+> **Une mesure qui coupe avant la fin ne dit pas « il n'y a rien », elle dit
+> « je n'ai pas regardé ».**
+
+> **`route_exists()` ne connaît que les routes GET.** Un garde de vue qui
+> interroge une route POST ne s'ouvre jamais, sans la moindre erreur.
+
+> **Un code produit n'est pas un code lisible.** À 17 mm, un QR reste net
+> avec `app.url` locale (38 caractères) et devient trop dense avec l'adresse
+> réelle d'une école (74). Aucune erreur n'est levée : le défaut n'apparaît
+> qu'après impression, quand il n'a plus de correctif mais un coût de
+> réimpression. Ce qui se mesure en développement est toujours le cas le
+> plus favorable.
+
+> **Une permission qu'aucune porte ne peut faire respecter n'est pas une
+> permission, c'est une case à cocher.** Depuis que l'école compose ses
+> rôles (11B), une case sans effet est pire qu'absente : on la décoche en
+> croyant fermer une porte.
+
+> **Une garde d'idempotence qui ne survit pas à son propre second passage
+> ne garde rien.** La branche « déjà fait » doit être `DO 0`, jamais un
+> SELECT : un jeu de résultats non consommé bloque la requête suivante.
+
+> **Un module qu'aucune donnée de démonstration n'alimente n'est pas un
+> module démontrable : c'est un module supposé.** Les finances et les
+> documents existaient depuis des phases et n'avaient jamais eu une seule
+> ligne de démonstration.
+
+> **Une sonde qui choisit ses éléments par leur forme mesure la forme,
+> pas ce qui est lu.** Trois fois de suite, un filtre « éléments sans
+> enfants » m'a fait accuser un produit correct.
+
 > **Une consultation ne démarre pas une horloge commerciale.** L'audit 7A avait
 > posé « une lecture ne doit pas écrire » et laissé passer cette violation :
 > elle était sans conséquence tant que seule l'école ouvrait son propre écran.
@@ -697,7 +763,7 @@ compteur. Voir `securite-perimetre-plateforme.md`.
   **schema.sql → seeds → migrations**.
 - `schema_migrations` avec empreintes SHA-256, `--status`, `--seed`,
   `--baseline`.
-- **30 migrations** appliquées, dont les **028, 029 et 030 rejouables**. Tables : **59**.
+- **38 migrations** appliquées, dont les **028, 029, 030, 036 et 037 rejouables**. Tables : **64**.
 - Suite complète vérifiée sur **MySQL 8.0** : 878 verts, 0 échec.
 - Référentiel RDC complet (4 cycles, 15 niveaux, MAT_1 → HUM_4), 5 domaines
   officiels, 6 sous-domaines attestés, 14 postes de dépense.
@@ -780,28 +846,28 @@ compteur. Voir `securite-perimetre-plateforme.md`.
 
 ## Prochaine étape
 
-La **8B1 (hors connexion)** est livrée **et auditée**. Voir
-`phase-8b1-hors-connexion.md`.
+La **11B (rôles et permissions par école)** est livrée **et auditée**. Voir
+`phase-11b-roles-permissions.md` et `audit-phase-11b.md`.
 
-Ce qui a été tranché, et qui engage la suite :
+Ce qui reste avant qu'une école puisse travailler une année entière sans
+retomber dans le papier :
 
-1. **Un seul écran descend : l'appel des présences.** Il se fait debout
-   devant une classe, il ne touche ni à l'argent ni à un document
-   officiel, et il se corrige. Bulletins, caisse et inscriptions restent
-   en ligne — la page de repli le dit franchement plutôt que de le
-   laisser croire.
-2. **L'arbitrage est humain, jamais automatique.** L'appareil envoie ce
-   qu'il avait VU (`seen_updated_at`) ; si le serveur a changé depuis, un
-   conflit s'ouvre et la direction tranche sur un écran qui montre les
-   deux versions. **L'horloge de l'appareil n'arbitre rien.**
-3. **Ce qui descend est réduit au strict nécessaire** : identifiant
-   d'inscription, nom, matricule. Rien d'autre. IndexedDB n'est pas
-   chiffré et l'appareil est souvent partagé — ce sont des mineurs.
+1. **Reçus imprimables** (`receipt.print`) — la caisse encaisse, elle ne
+   remet rien.
+2. **Documents d'élève** (`student.document`) — les pièces du dossier.
+3. **Registre des sortants** (`archive.view`, phase 9E).
+4. **Emploi du temps** (`timetable.*`), **évaluations**
+   (`evaluation.manage`), **communication** (`communication.send`) — trois
+   familles de permissions semées sans écran.
 
-**8B2**, si elle se fait, devra répondre aux mêmes trois questions pour
-chaque nouveau type : quel service rejoue l'écriture, quel champ sert de
-`seen_updated_at`, et qui arbitre. Rien n'oblige à l'ouvrir : l'appel
-était le seul usage dont la coupure empêche vraiment de travailler.
+Exploitation, à trancher avant la mise en service :
+
+- planifier `database/backup.php` et **copier les archives hors du serveur** ;
+- `email_messages` n'est jamais purgé ;
+- **faut-il chiffrer les sauvegardes ?** Recommandation : non — une archive
+  perdue avec sa clé est une archive perdue, et le dossier scolaire papier
+  qu'elle remplace se range dans une armoire, pas dans un coffre. À classer
+  comme un registre d'école, avec les mêmes obligations de garde.
 
 La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
 
@@ -833,18 +899,12 @@ La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
 
 ## Dette connue
 
-- **L'effacement d'une école est IMPOSSIBLE en l'état** — correction d'une
-  affirmation fausse portée par ce document jusqu'au 14/09/2026.
-  `DELETE FROM schools` échoue dès qu'une cote existe :
-  `grades.curriculum_subject_id` → `curriculum_subjects` est en **RESTRICT**, et
-  les deux tables sont filles de `schools`, l'ordre de cascade n'étant pas
-  garanti. Vérifié par exécution : une école vide s'efface, une école avec des
-  cotes non. Les suites de tests font déjà le ménage table par table, ce qui
-  masquait le défaut.
-  **Ne PAS corriger en passant ces clés en CASCADE** : le RESTRICT protège aussi
-  contre la suppression d'une branche de programme qui porte des cotes. Il faut
-  une procédure d'effacement **ordonnée**, avec export préalable et confirmation
-  explicite — sa propre étape, avant la mise en production.
+- ~~L'effacement d'une école est IMPOSSIBLE en l'état.~~ **Réglé en 10C** :
+  `database/erase_school.php`, quatre verrous (école résiliée, sauvegarde de
+  moins de 24 h contenant cette école, code retapé, motif). Les écritures
+  comptables de l'éditeur sont conservées dans `billing_archive` — le droit à
+  l'effacement d'un client n'efface pas la comptabilité de son fournisseur.
+  Voir `phase-10c-effacement.md`.
 - **Rien n'interdit deux abonnements « en cours » simultanés.** MySQL ne sait pas
   exprimer un `UNIQUE` conditionnel sur `status IN ('trial','active','past_due')`.
   `subscription_current()` prend le plus lointain : un arbitrage raisonnable, pas
@@ -890,9 +950,10 @@ La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
   l'écran le dit et invite à republier la classe.
 - ~~La limite de comptes du personnel n'est appliquée nulle part~~ —
   **réglé en 7D** : `users_service_create()` est la porte qui l'appelle.
-- **Aucun écran de gestion des RÔLES eux-mêmes** : `role.manage` est semée sans
-  écran, créer un rôle maison se fait encore en base. Les rôles système
-  suffisent aujourd'hui.
+- ~~Aucun écran de gestion des RÔLES eux-mêmes.~~ **Réglé en 11B** : `/roles`,
+  cinq règles gardées (appartenance à l'école, rôle système intouchable, on
+  n'accorde que ce qu'on détient, jamais une permission de plateforme, niveau
+  strictement inférieur). Voir `phase-11b-roles-permissions.md`.
 - **Un compte du personnel n'est pas relié à sa fiche enseignant** : créer l'un
   ne crée pas l'autre, et les deux coexistent sans se connaître.
 - **L'identifiant de connexion ne se change jamais**, même après une faute de
@@ -943,12 +1004,13 @@ La **7C (Mobile Money)** reste bloquée sur les identifiants du prestataire.
 - **Les abonnements antérieurs à la migration 028 n'ont pas de tarif figé** :
   ils sont signalés à l'écran et exclus des soldes. Appliquer une offre les
   remet en facturation.
-- **`/plateforme/journal` n'existe pas** : `platform.audit.view` est semée, le
-  lien est masqué par `route_exists()`. Phase 9.
+- ~~`/plateforme/journal` n'existe pas.~~ **Réglé en 9B.**
 - **Le catalogue d'offres se modifie en base** : `platform.plan.manage` n'a pas
   d'écran. Créer une offre est rare et engage tout le parc.
-- **`platform.impersonate` et `platform.school.create` sont semées et sans
-  écran** : créer une école se fait encore en base.
+- ~~`platform.school.create` est semée et sans écran.~~ **Réglé en 11A** :
+  `/plateforme/ecoles/nouveau` crée l'école, ses cycles, son année courante,
+  son essai de 60 jours et son premier administrateur en une transaction.
+  `platform.impersonate` reste semée sans écran.
 - **La liste du parc n'est pas paginée** : une requête, pas de N+1, mais à mille
   écoles la page sera longue.
 - **`visiting_school_id` n'est pas effacée si `users.school_id` change.** Un

@@ -19,6 +19,9 @@
  * @var array      $allocations
  * @var array      $school
  * @var array      $balance
+ * @var string     $qr         le SVG du code de vérification, vide si absent
+ * @var string     $verifyUrl  l'adresse lisible, imprimée sous le code
+ * @var float      $qrMm       la taille d'impression calculée, en millimètres
  */
 declare(strict_types=1);
 
@@ -57,6 +60,32 @@ $unallocated = round((float) $payment['credited_amount'] - $allocated, 2);
 </div>
 
 <div class="d-print-none"><?php require APP_PATH . '/views/partials/flash.php'; ?></div>
+
+<style>
+    /* LE CODE DOIT RESTER LISIBLE SUR LE PAPIER, pas seulement à
+       l'écran : 17 mm est la taille éprouvée sur la carte d'élève
+       (phase 9A), assez pour qu'un téléphone d'entrée de gamme accroche. */
+    .recu-qr { width: <?= e((string) max(22.0, $qrMm)) ?>mm; height: <?= e((string) max(22.0, $qrMm)) ?>mm; margin: 0 auto; }
+    .recu-qr svg { width: 100%; height: 100%; display: block; }
+    .recu-verif { max-width: 46mm; }
+    .recu-verif-code { font-family: monospace; font-size: 10px; letter-spacing: .08em; margin-top: 2px; }
+
+    /* L'ADRESSE EN CLAIR DOIT TENIR DANS SON BLOC.
+       Celle d'un établissement peut dépasser cent caractères : sans
+       césure, elle déborderait entre les deux signatures. */
+    .recu-verif-url {
+        font-size: 8px; color: #64748b;
+        word-break: break-all; line-height: 1.25;
+    }
+
+    @media print {
+        /* La taille vient du CONTENU, pas d'un chiffre rond : voir
+           `qr_taille_impression_mm()`. En dessous, le code est produit
+           mais aucun téléphone ne l'accroche. */
+        .recu-qr { width: <?= e((string) $qrMm) ?>mm; height: <?= e((string) $qrMm) ?>mm; }
+        .recu-verif { page-break-inside: avoid; }
+    }
+</style>
 
 <?php if ($cancelled): ?>
     <div class="alert alert-danger">
@@ -191,11 +220,35 @@ $unallocated = round((float) $payment['credited_amount'] - $allocated, 2);
             <?php endif; ?>
         </div>
 
-        <div class="d-flex justify-content-between mt-5 pt-4">
+        <div class="d-flex justify-content-between align-items-end mt-5 pt-4 gap-3">
             <div class="small text-secondary">
                 Signature du caissier<br><br>
                 ______________________
             </div>
+
+            <?php if ($qr !== ''): ?>
+                <!--
+                    LE CODE DE VÉRIFICATION.
+
+                    Il ne prouve pas que CE papier est authentique — il
+                    prouve qu'un versement de ce numéro et de ce montant
+                    a bien été enregistré. C'est exactement ce qui manque
+                    à une famille à qui l'on réclame une seconde fois une
+                    somme déjà payée : le papier ne prouve plus seul, la
+                    ligne en base prouve.
+
+                    Le code est imprimé EN CLAIR sous l'image : un
+                    téléphone sans appareil photo, une caméra qui refuse,
+                    une photocopie floue — dans tous ces cas, il reste
+                    recopiable à la main.
+                -->
+                <div class="text-center recu-verif">
+                    <div class="recu-qr"><?= $qr ?></div>
+                    <div class="recu-verif-code"><?= e((string) $payment['verify_token']) ?></div>
+                    <div class="recu-verif-url"><?= e($verifyUrl) ?></div>
+                </div>
+            <?php endif; ?>
+
             <div class="small text-secondary text-end">
                 Signature du payeur<br><br>
                 ______________________

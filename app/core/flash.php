@@ -92,8 +92,18 @@ function flash_old(array $input): void
     $_SESSION['_old'] = $input;
 }
 
-/** Ancienne valeur d'un champ, échappée pour un attribut HTML. */
-function old(string $field, mixed $default = ''): string
+/**
+ * La saisie précédente, lue UNE SEULE FOIS.
+ *
+ * `old()` et `old_array()` passent tous deux par ici, et c'est
+ * indispensable : chacun avec son propre cache, le premier appelé
+ * viderait la session et le second ne trouverait plus rien. Un
+ * formulaire qui mêle champs texte et cases à cocher perdrait la moitié
+ * de sa saisie selon l'ordre de ses lignes.
+ *
+ * @return array<string, mixed>
+ */
+function flash_old_all(): array
 {
     static $old = null;
 
@@ -102,7 +112,30 @@ function old(string $field, mixed $default = ''): string
         unset($_SESSION['_old']);
     }
 
-    $value = $old[$field] ?? $default;
+    return $old;
+}
+
+/** Ancienne valeur d'un champ, échappée pour un attribut HTML. */
+function old(string $field, mixed $default = ''): string
+{
+    $value = flash_old_all()[$field] ?? $default;
 
     return is_scalar($value) ? e($value) : '';
+}
+
+/**
+ * Ancienne valeur d'un champ MULTIPLE — cases à cocher, sélection
+ * multiple.
+ *
+ * `old()` rend une chaîne échappée, ce qui n'a pas de sens pour un
+ * tableau : il rendait `''`, et les cases revenaient décochées.
+ *
+ * @param array<int, string> $default
+ * @return array<int, string>
+ */
+function old_array(string $field, array $default = []): array
+{
+    $value = flash_old_all()[$field] ?? null;
+
+    return is_array($value) ? array_map('strval', $value) : $default;
 }

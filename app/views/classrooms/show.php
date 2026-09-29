@@ -36,6 +36,18 @@ foreach ($students as $student) {
         <strong class="fs-5"><?= count($students) ?></strong>
         <span class="text-muted small">/ <?= (int) $classroom['capacity'] ?></span>
         <span class="d-block text-muted small"><?= $girls ?> F · <?= count($students) - $girls ?> G</span>
+
+        <?php if (can('teacher.view')): ?>
+            <?php // L'ÉCRAN DE RÉPARTITION EXISTAIT SANS AUCUN CHEMIN POUR Y ALLER.
+                  // Il n'était atteignable que depuis la fiche d'un enseignant. Or le
+                  // geste naturel part de la CLASSE : « voici la 5e A, qui lui
+                  // enseigne quoi ». Un écran qu'on ne peut atteindre qu'en partant
+                  // de l'autre bout n'est pas un écran, c'est une adresse. ?>
+            <a href="<?= e(url('/classes/' . (int) $classroom['id'] . '/repartition')) ?>"
+               class="btn btn-sm btn-outline-primary mt-2">
+                <i class="bi bi-person-video3"></i> Répartition des enseignants
+            </a>
+        <?php endif; ?>
     </div>
 </div>
 

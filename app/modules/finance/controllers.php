@@ -401,6 +401,17 @@ function ctrl_finance_receipt(string $id): void
 
     $student = tenant_find('students', (int) $payment['student_id']);
 
+    // LE CODE DE VÉRIFICATION (phase 11C).
+    //
+    // Les reçus antérieurs à la migration 036 n'ont pas de jeton : leur
+    // bloc de vérification est simplement absent, plutôt qu'un code
+    // mort qui renverrait « aucune pièce ne correspond ». Un reçu sans
+    // code se lit comme avant ; il ne ment pas.
+    require_once APP_PATH . '/modules/finance/verification.php';
+    require_once APP_PATH . '/core/qrcode.php';
+
+    $jeton = (string) ($payment['verify_token'] ?? '');
+
     view('finance/receipt', [
         'title'       => 'Reçu ' . $payment['receipt_no'],
         'payment'     => $payment,
@@ -412,6 +423,18 @@ function ctrl_finance_receipt(string $id): void
         'allocations' => finance_repo_allocations((int) $payment['id']),
         'school'      => db_one('SELECT * FROM schools WHERE id = :id', ['id' => tenant_require()], true),
         'balance'     => finance_repo_balance((int) $payment['enrollment_id']),
+        'qr'          => $jeton !== '' ? qr_svg(receipt_verify_short_url($jeton), 3, 2) : '',
+        'verifyUrl'   => $jeton !== '' ? receipt_verify_url($jeton) : '',
+        // LA TAILLE D'IMPRESSION EST CALCULÉE, PAS FIGÉE.
+        //
+        // Elle dépend de la longueur de `app.url` : l'adresse d'une
+        // école congolaise fait deux fois celle du poste de
+        // développement, le code gagne des modules, et 17 mm ne suffisent
+        // plus. Un reçu a de la place — contrairement à une carte
+        // d'élève — donc il prend celle qu'il lui faut.
+        'qrMm'        => $jeton !== ''
+            ? max(17.0, qr_taille_impression_mm(receipt_verify_short_url($jeton), 2))
+            : 0.0,
     ]);
 }
 

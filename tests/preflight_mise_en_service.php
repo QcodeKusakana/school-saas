@@ -184,6 +184,20 @@ $controles = is_array($json['controles'] ?? null) ? $json['controles'] : [];
 check('Il joue plus de vingt contrôles', count($controles) >= 20,
     count($controles) . ' contrôle(s)');
 
+// LE CONTRÔLE DE LISIBILITÉ DES CODES IMPRIMÉS (audit 11C).
+//
+// Il existe parce que le défaut qu'il attrape ne se voit JAMAIS en
+// développement : l'adresse locale est la plus courte possible, et le
+// code paraît net. Avec l'adresse d'un vrai établissement, chaque module
+// tombe sous le seuil qu'un téléphone d'entrée de gamme accroche — sans
+// qu'aucune erreur ne soit levée, et sans recours une fois les reçus
+// remis aux familles.
+$sujets = array_column($controles, 'sujet');
+
+check('Il mesure la lisibilité des codes imprimés',
+    count(array_filter($sujets, static fn ($s) => str_contains((string) $s, 'Lisibilité du code'))) === 1,
+    'un code produit n\'est pas un code lisible');
+
 $formeOk = $controles !== [];
 
 foreach ($controles as $c) {
@@ -296,6 +310,9 @@ function decor_batir(string $racine): void
     foreach ([
         'app/config/config.php'  => BASE_PATH . '/app/config/config.php',
         'app/core/helpers.php'   => BASE_PATH . '/app/core/helpers.php',
+        // Depuis l'audit 11C, le contrôle mesure la densité des codes
+        // imprimés : il lui faut le générateur, comme en production.
+        'app/core/qrcode.php'    => BASE_PATH . '/app/core/qrcode.php',
         'database/runner.php'    => BASE_PATH . '/database/runner.php',
         'database/preflight.php' => BASE_PATH . '/database/preflight.php',
     ] as $vers => $depuis) {

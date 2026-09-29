@@ -409,3 +409,581 @@ function platform_service_leave_school(): array
 
     return ['ok' => true, 'message' => 'Vous êtes revenu à la console de la plateforme.'];
 }
+
+// =====================================================================
+//  PHASE 11A — LE CYCLE DE VIE D'UN ÉTABLISSEMENT
+// =====================================================================
+//
+//  POURQUOI CETTE PHASE EXISTE
+//  ---------------------------
+//  Mesuré : `platform.school.create`, `.edit` et `.suspend` étaient
+//  DORMANTES. Une école ne naissait que par `install.php` ou à la main
+//  en SQL — on ne vend pas un SaaS où signer un client exige un DBA.
+//
+//  Pire : RIEN dans le produit ne savait écrire `schools.status`. La
+//  console ne faisait que FILTRER dessus. Or `auth.php` refuse la
+//  connexion ET la session de toute école qui n'est pas `active`
+//  (lignes 84 et 209), et l'effacement de la phase 10C exige le statut
+//  `cancelled`.
+//
+//    > Un état que le produit fait respecter et qu'aucun écran ne sait
+//    > poser n'est pas une protection : c'est une impasse.
+//
+//  C'est le motif exact de la phase 9D, sur l'année scolaire. Il s'est
+//  reproduit un cran plus haut, sur l'établissement lui-même — et il
+//  rendait l'effacement livré la veille INATTEIGNABLE par le produit.
+
+/** Les cycles qu'une école peut déclarer dispenser. */
+const PLATFORM_CYCLES = ['MATERNELLE', 'PRIMAIRE', 'CTEB', 'HUMANITES'];
+
+/**
+ * Combien de fois rejouer une création dont le code a été pris.
+ *
+ * Trois suffisent : la fenêtre de collision est celle d'une transaction,
+ * et deux rejeux espacés de quelques dizaines de millisecondes règlent
+ * tout ce qu'un éditeur humain peut produire.
+ */
+const PLATFORM_CREATION_TENTATIVES = 3;
+
+/** Les statuts qu'un établissement peut porter. */
+const PLATFORM_SCHOOL_STATUSES = [
+    'active'    => 'En service',
+    'suspended' => 'Suspendu',
+    'cancelled' => 'Résilié',
+];
+
+/**
+ * Crée un établissement, et tout ce qu'il lui faut pour être UTILISABLE.
+ *
+ * CE N'EST PAS UN « INSERT INTO schools »
+ * ---------------------------------------
+ * Une ligne dans `schools` donne une école muette : pas de cycle, donc
+ * pas de niveau ; pas d'année courante, donc aucun écran de travail ;
+ * pas de compte, donc personne pour ouvrir la porte. `install.php`
+ * l'établit depuis la phase 1 — six écritures, pas une. Ce service fait
+ * les mêmes, dans le même ordre, dans UNE transaction.
+ *
+ *   > Créer un client, ce n'est pas créer sa fiche : c'est lui rendre le
+ *   > produit ouvrable.
+ *
+ * LE MOT DE PASSE N'EST RENDU QU'UNE FOIS, ET N'EST JAMAIS JOURNALISÉ.
+ * Il est tiré au hasard, le changement est imposé à la première
+ * connexion, et il ne passe par aucun `audit_log` — pas même rédigé :
+ * ce qui n'est pas écrit ne fuit pas.
+ *
+ * @param array{name: string, school_type: string, province?: string, city?: string,
+ *              commune?: string, address?: string, phone?: string, email?: string,
+ *              director_name?: string, cycles: array<int, string>,
+ *              admin_last_name: string, admin_first_name: string,
+ *              admin_username: string, admin_email?: string} $input
+ * @return array{ok: bool, message: string, school_id: ?int, code: ?string,
+ *               username: ?string, password: ?string}
+ */
+function platform_service_create_school(array $input): array
+{
+    return platform_scope('platform.school.create', static function () use ($input): array {
+        $echec = static fn (string $m): array => [
+            'ok' => false, 'message' => $m, 'school_id' => null,
+            'code' => null, 'username' => null, 'password' => null,
+        ];
+
+        $nom = trim((string) ($input['name'] ?? ''));
+
+        if (mb_strlen($nom) < 3) {
+            return $echec('Le nom de l\'établissement est requis (3 caractères au moins).');
+        }
+
+        if (!in_array((string) ($input['school_type'] ?? ''), ['public', 'conventionne', 'prive', 'autre'], true)) {
+            return $echec('Le type d\'établissement est requis.');
+        }
+
+        // AU MOINS UN CYCLE, SINON L'ÉCOLE N'A AUCUN NIVEAU.
+        // Le référentiel national s'attache aux cycles ; sans cycle,
+        // l'écran des classes n'a rien à proposer et l'école découvre le
+        // produit par une page vide.
+        $cycles = array_values(array_intersect(
+            array_map('strval', (array) ($input['cycles'] ?? [])),
+            PLATFORM_CYCLES
+        ));
+
+        if ($cycles === []) {
+            return $echec('Indiquez au moins un cycle d\'enseignement.');
+        }
+
+        $identifiant = trim((string) ($input['admin_username'] ?? ''));
+        $nomAdmin    = trim((string) ($input['admin_last_name'] ?? ''));
+        $prenomAdmin = trim((string) ($input['admin_first_name'] ?? ''));
+
+        if ($identifiant === '' || $nomAdmin === '' || $prenomAdmin === '') {
+            return $echec('L\'identité du premier administrateur est requise.');
+        }
+
+        if (preg_match('/^[a-z0-9._-]{4,50}$/', $identifiant) !== 1) {
+            return $echec('L\'identifiant doit faire 4 à 50 caractères : minuscules, chiffres, point, tiret.');
+        }
+
+        $courrielAdmin = trim((string) ($input['admin_email'] ?? ''));
+
+        if ($courrielAdmin !== '' && !filter_var($courrielAdmin, FILTER_VALIDATE_EMAIL)) {
+            return $echec('L\'adresse e-mail de l\'administrateur est invalide.');
+        }
+
+        // Les identifiants sont uniques SUR TOUTE LA PLATEFORME
+        // (uq_users_username, uq_users_email) : on le dit avant
+        // d'échouer sur une contrainte, pour que l'éditeur comprenne.
+        $pris = db_value(
+            'SELECT 1 FROM users WHERE username = :u LIMIT 1',
+            ['u' => $identifiant],
+            true
+        );
+
+        if ($pris !== null) {
+            return $echec('Cet identifiant est déjà pris sur la plateforme.');
+        }
+
+        if ($courrielAdmin !== '') {
+            $prise = db_value(
+                'SELECT 1 FROM users WHERE email = :e LIMIT 1',
+                ['e' => $courrielAdmin],
+                true
+            );
+
+            if ($prise !== null) {
+                return $echec('Cette adresse e-mail est déjà utilisée sur la plateforme.');
+            }
+        }
+
+        $motDePasse = platform_generer_mot_de_passe();
+
+        // DEUX CRÉATIONS SIMULTANÉES SE DISPUTENT LE MÊME CODE.
+        //
+        // `platform_prochain_code_ecole()` calcule MAX+1. Deux
+        // transactions ouvertes en même temps lisent le même maximum et
+        // visent donc le même `ECO-xxxxxx` ; `uq_schools_code` en refuse
+        // une. La donnée est sauve — c'est le rôle de la contrainte —
+        // mais mesuré sur seize créations simultanées :
+        //
+        //     8 réussies, 8 REFUSÉES
+        //     « SQLSTATE[23000] … Duplicate entry 'ECO-000002' … »
+        //
+        // L'éditeur n'a rien fait de mal : deux personnes qui inscrivent
+        // un client en même temps, ou un simple double-clic, suffisent.
+        // Et le message qu'il reçoit lui parle d'une clé d'index.
+        //
+        //   > Une collision que la base sait résoudre ne doit pas
+        //   > remonter jusqu'à l'utilisateur, et surtout pas dans sa
+        //   > langue à elle.
+        //
+        // On rejoue, comme `db_transaction()` rejoue un interblocage
+        // depuis la phase 5B — même motif, même raison.
+        $resultat = null;
+        $derniere = null;
+
+        for ($tentative = 1; $tentative <= PLATFORM_CREATION_TENTATIVES; $tentative++) {
+            try {
+                $resultat = db_transaction(static function () use (
+                $input, $nom, $cycles, $identifiant, $nomAdmin, $prenomAdmin,
+                $courrielAdmin, $motDePasse
+            ): array {
+                $code = platform_prochain_code_ecole();
+                $slug = platform_slug_libre($nom);
+
+                $ecoleId = db_insert('schools', [
+                    'uuid'          => str_uuid(),
+                    'code'          => $code,
+                    'slug'          => $slug,
+                    'name'          => $nom,
+                    'short_name'    => platform_texte($input['short_name'] ?? null, 60),
+                    'school_type'   => (string) $input['school_type'],
+                    'province'      => platform_texte($input['province'] ?? null, 100),
+                    'city'          => platform_texte($input['city'] ?? null, 100),
+                    'commune'       => platform_texte($input['commune'] ?? null, 100),
+                    'address'       => platform_texte($input['address'] ?? null, 255),
+                    'phone'         => platform_texte($input['phone'] ?? null, 40),
+                    'email'         => platform_texte($input['email'] ?? null, 190),
+                    'director_name' => platform_texte($input['director_name'] ?? null, 150),
+                    'status'        => 'active',
+                ], true);
+
+                // Les cycles dispensés.
+                foreach ($cycles as $cycle) {
+                    db_query(
+                        'INSERT INTO school_cycles (school_id, cycle_id, is_active)
+                         SELECT :ecole, id, 1 FROM education_cycles WHERE code = :code',
+                        ['ecole' => $ecoleId, 'code' => $cycle],
+                        true
+                    );
+                }
+
+                // L'ANNÉE COURANTE, sur le calendrier congolais : rentrée
+                // en septembre, fin en juillet. Sans elle, douze écrans du
+                // produit n'ont rien à montrer.
+                $debut = (int) date('n') >= 8 ? (int) date('Y') : (int) date('Y') - 1;
+
+                db_query(
+                    'INSERT INTO academic_years (school_id, code, name, starts_on, ends_on, status, is_current)
+                     VALUES (:ecole, :code, :nom, :debut, :fin, \'active\', 1)',
+                    [
+                        'ecole' => $ecoleId,
+                        'code'  => $debut . '-' . ($debut + 1),
+                        'nom'   => 'Année scolaire ' . $debut . '-' . ($debut + 1),
+                        'debut' => $debut . '-09-01',
+                        'fin'   => ($debut + 1) . '-07-31',
+                    ],
+                    true
+                );
+
+                // Un essai de 60 jours sur l'offre d'entrée : l'école
+                // travaille avant de payer, et l'invariant « une école, un
+                // abonnement en cours » est respecté dès la naissance.
+                db_query(
+                    'INSERT INTO subscriptions (school_id, plan_id, status, billing_cycle, starts_on, ends_on)
+                     SELECT :ecole, id, \'trial\', \'yearly\', CURDATE(), DATE_ADD(CURDATE(), INTERVAL 60 DAY)
+                       FROM plans WHERE code = \'DECOUVERTE\'',
+                    ['ecole' => $ecoleId],
+                    true
+                );
+
+                // Le premier administrateur.
+                $adminId = db_insert('users', [
+                    'uuid'                 => str_uuid(),
+                    'school_id'            => $ecoleId,
+                    'username'             => $identifiant,
+                    'email'                => $courrielAdmin !== '' ? $courrielAdmin : null,
+                    'password_hash'        => auth_hash_password($motDePasse),
+                    'last_name'            => $nomAdmin,
+                    'first_name'           => $prenomAdmin,
+                    'status'               => 'active',
+                    'must_change_password' => 1,
+                    'password_changed_at'  => date('Y-m-d H:i:s'),
+                ], true);
+
+                db_query(
+                    'INSERT INTO user_roles (user_id, role_id)
+                     SELECT :u, id FROM roles WHERE code = \'SCHOOL_ADMIN\' AND school_id IS NULL',
+                    ['u' => $adminId],
+                    true
+                );
+
+                // LE JOURNAL NE VOIT PAS LE MOT DE PASSE.
+                // Pas même rédigé : ce qui n'est pas écrit ne fuit pas.
+                audit_log(
+                    'platform.school.create',
+                    'schools',
+                    $ecoleId,
+                    null,
+                    ['code' => $code, 'name' => $nom, 'cycles' => $cycles,
+                     'admin_username' => $identifiant],
+                    'Création de l\'établissement ' . $code . ' — ' . $nom
+                );
+
+                return ['id' => $ecoleId, 'code' => $code];
+                });
+
+                break;
+            } catch (Throwable $e) {
+                $derniere = $e;
+
+                if ($tentative < PLATFORM_CREATION_TENTATIVES && platform_collision_de_code($e)) {
+                    log_warning('Code d\'établissement déjà pris : création rejouée', [
+                        'tentative' => $tentative,
+                    ]);
+
+                    // 10 à 60 ms, pour que les deux ne repartent pas
+                    // exactement ensemble — la mesure de la phase 5B.
+                    usleep(random_int(10000, 60000));
+
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        if ($resultat === null) {
+            // LE MESSAGE DE MySQL NE REMONTE PAS JUSQU'À L'ÉCRAN.
+            // Il nomme des index et des contraintes : il n'apprend rien
+            // à l'éditeur et renseigne un visiteur mal intentionné.
+            log_error('Création d\'établissement impossible', [
+                'error' => $derniere !== null ? $derniere->getMessage() : 'inconnue',
+            ]);
+
+            return $echec(
+                $derniere !== null && platform_collision_de_code($derniere)
+                    ? 'Plusieurs créations simultanées se sont disputé le même code. '
+                      . 'Réessayez : la saisie est conservée.'
+                    : 'Création impossible. Le détail est au journal du serveur.'
+            );
+        }
+
+        return [
+            'ok'        => true,
+            'message'   => 'Établissement ' . $resultat['code'] . ' créé.',
+            'school_id' => $resultat['id'],
+            'code'      => $resultat['code'],
+            'username'  => $identifiant,
+            'password'  => $motDePasse,
+        ];
+    });
+}
+
+/**
+ * Modifie les coordonnées d'un établissement.
+ *
+ * CE QUI N'EST PAS MODIFIABLE ICI, ET POURQUOI
+ * --------------------------------------------
+ *  · le CODE est l'identité de l'école : il figure sur des documents
+ *    déjà remis et sur la trace d'un éventuel effacement ;
+ *  · le SLUG a servi à nommer des dossiers de fichiers ;
+ *  · le STATUT relève d'une autre permission — suspendre un client et
+ *    corriger son adresse ne sont pas le même pouvoir.
+ *
+ * @param array<string, mixed> $input
+ * @return array{ok: bool, message: string}
+ */
+function platform_service_update_school(int $schoolId, array $input): array
+{
+    return platform_scope('platform.school.edit', static function () use ($schoolId, $input): array {
+        $ecole = db_one('SELECT * FROM schools WHERE id = :id', ['id' => $schoolId], true);
+
+        if ($ecole === null) {
+            return ['ok' => false, 'message' => 'Établissement introuvable.'];
+        }
+
+        $nom = trim((string) ($input['name'] ?? ''));
+
+        if (mb_strlen($nom) < 3) {
+            return ['ok' => false, 'message' => 'Le nom de l\'établissement est requis.'];
+        }
+
+        if (!in_array((string) ($input['school_type'] ?? ''), ['public', 'conventionne', 'prive', 'autre'], true)) {
+            return ['ok' => false, 'message' => 'Le type d\'établissement est requis.'];
+        }
+
+        $champs = [
+            'name'            => $nom,
+            'short_name'      => platform_texte($input['short_name'] ?? null, 60),
+            'school_type'     => (string) $input['school_type'],
+            'sernie_number'   => platform_texte($input['sernie_number'] ?? null, 50),
+            'approval_number' => platform_texte($input['approval_number'] ?? null, 50),
+            'province'        => platform_texte($input['province'] ?? null, 100),
+            'city'            => platform_texte($input['city'] ?? null, 100),
+            'commune'         => platform_texte($input['commune'] ?? null, 100),
+            'address'         => platform_texte($input['address'] ?? null, 255),
+            'phone'           => platform_texte($input['phone'] ?? null, 40),
+            'phone_alt'       => platform_texte($input['phone_alt'] ?? null, 40),
+            'email'           => platform_texte($input['email'] ?? null, 190),
+            'website'         => platform_texte($input['website'] ?? null, 190),
+            'director_name'   => platform_texte($input['director_name'] ?? null, 150),
+        ];
+
+        $avant = [];
+
+        foreach (array_keys($champs) as $cle) {
+            $avant[$cle] = $ecole[$cle] ?? null;
+        }
+
+        db_update('schools', $champs, 'id = :id', ['id' => $schoolId], true);
+
+        audit_log('platform.school.update', 'schools', $schoolId, $avant, $champs,
+            'Modification de l\'établissement ' . (string) $ecole['code']);
+
+        return ['ok' => true, 'message' => 'Établissement mis à jour.'];
+    });
+}
+
+/**
+ * Pose le statut d'un établissement.
+ *
+ * C'EST CE SERVICE QUI REND LA 10C ATTEIGNABLE
+ * ---------------------------------------------
+ * `auth.php` refuse la connexion ET la session de toute école qui n'est
+ * pas `active` — lignes 84 et 209, depuis la phase 1. Et l'effacement de
+ * la phase 10C exige `cancelled`. Ces deux règles étaient tenues par un
+ * état que RIEN dans le produit ne savait écrire.
+ *
+ *   > Un état que le produit fait respecter et qu'aucun écran ne sait
+ *   > poser n'est pas une protection : c'est une impasse.
+ *
+ * SUSPENDRE MET TOUT LE MONDE DEHORS, SÉANCE TENANTE.
+ * Ce n'est pas un drapeau décoratif : à la requête suivante, chaque
+ * session de l'école est détruite. L'écran doit le dire avant, pas
+ * l'école le découvrir après.
+ *
+ * UN MOTIF EST EXIGÉ pour suspendre comme pour résilier. L'école
+ * demandera pourquoi ; sans motif, la trace dirait QUE c'est arrivé,
+ * jamais POURQUOI. C'est la règle posée en 9D pour la réouverture d'une
+ * année, et elle vaut ici davantage.
+ *
+ * @return array{ok: bool, message: string}
+ */
+function platform_service_set_school_status(int $schoolId, string $status, string $reason = ''): array
+{
+    return platform_scope('platform.school.suspend', static function () use ($schoolId, $status, $reason): array {
+        if (!array_key_exists($status, PLATFORM_SCHOOL_STATUSES)) {
+            return ['ok' => false, 'message' => 'Statut invalide.'];
+        }
+
+        $ecole = db_one(
+            'SELECT id, code, name, status FROM schools WHERE id = :id',
+            ['id' => $schoolId],
+            true
+        );
+
+        if ($ecole === null) {
+            return ['ok' => false, 'message' => 'Établissement introuvable.'];
+        }
+
+        $avant = (string) $ecole['status'];
+
+        if ($avant === $status) {
+            return ['ok' => false, 'message' => 'Cet établissement est déjà « '
+                . PLATFORM_SCHOOL_STATUSES[$status] . ' ».'];
+        }
+
+        $motif = trim($reason);
+
+        if ($status !== 'active' && mb_strlen($motif) < 10) {
+            return ['ok' => false, 'message' => 'Un motif d\'au moins 10 caractères est exigé : '
+                . 'l\'établissement demandera pourquoi, et la trace doit pouvoir le dire.'];
+        }
+
+        db_update('schools', ['status' => $status], 'id = :id', ['id' => $schoolId], true);
+
+        audit_log(
+            'platform.school.status',
+            'schools',
+            $schoolId,
+            ['status' => $avant],
+            ['status' => $status, 'reason' => $motif],
+            // `.` lie plus fort que `??` : écrire « A . B ?? C » aurait
+            // donné « (A . B) ?? C », c'est-à-dire jamais C. Et la trace
+            // doit dire la TRANSITION, pas seulement l'état de départ.
+            sprintf(
+                'Établissement %s : %s → %s',
+                (string) $ecole['code'],
+                PLATFORM_SCHOOL_STATUSES[$avant] ?? $avant,
+                PLATFORM_SCHOOL_STATUSES[$status]
+            )
+        );
+
+        $suite = match ($status) {
+            'suspended' => ' Les sessions en cours de cet établissement sont closes.',
+            'cancelled' => ' L\'établissement peut désormais être effacé définitivement '
+                . '(php database/erase_school.php ' . (string) $ecole['code'] . ').',
+            default     => ' Ses utilisateurs peuvent de nouveau se connecter.',
+        };
+
+        return ['ok' => true, 'message' => 'Établissement « ' . (string) $ecole['name']
+            . ' » : ' . PLATFORM_SCHOOL_STATUSES[$status] . '.' . $suite];
+    });
+}
+
+// ---------------------------------------------------------------------
+//  Appui
+// ---------------------------------------------------------------------
+
+/**
+ * Le prochain code d'établissement libre.
+ *
+ * `uq_schools_code` est UNIQUE : c'est la base qui tranche en dernier
+ * ressort. Ce calcul est fait DANS la transaction de création, et deux
+ * créations simultanées verraient la seconde échouer sur la contrainte
+ * plutôt que produire un doublon — le bon ordre des garde-fous.
+ */
+function platform_prochain_code_ecole(): string
+{
+    $dernier = (string) db_value(
+        "SELECT code FROM schools WHERE code REGEXP '^ECO-[0-9]{6}$'
+          ORDER BY code DESC LIMIT 1",
+        [],
+        true
+    );
+
+    $suivant = $dernier === '' ? 1 : ((int) substr($dernier, 4)) + 1;
+
+    return sprintf('ECO-%06d', $suivant);
+}
+
+/**
+ * Un slug libre, dérivé du nom.
+ *
+ * `uq_schools_slug` est UNIQUE, et le slug a servi à nommer des chemins :
+ * deux écoles homonymes — il y en a — ne doivent pas se le disputer.
+ */
+function platform_slug_libre(string $nom): string
+{
+    $base = str_slug($nom);
+    $base = $base !== '' ? mb_substr($base, 0, 90) : 'etablissement';
+    $essai = $base;
+
+    for ($n = 2; $n < 200; $n++) {
+        $pris = db_value('SELECT 1 FROM schools WHERE slug = :s LIMIT 1', ['s' => $essai], true);
+
+        if ($pris === null) {
+            return $essai;
+        }
+
+        $essai = $base . '-' . $n;
+    }
+
+    return $base . '-' . bin2hex(random_bytes(3));
+}
+
+/**
+ * Cette exception est-elle une collision sur le code ou le slug ?
+ *
+ * On ne rejoue QUE cela. Une violation de contrainte sur l'identifiant
+ * de l'administrateur, par exemple, se reproduirait à l'identique au
+ * rejeu : la rejouer ferait perdre du temps et masquerait la vraie
+ * cause.
+ */
+function platform_collision_de_code(Throwable $e): bool
+{
+    if (!$e instanceof PDOException) {
+        return false;
+    }
+
+    if ((int) ($e->errorInfo[1] ?? 0) !== 1062) {
+        return false;
+    }
+
+    $message = $e->getMessage();
+
+    return str_contains($message, 'uq_schools_code')
+        || str_contains($message, 'uq_schools_slug');
+}
+
+/** Un texte nettoyé, tronqué, ou null s'il est vide. */
+function platform_texte(mixed $valeur, int $max): ?string
+{
+    $texte = trim((string) ($valeur ?? ''));
+
+    return $texte === '' ? null : mb_substr($texte, 0, $max);
+}
+
+/**
+ * Un mot de passe initial, lisible et solide.
+ *
+ * Il sera dicté au téléphone ou recopié d'un écran : on évite les
+ * caractères qui se confondent (O/0, l/1/I). Le changement est imposé à
+ * la première connexion, donc sa durée de vie se compte en minutes.
+ */
+function platform_generer_mot_de_passe(): string
+{
+    $lettres = 'ABCDEFGHJKMNPQRSTUVWXYZ';
+    $minus   = 'abcdefghijkmnpqrstuvwxyz';
+    $chiffres = '23456789';
+
+    $mot = $lettres[random_int(0, strlen($lettres) - 1)];
+
+    for ($i = 0; $i < 5; $i++) {
+        $mot .= $minus[random_int(0, strlen($minus) - 1)];
+    }
+
+    for ($i = 0; $i < 4; $i++) {
+        $mot .= $chiffres[random_int(0, strlen($chiffres) - 1)];
+    }
+
+    return $mot . $lettres[random_int(0, strlen($lettres) - 1)];
+}

@@ -173,6 +173,7 @@ foreach ($inventaire['scolaire'] as $table => $n) {
 }
 
 printf("\n    %-26s %6d\n", 'entrées de journal', $inventaire['journal']);
+printf("    %-26s %6d\n", 'tentatives de connexion', $inventaire['tentatives']);
 printf("    %-26s %6d\n", 'fichiers déposés', $inventaire['fichiers']);
 
 echo "\n  CE QUI SERA GARDÉ\n";
@@ -250,11 +251,33 @@ if (mb_strlen($motif) < 10) {
     exit(1);
 }
 
-echo "     Votre identifiant d'opérateur : ";
+// L'OPÉRATEUR DOIT EXISTER, ET ÊTRE UN COMPTE DE PLATEFORME.
+//
+// Première version : n'importe quelle chaîne était acceptée et recopiée
+// dans la trace. Or cette trace est ce qui répondra, des années plus
+// tard, à « qui a effacé cet établissement ». Une trace qui accepte un
+// nom inventé ne désigne personne.
+//
+//   > Une responsabilité qu'on saisit au clavier sans la vérifier n'est
+//   > pas une responsabilité, c'est une mention.
+//
+// L'objection « il a déjà un accès au serveur, il pourrait écrire en
+// base » est vraie et ne change rien : rendre le contournement explicite
+// vaut mieux que l'offrir dans le formulaire.
+echo "     Votre identifiant d'opérateur (compte de plateforme) : ";
 $operateur = trim((string) fgets(STDIN));
 
 if ($operateur === '') {
     echo "\n  ✗ Identifiant requis. Aucune modification effectuée.\n\n";
+    exit(1);
+}
+
+$operateurId = erase_identifiant_operateur($pdo, $operateur);
+
+if ($operateurId === null) {
+    echo "\n  ✗ « {$operateur} » n'est pas un compte de plateforme actif.\n\n";
+    echo "    La trace de cet effacement doit désigner quelqu'un qui existe.\n";
+    echo "    Aucune modification effectuée.\n\n";
     exit(1);
 }
 
@@ -271,6 +294,7 @@ try {
         $inventaire,
         $motif,
         $operateur,
+        $operateurId,
         basename($archive),
         $verification['date']
     );
@@ -284,6 +308,7 @@ try {
 
 printf("  ✓ %d écriture(s) comptable(s) archivée(s)\n", $resultat['comptable']);
 printf("  ✓ %d entrée(s) de journal effacée(s)\n", $resultat['journal']);
+printf("  ✓ %d tentative(s) de connexion effacée(s)\n", $resultat['tentatives']);
 printf("  ✓ établissement effacé (%d ligne(s) au total)\n", $resultat['lignes']);
 
 // LES FICHIERS PARTENT APRÈS LA VALIDATION, JAMAIS AVANT.
@@ -307,7 +332,7 @@ exit(0);
 /**
  * Ce que porte cet établissement, table par table.
  *
- * @return array{scolaire: array<string, int>, journal: int, comptable: int, fichiers: int}
+ * @return array{scolaire: array<string, int>, journal: int, tentatives: int, comptable: int, fichiers: int}
  */
 function erase_inventaire(PDO $pdo, int $ecoleId): array
 {
@@ -338,18 +363,56 @@ function erase_inventaire(PDO $pdo, int $ecoleId): array
         }
 
         if (in_array($table, ERASE_TABLES_COMPTABLES, true)) {
-            $comptable += $n;
-            continue;
+            continue;   // compté plus bas, à l'identique de l'archivage
         }
 
         $scolaire[$table] = $n;
     }
 
+    // LE COMPTE ANNONCÉ EST CELUI QUI SERA ÉCRIT.
+    //
+    // Première version : l'inventaire additionnait les lignes de
+    // `subscriptions` ET de `subscription_payments`. L'archivage, lui,
+    // ne recopiait que les secondes. Une école en essai gratuit voyait
+    // donc « écritures comptables : 1, archivées » puis, à l'exécution,
+    // « 0 archivée(s) » — sans que rien ne signale la contradiction.
+    //
+    //   > Un inventaire qui ne compte pas ce que l'exécution écrira
+    //   > n'est pas un inventaire, c'est une estimation.
+    //
+    // La requête ci-dessous reproduit EXACTEMENT la règle de
+    // `erase_archiver_comptabilite()`. Les deux se lisent ensemble ;
+    // modifier l'une sans l'autre se verra à la première simulation.
+    $ecritures = $pdo->prepare(
+        'SELECT
+            (SELECT COUNT(*) FROM subscription_payments WHERE school_id = :s1)
+          + (SELECT COUNT(*) FROM subscriptions s
+              WHERE s.school_id = :s2
+                AND s.price_amount IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM subscription_payments p
+                     WHERE p.subscription_id = s.id
+                       AND p.status <> \'cancelled\'
+                ))'
+    );
+    $ecritures->execute(['s1' => $ecoleId, 's2' => $ecoleId]);
+    $comptable = (int) $ecritures->fetchColumn();
+
+    // Les tentatives de connexion : hors de toute cascade, il faut aller
+    // les chercher par l'identifiant des comptes.
+    $tentatives = $pdo->prepare(
+        'SELECT COUNT(*) FROM login_attempts la
+           JOIN users u ON la.identifier = u.username OR la.identifier = u.email
+          WHERE u.school_id = :s'
+    );
+    $tentatives->execute(['s' => $ecoleId]);
+
     return [
-        'scolaire'  => $scolaire,
-        'journal'   => $journal,
-        'comptable' => $comptable,
-        'fichiers'  => erase_compter_fichiers($ecoleId),
+        'scolaire'   => $scolaire,
+        'journal'    => $journal,
+        'tentatives' => (int) $tentatives->fetchColumn(),
+        'comptable'  => $comptable,
+        'fichiers'   => erase_compter_fichiers($ecoleId),
     ];
 }
 
@@ -522,8 +585,8 @@ function erase_verifier_sauvegarde(string $archive, string $uuidEcole): array
  * l'état d'arrivée.
  *
  * @param array<string, mixed> $ecole
- * @param array{scolaire: array<string, int>, journal: int, comptable: int, fichiers: int} $inventaire
- * @return array{comptable: int, journal: int, lignes: int, trace: int}
+ * @param array{scolaire: array<string, int>, journal: int, tentatives: int, comptable: int, fichiers: int} $inventaire
+ * @return array{comptable: int, journal: int, tentatives: int, lignes: int, trace: int}
  */
 function erase_executer(
     PDO $pdo,
@@ -531,6 +594,7 @@ function erase_executer(
     array $inventaire,
     string $motif,
     string $operateur,
+    int $operateurId,
     string $archive,
     string $verifieeLe
 ): array {
@@ -542,7 +606,30 @@ function erase_executer(
         // --- 1. La comptabilité, AVANT que le CASCADE ne l'emporte ----
         $archivees = erase_archiver_comptabilite($pdo, $ecole);
 
-        // --- 2. Le journal de l'école --------------------------------
+        // --- 2. Les tentatives de connexion --------------------------
+        //
+        // `login_attempts` n'a NI `school_id` NI clé étrangère : aucun
+        // CASCADE ne l'emporte. Elle garde pourtant l'identifiant saisi
+        // et l'adresse IP — deux données personnelles. Mesuré : après
+        // un effacement, trois tentatives survivaient, nommant le
+        // directeur et son adresse.
+        //
+        //   > Un inventaire qui n'énumère que ce qu'il sait compter ne
+        //   > mesure pas ce qui reste.
+        //
+        // Les identifiants sont uniques SUR TOUTE LA PLATEFORME
+        // (uq_users_username, uq_users_email) : effacer par identifiant
+        // ne peut donc pas emporter les tentatives d'une autre école.
+        // Et cela DOIT précéder la suppression des comptes.
+        $effaceTentatives = $pdo->prepare(
+            'DELETE la FROM login_attempts la
+               JOIN users u ON la.identifier = u.username OR la.identifier = u.email
+              WHERE u.school_id = :s'
+        );
+        $effaceTentatives->execute(['s' => $ecoleId]);
+        $tentatives = $effaceTentatives->rowCount();
+
+        // --- 3. Le journal de l'école --------------------------------
         //
         // Il n'a pas de clé étrangère vers `schools` : sans cet ordre
         // explicite, ses lignes survivraient au CASCADE, avec les noms
@@ -551,15 +638,13 @@ function erase_executer(
         $effaceJournal->execute(['s' => $ecoleId]);
         $journal = $effaceJournal->rowCount();
 
-        // --- 3. L'établissement, et les 42 tables en cascade ----------
+        // --- 4. L'établissement, et les 42 tables en cascade ----------
         $lignesAvant = array_sum($inventaire['scolaire']);
 
         $effaceEcole = $pdo->prepare('DELETE FROM schools WHERE id = :id');
         $effaceEcole->execute(['id' => $ecoleId]);
 
-        // --- 4. La trace, qui survit à tout --------------------------
-        $operateurId = erase_identifiant_operateur($pdo, $operateur);
-
+        // --- 5. La trace, qui survit à tout --------------------------
         $trace = $pdo->prepare(
             'INSERT INTO school_erasures
                  (uuid, school_code, school_name, school_slug,
@@ -580,16 +665,17 @@ function erase_executer(
             'archive'  => $archive,
             'verifiee' => $verifieeLe,
             'comptes'  => json_encode([
-                'scolaire'  => $lignesAvant,
-                'journal'   => $journal,
-                'comptable' => $archivees,
-                'fichiers'  => $inventaire['fichiers'],
+                'scolaire'   => $lignesAvant,
+                'journal'    => $journal,
+                'tentatives' => $tentatives,
+                'comptable'  => $archivees,
+                'fichiers'   => $inventaire['fichiers'],
             ], JSON_UNESCAPED_UNICODE),
         ]);
 
         $traceId = (int) $pdo->lastInsertId();
 
-        // --- 5. La trace au journal de la PLATEFORME -----------------
+        // --- 6. La trace au journal de la PLATEFORME -----------------
         //
         // `school_id` vaut NULL : l'entrée n'appartient plus à personne,
         // et elle ne nomme aucun élève. Elle dit qu'un effacement a eu
@@ -615,10 +701,11 @@ function erase_executer(
         $pdo->commit();
 
         return [
-            'comptable' => $archivees,
-            'journal'   => $journal,
-            'lignes'    => $lignesAvant,
-            'trace'     => $traceId,
+            'comptable'  => $archivees,
+            'journal'    => $journal,
+            'tentatives' => $tentatives,
+            'lignes'     => $lignesAvant,
+            'trace'      => $traceId,
         ];
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
@@ -640,6 +727,23 @@ function erase_executer(
  */
 function erase_archiver_comptabilite(PDO $pdo, array $ecole): int
 {
+    // UNE CRÉANCE IMPAYÉE EST UNE ÉCRITURE COMPTABLE.
+    //
+    // Première version : cette fonction ne lisait que
+    // `subscription_payments`. Un abonnement facturé dont AUCUN
+    // versement n'a été enregistré — l'école est partie sans payer, ou
+    // le versement est resté « en attente » chez l'opérateur — était
+    // détruit sans trace. L'effacement du client effaçait la dette du
+    // client, à son bénéfice.
+    //
+    //   > Le droit à l'effacement d'un client n'efface pas les
+    //   > écritures comptables de son fournisseur — la créance en est
+    //   > une, et c'est même la seule qui coûte quelque chose.
+    //
+    // Un abonnement SANS tarif figé (`price_amount IS NULL`) n'est pas
+    // archivé : il n'engage rien. C'est la décision de la phase 7B2 —
+    // inventer une dette est pire que l'avouer — et `billing_archive`
+    // exige d'ailleurs un montant.
     $lecture = $pdo->prepare(
         'SELECT p.*, s.plan_id, s.billing_cycle, s.status AS sub_status,
                 s.starts_on, s.ends_on
@@ -680,6 +784,41 @@ function erase_archiver_comptabilite(PDO $pdo, array $ecole): int
             'statut'      => $ligne['status'],
             'paye_le'     => $ligne['paid_at'],
             'origine'     => $ligne['id'],
+        ]);
+        $n++;
+    }
+
+    // Les abonnements facturés que personne n'a payés.
+    $creances = $pdo->prepare(
+        'SELECT s.* FROM subscriptions s
+          WHERE s.school_id = :s
+            AND s.price_amount IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM subscription_payments p
+                 WHERE p.subscription_id = s.id
+                   AND p.status <> \'cancelled\'
+            )
+          ORDER BY s.id'
+    );
+    $creances->execute(['s' => (int) $ecole['id']]);
+
+    foreach ($creances as $sub) {
+        $ecriture->execute([
+            'code'        => (string) $ecole['code'],
+            'nom'         => (string) $ecole['name'],
+            'plan'        => $sub['plan_id'],
+            'cycle'       => $sub['billing_cycle'],
+            'sub_statut'  => $sub['status'],
+            'debut'       => $sub['starts_on'],
+            'fin'         => $sub['ends_on'],
+            'montant'     => $sub['price_amount'],
+            'devise'      => $sub['price_currency'],
+            'methode'     => null,
+            'fournisseur' => null,
+            'reference'   => null,
+            'statut'      => 'unpaid',
+            'paye_le'     => null,
+            'origine'     => null,
         ]);
         $n++;
     }

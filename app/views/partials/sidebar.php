@@ -147,7 +147,7 @@ $isPlatform = $user['school_id'] === null;
                 <?php endif; ?>
             <?php endif; ?>
 
-            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view', 'audit.view', 'report.academic', 'academic_year.view'])): ?>
+            <?php if (perm_any(['school.edit', 'school.branding', 'user.view', 'role.view', 'academic_year.view', 'curriculum.view', 'subscription.view', 'email.view', 'sync.view', 'audit.view', 'report.academic', 'academic_year.view'])): ?>
                 <p class="nav-heading">Administration</p>
 
                 <?php if (can('academic_year.view') && route_exists('/annees-scolaires')): ?>
@@ -165,6 +165,12 @@ $isPlatform = $user['school_id'] === null;
                 <?php if (can('user.view') && route_exists('/utilisateurs')): ?>
                     <a class="nav-item <?= nav_active('/utilisateurs') ?>" href="<?= e(url('/utilisateurs')) ?>">
                         <i class="bi bi-person-badge"></i><span>Utilisateurs</span>
+                    </a>
+                <?php endif; ?>
+
+                <?php if (can('role.view') && route_exists('/roles')): ?>
+                    <a class="nav-item <?= nav_active('/roles') ?>" href="<?= e(url('/roles')) ?>">
+                        <i class="bi bi-shield-lock"></i><span>Rôles et permissions</span>
                     </a>
                 <?php endif; ?>
 

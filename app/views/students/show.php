@@ -269,6 +269,162 @@ $relationshipLabels = [
     </div>
 <?php endif; ?>
 
+<?php
+/*
+ * LES PIÈCES DU DOSSIER (phase 11D).
+ *
+ * C'est ce que le « dossier numérique unique » promettait depuis le
+ * départ : l'acte de naissance, le bulletin de l'établissement
+ * précédent, la pièce du tuteur — rangés là plutôt que dans une
+ * chemise en carton.
+ *
+ * Le bloc n'apparaît QU'À QUI PEUT LES OUVRIR. Ce sont des pièces de
+ * mineurs : `student.view`, que les enseignants détiennent, serait une
+ * porte trop large, et montrer une liste qu'on ne peut pas ouvrir
+ * n'apprendrait rien d'utile — sinon l'existence des pièces.
+ */
+?>
+<?php
+/*
+ * `route_exists()` NE CONNAÎT QUE LES ROUTES GET.
+ * Premier jet : le garde visait `/eleves/{id}/pieces`, qui n'existe
+ * qu'en POST — le bloc ne s'affichait donc jamais, sans la moindre
+ * erreur. On interroge la route de LECTURE, qui est bien en GET et qui
+ * conditionne de toute façon l'utilité du bloc : sans elle, on pourrait
+ * déposer des pièces sans jamais les relire.
+ */
+?>
+<?php if (can('student.document') && route_exists('/pieces/{id}')): ?>
+    <div class="card mb-4">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h2 class="card-title mb-0">
+                Pièces du dossier
+                <?php if ($pieces !== []): ?>
+                    <span class="badge text-bg-secondary"><?= count($pieces) ?></span>
+                <?php endif; ?>
+            </h2>
+            <button class="btn btn-sm btn-outline-primary" type="button"
+                    data-bs-toggle="collapse" data-bs-target="#bloc-piece">
+                <i class="bi bi-paperclip me-1"></i> Ajouter une pièce
+            </button>
+        </div>
+
+        <div class="collapse<?= $pieces === [] ? ' show' : '' ?>" id="bloc-piece">
+            <div class="card-body border-bottom bg-light">
+                <form method="post" enctype="multipart/form-data" class="row g-2 align-items-end"
+                      action="<?= e(url('/eleves/' . (int) $student['id'] . '/pieces')) ?>">
+                    <?= csrf_field() ?>
+
+                    <div class="col-md-4">
+                        <label class="form-label small" for="piece-type">Nature</label>
+                        <select class="form-select form-select-sm" id="piece-type" name="type" required>
+                            <?php foreach (STUDENT_DOCUMENT_TYPES as $code => $libelle): ?>
+                                <option value="<?= e($code) ?>"><?= e($libelle) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="col-md-4">
+                        <label class="form-label small" for="piece-label">Précision</label>
+                        <input class="form-control form-control-sm" id="piece-label" name="label"
+                               maxlength="150" placeholder="Bulletin 5e primaire, EP Lumumba">
+                    </div>
+
+                    <div class="col-md-3">
+                        <label class="form-label small" for="piece-fichier">Fichier</label>
+                        <input class="form-control form-control-sm" type="file" id="piece-fichier"
+                               name="piece" accept=".pdf,.jpg,.jpeg,.png,.webp" required>
+                    </div>
+
+                    <div class="col-md-1 d-grid">
+                        <button class="btn btn-sm btn-primary" type="submit">Ranger</button>
+                    </div>
+
+                    <div class="col-12">
+                        <p class="form-text mb-0">
+                            PDF ou image, 5 Mo au plus. Ces pièces concernent un mineur :
+                            elles ne sont lisibles que par le secrétariat et la direction,
+                            et ne sont jamais accessibles par une adresse publique.
+                        </p>
+                    </div>
+                </form>
+            </div>
+
+            <?php if ($pieces === []): ?>
+                <div class="card-body text-secondary small">
+                    Aucune pièce rangée pour le moment.
+                </div>
+            <?php endif; ?>
+        </div>
+
+        <?php if ($pieces !== []): ?>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                    <tbody>
+                        <?php foreach ($pieces as $piece): ?>
+                            <tr>
+                                <td>
+                                    <span class="fw-medium">
+                                        <?= e(STUDENT_DOCUMENT_TYPES[(string) $piece['type']]
+                                            ?? (string) $piece['type']) ?>
+                                    </span>
+                                    <?php if ($piece['label'] !== null): ?>
+                                        <span class="d-block small text-secondary"><?= e((string) $piece['label']) ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="small text-secondary" style="width:130px;">
+                                    <?= e(student_documents_poids((int) $piece['size_bytes'])) ?>
+                                </td>
+                                <td class="small text-secondary" style="width:190px;">
+                                    <?= e(date('d/m/Y', strtotime((string) $piece['created_at']))) ?>
+                                    <?php if ($piece['par_nom'] !== null): ?>
+                                        <span class="d-block">par <?= e((string) $piece['par_nom']) ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="text-end" style="width:210px;">
+                                    <a class="btn btn-sm btn-outline-secondary"
+                                       href="<?= e(url('/pieces/' . (int) $piece['id'])) ?>">
+                                        <i class="bi bi-download me-1"></i> Télécharger
+                                    </a>
+                                    <button class="btn btn-sm btn-outline-danger" type="button"
+                                            data-bs-toggle="collapse"
+                                            data-bs-target="#retrait-<?= (int) $piece['id'] ?>">
+                                        Retirer
+                                    </button>
+                                </td>
+                            </tr>
+
+                            <tr class="collapse" id="retrait-<?= (int) $piece['id'] ?>">
+                                <td colspan="4" class="bg-light">
+                                    <form method="post" class="row g-2 align-items-end"
+                                          action="<?= e(url('/pieces/' . (int) $piece['id'] . '/retirer')) ?>">
+                                        <?= csrf_field() ?>
+                                        <div class="col-md-9">
+                                            <label class="form-label small"
+                                                   for="motif-<?= (int) $piece['id'] ?>">
+                                                Motif — le fichier sera <strong>définitivement supprimé</strong>
+                                            </label>
+                                            <input class="form-control form-control-sm"
+                                                   id="motif-<?= (int) $piece['id'] ?>" name="motif"
+                                                   required minlength="5" maxlength="160"
+                                                   placeholder="Pièce déposée sur le mauvais dossier">
+                                        </div>
+                                        <div class="col-md-3 d-grid">
+                                            <button class="btn btn-sm btn-outline-danger" type="submit">
+                                                Retirer la pièce
+                                            </button>
+                                        </div>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </div>
+<?php endif; ?>
+
 <div class="row g-4">
 
     <!-- ==============================================================

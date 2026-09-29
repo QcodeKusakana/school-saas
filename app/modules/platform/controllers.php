@@ -298,3 +298,141 @@ function ctrl_platform_audit(): void
         'actions' => $actions,
     ], 'app');
 }
+
+// =====================================================================
+//  PHASE 11A — LE CYCLE DE VIE D'UN ÉTABLISSEMENT
+// =====================================================================
+
+/** Le formulaire de création d'un établissement. */
+function ctrl_platform_school_create_form(): void
+{
+    view('platform/school_form', [
+        'title'  => 'Nouvel établissement',
+        'ecole'  => null,
+        'cycles' => platform_scope('platform.school.create', static fn (): array => db_all(
+            'SELECT code, name FROM education_cycles ORDER BY id',
+            [],
+            true
+        )),
+        'retour' => '/plateforme/ecoles',
+    ], 'app');
+}
+
+/**
+ * Crée l'établissement, et montre UNE FOIS le mot de passe initial.
+ *
+ * Le mot de passe passe par un message éclair, jamais par l'URL : une
+ * adresse se retrouve dans l'historique du navigateur, dans les journaux
+ * du serveur et dans l'en-tête `Referer` de la page suivante.
+ */
+function ctrl_platform_school_create(): void
+{
+    csrf_verify();
+
+    $resultat = platform_service_create_school([
+        'name'             => (string) input('name', ''),
+        'short_name'       => (string) input('short_name', ''),
+        'school_type'      => (string) input('school_type', ''),
+        'province'         => (string) input('province', ''),
+        'city'             => (string) input('city', ''),
+        'commune'          => (string) input('commune', ''),
+        'address'          => (string) input('address', ''),
+        'phone'            => (string) input('phone', ''),
+        'email'            => (string) input('email', ''),
+        'director_name'    => (string) input('director_name', ''),
+        'cycles'           => (array) input('cycles', []),
+        'admin_last_name'  => (string) input('admin_last_name', ''),
+        'admin_first_name' => (string) input('admin_first_name', ''),
+        'admin_username'   => (string) input('admin_username', ''),
+        'admin_email'      => (string) input('admin_email', ''),
+    ]);
+
+    if (!$resultat['ok']) {
+        // LA SAISIE EST CONSERVÉE — parce que le refus le promet.
+        //
+        // Le message de rejeu dit « Réessayez : la saisie est conservée ».
+        // Sans `flash_old()`, il aurait menti, et l'éditeur aurait
+        // retapé quinze champs pour une collision de code qui dure
+        // quelques millisecondes. Le produit sait faire cela depuis la
+        // phase 3 ; il n'y avait qu'à s'en servir.
+        //
+        //   > Un message qui promet quelque chose que le code ne fait
+        //   > pas est pire qu'un message absent.
+        //
+        // Le mot de passe n'est pas dans le formulaire — il est tiré par
+        // le service — donc rien de secret ne transite par la session.
+        flash_old(input_all());
+        flash_error($resultat['message']);
+        redirect('/plateforme/ecoles/nouveau');
+    }
+
+    flash_success($resultat['message']);
+
+    // LE SEUL ENDROIT OÙ CE MOT DE PASSE EXISTERA.
+    //
+    // Il passe par le message éclair — le mécanisme que le produit a
+    // déjà — et jamais par l'URL : une adresse se retrouve dans
+    // l'historique du navigateur, dans les journaux du serveur et dans
+    // l'en-tête « Referer » de la page suivante.
+    //
+    // Il n'est ni journalisé, ni relisible plus tard : si l'éditeur le
+    // perd, l'école passera par « mot de passe oublié ». C'est le
+    // comportement voulu, pas une lacune.
+    flash_warning(sprintf(
+        'Premier accès de %s — identifiant : %s · mot de passe : %s — '
+        . 'notez-le maintenant, il ne sera plus affiché. Le changement est '
+        . 'imposé à la première connexion.',
+        (string) $resultat['code'],
+        (string) $resultat['username'],
+        (string) $resultat['password']
+    ));
+
+    redirect('/plateforme/ecoles/' . (int) $resultat['school_id']);
+}
+
+/** Le formulaire de modification. */
+function ctrl_platform_school_edit_form(string $id): void
+{
+    $ecole = platform_repo_school((int) $id);
+
+    if ($ecole === null) {
+        flash_error('Établissement introuvable.');
+        redirect('/plateforme/ecoles');
+    }
+
+    view('platform/school_form', [
+        'title'  => 'Modifier ' . (string) $ecole['name'],
+        'ecole'  => $ecole,
+        'cycles' => [],
+        'retour' => '/plateforme/ecoles/' . (int) $id,
+    ], 'app');
+}
+
+function ctrl_platform_school_update(string $id): void
+{
+    csrf_verify();
+
+    $resultat = platform_service_update_school((int) $id, input_all());
+
+    $resultat['ok'] ? flash_success($resultat['message']) : flash_error($resultat['message']);
+
+    redirect($resultat['ok']
+        ? '/plateforme/ecoles/' . (int) $id
+        : '/plateforme/ecoles/' . (int) $id . '/modifier');
+}
+
+/** Suspend, réactive ou résilie un établissement. */
+function ctrl_platform_school_status(string $id): void
+{
+    csrf_verify();
+
+    $resultat = platform_service_set_school_status(
+        (int) $id,
+        (string) input('status', ''),
+        (string) input('reason', '')
+    );
+
+    $resultat['ok'] ? flash_success($resultat['message']) : flash_error($resultat['message']);
+
+    redirect('/plateforme/ecoles/' . (int) $id);
+}

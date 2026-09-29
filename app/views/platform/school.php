@@ -52,6 +52,12 @@ foreach ($subscriptions as $sub) {
         </p>
     </div>
     <div>
+        <?php if (can('platform.school.edit')): ?>
+            <a class="btn btn-outline-secondary"
+               href="<?= e(url('/plateforme/ecoles/' . (int) $school['id'] . '/modifier')) ?>">
+                Modifier
+            </a>
+        <?php endif; ?>
         <?php if (can('platform.billing.manage')): ?>
             <a class="btn btn-outline-primary"
                href="<?= e(url('/plateforme/ecoles/' . (int) $school['id'] . '/facturation')) ?>">
@@ -286,3 +292,80 @@ foreach ($subscriptions as $sub) {
         </table>
     </div>
 </div>
+
+<?php if (can('platform.school.suspend')): ?>
+    <?php
+    /**
+     * L'ÉTAT DE L'ÉTABLISSEMENT — l'écran qui manquait.
+     *
+     * `auth.php` refuse la connexion ET la session de toute école qui
+     * n'est pas « active » (lignes 84 et 209), et l'effacement de la
+     * phase 10C exige « cancelled ». Ces deux règles étaient tenues par
+     * un état que RIEN dans le produit ne savait poser.
+     *
+     *   > Un état que le produit fait respecter et qu'aucun écran ne
+     *   > sait poser n'est pas une protection : c'est une impasse.
+     */
+    $etatCourant = (string) $school['status'];
+
+    // DES LIBELLÉS PROPRES À L'ÉTABLISSEMENT.
+    // `$statusLabels` plus haut décrit le statut de l'ABONNEMENT. Les
+    // deux partagent « actif », « suspendu », « résilié » — les
+    // confondre marcherait par coïncidence aujourd'hui et tromperait le
+    // prochain lecteur, qui croirait lire l'abonnement.
+    $etatsEcole = [
+        'pending'   => ['En attente', 'bg-warning-subtle text-warning-emphasis'],
+        'active'    => ['En service', 'bg-success-subtle text-success-emphasis'],
+        'suspended' => ['Suspendu',   'bg-danger-subtle text-danger-emphasis'],
+        'cancelled' => ['Résilié',    'bg-secondary-subtle text-secondary-emphasis'],
+    ];
+    ?>
+    <div class="card mt-3 border-warning-subtle">
+        <div class="card-header fw-medium d-flex justify-content-between align-items-center">
+            <span>État de l'établissement</span>
+            <span class="badge <?= e($etatsEcole[$etatCourant][1] ?? 'bg-secondary-subtle text-secondary-emphasis') ?>">
+                <?= e($etatsEcole[$etatCourant][0] ?? $etatCourant) ?>
+            </span>
+        </div>
+        <div class="card-body">
+            <p class="text-muted small mb-3">
+                Suspendre <strong>ferme immédiatement les sessions en cours</strong> et
+                empêche toute connexion : les utilisateurs de l'établissement le
+                constateront à leur requête suivante, sans autre avertissement.
+                Résilier va plus loin — c'est la condition d'entrée de l'effacement
+                définitif, qui se joue en ligne de commande.
+            </p>
+
+            <form method="post"
+                  action="<?= e(url('/plateforme/ecoles/' . (int) $school['id'] . '/etat')) ?>">
+                <?= csrf_field() ?>
+
+                <div class="row g-2 align-items-end">
+                    <div class="col-md-4">
+                        <label class="form-label small" for="school_state">Nouvel état</label>
+                        <select class="form-select" id="school_state" name="status" required>
+                            <option value="">—</option>
+                            <?php foreach ($etatsEcole as $code => [$libelle, ]): ?>
+                                <?php if ($code === $etatCourant || $code === 'pending') { continue; } ?>
+                                <option value="<?= e($code) ?>"><?= e($libelle) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="col-md-6">
+                        <label class="form-label small" for="school_state_reason">
+                            Motif <span class="text-muted">(10 caractères minimum, sauf remise en service)</span>
+                        </label>
+                        <input class="form-control" id="school_state_reason" name="reason"
+                               maxlength="255"
+                               placeholder="L'établissement demandera pourquoi.">
+                    </div>
+
+                    <div class="col-md-2">
+                        <button class="btn btn-outline-warning w-100" type="submit">Appliquer</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+<?php endif; ?>

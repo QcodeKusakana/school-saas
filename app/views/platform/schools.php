@@ -37,6 +37,12 @@ $statusClass = [
             <?= $filters['q'] !== '' || $filters['status'] !== '' ? 'correspondant au filtre' : 'au total' ?>
         </p>
     </div>
+
+    <?php if (can('platform.school.create')): ?>
+        <a class="btn btn-primary" href="<?= e(url('/plateforme/ecoles/nouveau')) ?>">
+            <i class="bi bi-plus-lg"></i> Nouvel établissement
+        </a>
+    <?php endif; ?>
 </div>
 
 <?php require APP_PATH . '/views/partials/flash.php'; ?>

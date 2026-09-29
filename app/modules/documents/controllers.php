@@ -153,14 +153,49 @@ function ctrl_documents_revoke(string $id): void
  * vérificateur croirait que scanner suffit, alors qu'il doit comparer
  * le numéro imprimé avec celui de l'écran.
  */
+/**
+ * La page publique de vérification — documents ET reçus.
+ *
+ * UNE SEULE PORTE POUR DEUX FAMILLES DE PIÈCES.
+ * Une personne qui recopie un code à la main, ou qui scanne, ne sait pas
+ * — et n'a pas à savoir — si elle tient une attestation ou un reçu. Deux
+ * pages distinctes l'obligeraient à choisir avant de pouvoir vérifier,
+ * et la moitié des gens choisiraient mal.
+ *
+ * L'ordre d'interrogation n'a pas d'importance pour la justesse : le
+ * tirage d'un jeton de reçu vérifie qu'aucun document ne le porte déjà
+ * (voir `receipt_new_token()`), et l'inverse est vrai par construction —
+ * les documents sont antérieurs. Un jeton ne peut donc désigner qu'une
+ * seule pièce.
+ */
 function ctrl_documents_verify(string $token = ''): void
 {
+    require_once APP_PATH . '/modules/finance/verification.php';
+
     $token = $token !== '' ? $token : (string) input('jeton', '');
 
+    $resultat = null;
+    $nature   = null;
+
+    if ($token !== '') {
+        $resultat = document_service_verify($token);
+        $nature   = 'document';
+
+        if (!($resultat['found'] ?? false)) {
+            $recu = receipt_service_verify($token);
+
+            if ($recu['found'] ?? false) {
+                $resultat = $recu;
+                $nature   = 'recu';
+            }
+        }
+    }
+
     view('documents/verify', [
-        'title'    => 'Vérification d\'un document',
+        'title'    => 'Vérification',
         'token'    => $token,
-        'resultat' => $token !== '' ? document_service_verify($token) : null,
+        'resultat' => $resultat,
+        'nature'   => $nature,
     ], 'auth');
 }
 

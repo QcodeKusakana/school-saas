@@ -82,6 +82,9 @@ const TENANT_TABLES = [
     // (`tenant_scope_identity`), exactement comme `users.username` ou
     // `sync_devices.device_uuid` — jamais par un filtre oublié.
     'documents',
+    // Phase 11D — les pièces REÇUES et rangées au dossier de l'élève.
+    // À ne pas confondre avec `documents`, qui porte ce que l'école ÉMET.
+    'student_documents',
     'document_counters',
 
     // Journal d'audit : school_id vaut NULL pour les actions de la

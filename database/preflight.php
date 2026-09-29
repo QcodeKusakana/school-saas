@@ -198,13 +198,53 @@ $urlPubl = $url !== ''
 
 verdict(BLOQUANT, 'app.url', $urlPubl,
     $url !== '' ? $url : '(vide)',
-    'app.url sert à composer les liens de réinitialisation envoyés par e-mail. '
-    . 'Une valeur locale produit des liens inutilisables pour le destinataire.');
+    'app.url sert à composer les liens de réinitialisation envoyés par e-mail '
+    . 'ET les codes de vérification IMPRIMÉS sur les reçus, les cartes et les '
+    . 'attestations. Un lien d\'e-mail se renvoie ; un millier de reçus déjà '
+    . 'remis aux familles, non.');
 
 verdict(BLOQUANT, 'app.url en HTTPS', str_starts_with(strtolower($url), 'https://'),
     $url !== '' ? parse_url($url, PHP_URL_SCHEME) ?: '(indéterminé)' : '(vide)',
     'Sans HTTPS, session.cookie_secure rendrait la connexion impossible, et '
     . 'le mot de passe circule en clair.');
+
+// --- LA LISIBILITÉ DES CODES IMPRIMÉS --------------------------------
+//
+// PRODUIRE UN CODE N'EST PAS LE RENDRE LISIBLE.
+//
+// La longueur de `app.url` décide du nombre de modules du code, donc de
+// leur taille sur le papier. Sur un poste de développement, l'adresse
+// est la plus courte possible et tout paraît net. Avec l'adresse réelle
+// d'un établissement — « https://scolarite.complexe-scolaire-saint-joseph.gombe.cd »
+// — chaque module tombe sous le seuil qu'un téléphone d'entrée de gamme
+// sait accrocher, sans qu'aucune erreur ne soit levée.
+//
+// Le REÇU s'adapte : il calcule sa taille et prend la place qu'il faut.
+// La CARTE D'ÉLÈVE ne le peut pas — elle a le format d'une carte
+// bancaire, et son code est borné à 17 mm. C'est donc ici, avant la mise
+// en service, que le problème doit se voir.
+//
+//   > Un défaut qui n'apparaît qu'après impression n'a plus de
+//   > correctif : il a un coût de réimpression.
+if ($url !== '') {
+    require_once APP_PATH . '/core/qrcode.php';
+
+    // Le gabarit d'un jeton réel : 12 caractères groupés par quatre.
+    $urlType = rtrim($url, '/') . '/v/ABCD-EFGH-JKMN';
+    $requis  = qr_taille_impression_mm($urlType, 4);   // la carte utilise une marge de 4
+
+    verdict(
+        RECOMMANDE,
+        'Lisibilité du code sur la carte d\'élève',
+        $requis <= 17.0,
+        sprintf('%.1f mm nécessaires pour %d caractères, 17 mm disponibles sur la carte',
+            $requis, mb_strlen($urlType)),
+        'Le code tiendra sur le papier mais sera trop dense pour beaucoup de '
+        . 'téléphones. Un sous-domaine plus court pour app.url (par exemple '
+        . '« https://ecole.cd ») ramène le code à une densité lisible. Les reçus, '
+        . 'eux, s\'adaptent d\'eux-mêmes.'
+    );
+}
 
 $secure = (bool) config('session.cookie_secure', false);
 verdict(BLOQUANT, 'session.cookie_secure', $secure === true,

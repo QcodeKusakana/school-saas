@@ -165,6 +165,74 @@ function garnir(PDO $db, string $racine, int $ecoleId, string $etiquette): void
          VALUES (:s, :a, 120.00, 'USD', 'mobile_money', 'mpesa', :r, 'confirmed', NOW())"
     )->execute(['s' => $ecoleId, 'a' => $abonnement, 'r' => 'REF-' . $etiquette]);
 
+    // UNE CRÉANCE : un abonnement facturé que personne n'a payé.
+    //
+    // C'est le cas qui coûte. L'archivage ne lisait que
+    // `subscription_payments` : une école partie sans payer emportait sa
+    // dette avec elle, et l'éditeur n'en gardait aucune trace.
+    $db->prepare(
+        "INSERT INTO subscriptions (school_id, plan_id, status, billing_cycle,
+                                    price_amount, price_currency, starts_on, ends_on, created_at)
+         VALUES (:s, 2, 'past_due', 'yearly', 250.00, 'USD', '2027-01-01', '2027-12-31', NOW())"
+    )->execute(['s' => $ecoleId]);
+
+    // UN RÔLE COMPOSÉ PAR L'ÉCOLE (phase 11B).
+    //
+    // `roles` n'avait aucune ligne portant `school_id` quand cette
+    // procédure a été écrite. Vérifier la règle DELETE_RULE dans
+    // `information_schema` n'est pas la même chose que voir la ligne
+    // disparaître.
+    $db->prepare(
+        "INSERT INTO roles (school_id, code, name, level, is_system, is_active, created_at)
+         VALUES (:s, :c, 'Surveillant maison', 30, 0, 1, NOW())"
+    )->execute(['s' => $ecoleId, 'c' => 'E' . $ecoleId . '_SURVEILLANT']);
+
+    $roleMaison = (int) $db->lastInsertId();
+
+    $db->prepare(
+        'INSERT INTO role_permissions (role_id, permission_id)
+         SELECT :r, id FROM permissions WHERE is_platform = 0 ORDER BY id LIMIT 2'
+    )->execute(['r' => $roleMaison]);
+
+    // ET UN ABONNEMENT SANS TARIF FIGÉ : il n'engage rien, il ne doit
+    // PAS être archivé — `billing_archive` exige un montant, et
+    // inventer une dette est pire que l'avouer (décision de la 7B2).
+    $db->prepare(
+        "INSERT INTO subscriptions (school_id, plan_id, status, billing_cycle,
+                                    price_amount, price_currency, starts_on, ends_on, created_at)
+         VALUES (:s, 1, 'trial', 'yearly', NULL, NULL, '2025-01-01', '2025-12-31', NOW())"
+    )->execute(['s' => $ecoleId]);
+
+    // UN COMPTE, ET SES TENTATIVES DE CONNEXION.
+    //
+    // `login_attempts` ne porte NI school_id NI clé étrangère : ses
+    // lignes ne sont emportées par aucun CASCADE. Elles gardent
+    // pourtant l'identifiant du compte et l'adresse IP — deux données
+    // personnelles.
+    $db->prepare(
+        "INSERT INTO users (uuid, school_id, username, email, password_hash,
+                            last_name, first_name, status, created_at)
+         VALUES (:uuid, :s, :u, :e, :h, 'NGOY', 'Jean', 'active', NOW())"
+    )->execute([
+        // uuid : CHAR(36), donc 8-4-4-4-12.
+        'uuid' => sprintf('%s-%s-4%s-a%s-%s',
+            bin2hex(random_bytes(4)), bin2hex(random_bytes(2)),
+            substr(bin2hex(random_bytes(2)), 1), substr(bin2hex(random_bytes(2)), 1),
+            bin2hex(random_bytes(6))),
+        's'    => $ecoleId,
+        'u'    => 'directeur.' . $etiquette,
+        'e'    => 'directeur.' . $etiquette . '@exemple.cd',
+        'h'    => password_hash('MotDePasse2026', PASSWORD_BCRYPT),
+    ]);
+
+    foreach ([['directeur.' . $etiquette, 1], ['directeur.' . $etiquette, 0],
+              ['directeur.' . $etiquette . '@exemple.cd', 0]] as [$identifiant, $reussi]) {
+        $db->prepare(
+            "INSERT INTO login_attempts (identifier, ip_address, successful, user_agent, created_at)
+             VALUES (:i, :ip, :r, 'Mozilla', NOW())"
+        )->execute(['i' => $identifiant, 'ip' => inet_pton('41.243.11.7'), 'r' => $reussi]);
+    }
+
     // Un fichier déposé.
     $dossier = $racine . '/storage/uploads/photos/' . $ecoleId;
     mkdir($dossier, 0o775, true);
@@ -356,6 +424,20 @@ try {
     check('Un motif trop court : refusé',
         $motifCourt['code'] !== 0 && str_contains($motifCourt['sortie'], 'Motif trop court'));
 
+    // La trace doit désigner quelqu'un qui existe : un nom inventé ne
+    // désigne personne, et c'est elle qui répondra dans dix ans à
+    // « qui a effacé cet établissement ».
+    $operateurInvente = lancer(
+        $racine,
+        'erase_school.php',
+        ['ECO-900001'],
+        "ECO-900001\nRésiliation du contrat à la demande de l'établissement\nmonsieur.personne\n"
+    );
+
+    check('Un opérateur inventé : refusé',
+        $operateurInvente['code'] !== 0
+        && str_contains($operateurInvente['sortie'], 'compte de plateforme actif'));
+
     check('… et rien n\'a bougé', $inventaire($db, $partante['id']) === $avantPartante);
 
     // =================================================================
@@ -418,6 +500,34 @@ try {
     check('… tandis que celui de l\'école voisine est intact', $resteVoisine === 1,
         $resteVoisine . ' entrée(s)');
 
+    // LE PIÈGE SUIVANT : `login_attempts` n'a ni school_id ni clé
+    // étrangère. Rien ne l'emporte, et il garde l'identifiant du compte
+    // ET l'adresse IP.
+    $tentatives = (int) $db->query(
+        "SELECT COUNT(*) FROM login_attempts WHERE identifier LIKE 'directeur.partante%'"
+    )->fetchColumn();
+
+    check('Les tentatives de connexion de cette école sont parties', $tentatives === 0,
+        $tentatives . ' tentative(s) restante(s), avec identifiant et adresse IP');
+
+    check('… tandis que celles de l\'école voisine restent',
+        (int) $db->query(
+            "SELECT COUNT(*) FROM login_attempts WHERE identifier LIKE 'directeur.voisine%'"
+        )->fetchColumn() === 3);
+
+    check('Le rôle composé par l\'école est parti',
+        (int) $db->query("SELECT COUNT(*) FROM roles WHERE code LIKE 'E%_SURVEILLANT'
+                            AND school_id = " . $partante['id'])->fetchColumn() === 0);
+
+    check('… ainsi que les permissions qu\'il accordait',
+        (int) $db->query('SELECT COUNT(*) FROM role_permissions rp
+                            LEFT JOIN roles r ON r.id = rp.role_id
+                           WHERE r.id IS NULL')->fetchColumn() === 0);
+
+    check('… sans toucher aux neuf rôles livrés avec le produit',
+        (int) $db->query('SELECT COUNT(*) FROM roles WHERE school_id IS NULL
+                            AND is_system = 1')->fetchColumn() === 9);
+
     check('Les fichiers déposés sont partis', !is_file($photo));
     check('… et leur dossier aussi',
         !is_dir($racine . '/storage/uploads/photos/' . $partante['id']));
@@ -432,16 +542,42 @@ try {
         "SELECT * FROM billing_archive WHERE school_code = 'ECO-900001'"
     )->fetchAll();
 
-    check('La comptabilité de l\'éditeur est archivée', count($comptable) === 1);
+    // DEUX LIGNES : le versement encaissé, ET la créance impayée.
+    // La troisième — l'essai sans tarif figé — n'engage rien et reste
+    // dehors.
+    check('La comptabilité de l\'éditeur est archivée', count($comptable) === 2,
+        count($comptable) . ' ligne(s), 2 attendues');
 
-    if ($comptable !== []) {
-        check('… avec le montant et la devise',
-            (float) $comptable[0]['amount'] === 120.00 && $comptable[0]['currency'] === 'USD');
-        check('… avec la référence du paiement',
-            $comptable[0]['reference'] === 'REF-partante');
-        check('… et le nom de l\'établissement, personne morale',
-            $comptable[0]['school_name'] === 'École qui s\'en va');
+    $verse  = null;
+    $impaye = null;
+
+    foreach ($comptable as $ligne) {
+        $ligne['original_payment_id'] === null ? $impaye = $ligne : $verse = $ligne;
     }
+
+    check('Le versement encaissé est archivé', $verse !== null);
+
+    if ($verse !== null) {
+        check('… avec le montant et la devise',
+            (float) $verse['amount'] === 120.00 && $verse['currency'] === 'USD');
+        check('… avec la référence du paiement',
+            $verse['reference'] === 'REF-partante');
+        check('… et le nom de l\'établissement, personne morale',
+            $verse['school_name'] === 'École qui s\'en va');
+    }
+
+    check('LA CRÉANCE IMPAYÉE est archivée elle aussi', $impaye !== null,
+        'une école ne s\'acquitte pas de sa dette en demandant son effacement');
+
+    if ($impaye !== null) {
+        check('… avec son montant', (float) $impaye['amount'] === 250.00);
+        check('… marquée impayée', $impaye['payment_status'] === 'unpaid');
+        check('… et sans versement d\'origine', $impaye['original_payment_id'] === null);
+    }
+
+    check('L\'abonnement SANS tarif figé n\'est pas archivé',
+        count(array_filter($comptable, static fn ($l) => (float) $l['amount'] === 0.0)) === 0,
+        'il n\'engage rien : inventer une dette est pire que l\'avouer');
 
     $trace = $db->query(
         "SELECT * FROM school_erasures WHERE school_code = 'ECO-900001'"
@@ -495,6 +631,14 @@ try {
     check('Sa comptabilité n\'a pas été archivée',
         (int) $db->query("SELECT COUNT(*) FROM billing_archive WHERE school_code = 'ECO-900002'")
             ->fetchColumn() === 0);
+
+    check('Son rôle maison est intact',
+        (int) $db->query('SELECT COUNT(*) FROM roles WHERE school_id = '
+            . $voisine['id'])->fetchColumn() === 1);
+
+    check('Sa créance impayée est intacte',
+        (int) $db->query('SELECT COUNT(*) FROM subscriptions WHERE school_id = '
+            . $voisine['id'] . ' AND price_amount = 250.00')->fetchColumn() === 1);
 
     // =================================================================
     //  ON N'EFFACE PAS DEUX FOIS
